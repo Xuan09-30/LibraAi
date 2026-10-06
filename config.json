@@ -1,0 +1,5 @@
+{
+  "city": "Kuala Lumpur",
+  "ollama_model": "qwen3:8b",
+  "ollama_base_url": "http://localhost:11434"
+}
