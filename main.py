@@ -1,129 +1,106 @@
-"""
-main.py: Libra, step 1 (terminal version).
-Chat with a local Ollama model that can call a weather tool by itself.
-"""
-
 import json
-from datetime import datetime
-from pathlib import Path
+import ollama
+from tools.weather import get_weather
+from core.stt import listen
+from core.tts import speak
+import re
+from core.tts import TextToSpeech
+from core.stt import SpeechToText
+from tools.weather import get_weather
 
-from ollama import Client
-
-from weather import get_weather
-
-CONFIG_PATH = Path(__file__).parent / "config.json"
-
-# Describes the tool to the model in plain English so it knows when to use it.
-WEATHER_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "get_weather",
-        "description": (
-            "Get the current weather and the hourly forecast for the rest of today "
-            "in a city. Use it for questions about weather, rain, temperature, "
-            "outdoor activities, or what to wear."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "city_name": {
-                    "type": "string",
-                    "description": "The city to check, e.g. Kuala Lumpur.",
-                }
-            },
-            "required": ["city_name"],
-        },
-    },
+# Map available tools by name
+TOOL_MAP = {
+    "get_weather": get_weather
 }
 
+SYSTEM_PROMPT = """You are Libra, an authentic, highly capable AI assistant like JARVIS.
+Default location: Kuala Lumpur, Malaysia. If the user asks about the weather without specifying a location, assume Kuala Lumpur.
+Keep your spoken responses natural, concise, and direct."""
 
-def load_config() -> dict:
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+def clean_for_speech(text):
+    """Strips markdown, redundant time formats, and emojis for TTS."""
+    if not text:
+        return ""
+        
+    # Remove Markdown formatting (like ** or *)
+    text = re.sub(r'\*+', '', text)
+    
+    # Remove redundant 24-hour times in parentheses e.g. (20:00)
+    text = re.sub(r'\(\d{1,2}:\d{2}\)', '', text)
+    
+    # Remove emojis by keeping only standard ASCII characters (letters, numbers, basic punctuation)
+    text = text.encode('ascii', 'ignore').decode('ascii')
+    
+    # Clean up any leftover double spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
 
-
-def build_system_prompt(default_city: str) -> str:
-    """Rebuilt every turn so the date and time are always current."""
-    now = datetime.now().strftime("%A, %d %B %Y, %I:%M %p")
-    return (
-        "You are Libra, a helpful local voice assistant running on the user's Windows PC.\n"
-        f"The current local date and time is {now}.\n"
-        f"The user's home city is {default_city}. Assume it unless they name another city.\n"
-        "For questions about weather, rain, temperature, outdoor plans or clothing, "
-        "you MUST call the get_weather tool before answering, and base your answer "
-        "on its numbers, including the hourly forecast for time-specific questions."
-    )
-
-
-def run_turn(client: Client, model: str, messages: list, default_city: str) -> str:
-    """Send the conversation to the model, run any tools it asks for, return the final reply."""
-    messages[0] = {"role": "system", "content": build_system_prompt(default_city)}
-
-    # Allow a few rounds so the model can call a tool, read the result, and answer.
-    for _ in range(4):
-        response = client.chat(
-            model=model,
-            messages=messages,
-            tools=[WEATHER_TOOL],
-            think=False,  # turn off Qwen3's slow "thinking" mode
-        )
-        message = response.message
-        messages.append(message)
-
-        if not message.tool_calls:
-            return message.content or ""
-
-        for call in message.tool_calls:
-            name = call.function.name
-            args = call.function.arguments or {}
-            if name == "get_weather":
-                city = args.get("city_name", default_city)
-                print(f"\n[Libra is checking weather for {city}...]")
-                result = get_weather(city)
-            else:
-                result = f"Unknown tool: {name}"
-            messages.append({"role": "tool", "content": result})
-
-    return "Sorry, I got stuck trying to answer that. Could you ask again?"
-
-
-def main():
-    config = load_config()
-    model = config.get("ollama_model", "qwen3:8b")
-    default_city = config.get("city", "Kuala Lumpur")
-    client = Client(host=config.get("ollama_base_url", "http://localhost:11434"))
-
-    print("=" * 60)
-    print("Libra AI Assistant (Step 1 - Terminal)")
-    print(f"Model: {model} | Home city: {default_city}")
-    print("Type your question (type 'exit' or 'quit' to stop).")
-    print("=" * 60)
-
-    messages = [{"role": "system", "content": build_system_prompt(default_city)}]
-
+def chat_loop():
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT}
+    ]
+    
+    speak("All systems online. I am ready.")
+    
     while True:
         try:
-            user_input = input("\nYou: ").strip()
-            if not user_input:
+            # 1. Listen for voice input
+            user_text = listen(duration=5)
+            
+            if not user_text or len(user_text.strip()) == 0:
                 continue
-            if user_input.lower() in ("exit", "quit"):
-                print("Goodbye!")
-                break
+                
+            print(f"\n[You]: {user_text}")
+            messages.append({"role": "user", "content": user_text})
+            
+            # 2. First call to Ollama (checking for tool calls)
+            response = ollama.chat(
+                model='qwen3:8b',
+                messages=messages,
+                tools=[get_weather],
+            )
+            
+            # Append model's response (tool call or direct message)
+            messages.append(response.message)
+            
+            # 3. Handle Tool Calls if the model triggered one
+            if response.message.tool_calls:
+                for tool_call in response.message.tool_calls:
+                    func_name = tool_call.function.name
+                    args = tool_call.function.arguments
+                    
+                    if func_name in TOOL_MAP:
+                        print(f"⚙️ [Tool Calling]: {func_name}({args})")
+                        tool_result = TOOL_MAP[func_name](**args)
+                        
+                        # Feed the tool output back into the conversation history
+                        messages.append({
+                            "role": "tool",
+                            "content": json.dumps(tool_result),
+                        })
+                
+                # Ask Ollama to synthesize the final spoken answer using the tool data
+                followup_response = ollama.chat(
+                    model='qwen3:8b',
+                    messages=messages
+                )
+                final_reply = followup_response.message.content
+                messages.append(followup_response.message)
+            else:
+                final_reply = response.message.content
 
-            messages.append({"role": "user", "content": user_input})
-            reply = run_turn(client, model, messages, default_city)
-            print(f"\nLibra: {reply}")
+            # 4. Speak and display the final reply
+            print(f"\n[Libra]: {final_reply}")
+            if final_reply:
+                spoken_reply = clean_for_speech(final_reply)
+                speak(spoken_reply)
 
         except KeyboardInterrupt:
-            print("\nGoodbye!")
+            print("\nShutting down Libra.")
             break
         except Exception as e:
-            print(f"\nError communicating with Ollama: {e}")
-            print("Make sure the Ollama app is running and the model is pulled (ollama pull qwen3:8b).")
-
+            print(f"Error encountered: {e}")
 
 if __name__ == "__main__":
-    main()
+    chat_loop()
