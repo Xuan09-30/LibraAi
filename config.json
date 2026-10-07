@@ -1,5 +1,11 @@
 {
   "city": "Kuala Lumpur",
-  "ollama_model": "qwen3:8b",
-  "ollama_base_url": "http://localhost:11434"
+  "ollama_base_url": "http://localhost:11434",
+  "default_model": "qwen3:8b",
+  "models": {
+    "router": "qwen3:8b",
+    "web_research": "qwen3:8b",
+    "coding": "qwen2.5-coder:7b",
+    "chat": "qwen3:8b"
+  }
 }
