@@ -9,6 +9,8 @@ from datetime import datetime
 from collections import deque
 import numpy as np
 import pyaudio
+import torch
+from silero_vad import load_silero_vad, get_speech_timestamps
 
 # Ensure project root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -88,6 +90,8 @@ class VoiceAssistantWorker(QThread):
             stt = SpeechToText()
             print("[Worker] Connecting to Local LLM Core...")
             llm = LocalLLM()
+            print("[Worker] Initializing Silero VAD turn detector...")
+            vad_model = load_silero_vad()
         except Exception as e:
             print(f"[Worker FATAL ERROR during initialization]: {e}")
             self.status_changed.emit("INIT ERROR")
@@ -170,40 +174,43 @@ class VoiceAssistantWorker(QThread):
 
             while not playback_finished.is_set():
                 try:
-                    # Inside speak_interruptible while not playback_finished.is_set():
+                    # 1. Read fresh audio frame from microphone
                     mic_data = input_stream.read(1280, exception_on_overflow=False)
                     frame = np.frombuffer(mic_data, dtype=np.int16)
 
-                        # Skip initial 0.3s to avoid audio transient pops
-                    if (time.time() - playback_start_time) < 0.3:
-                            continue
+                    # 2. Skip first 0.35s to prevent audio clicks/pops from triggering barge-in
+                    if (time.time() - playback_start_time) < 0.35:
+                        continue
 
-                    rms = calculate_rms(mic_data)
-                        # If your voice spikes noticeably above the speaker audio
-                    if rms > 1400:
-                        norm = frame.astype(np.float32) / 32768.0
-                        phrase = stt.transcribe(norm).lower().strip()
-                        if any(w in phrase for w in ["stop", "quiet", "shut up", "hold on", "cancel"]):
-                            print(f"[Interruption] Spoken stop command detected: '{phrase}'")
-                            self.interrupted.set()
-                            playback_thread.join()
-                            return
-                        else:
-                            consecutive_stop_hits = 0
+                    # 3. Predict wake words
+                    prediction = oww_model.predict(frame)
 
-                        # Priority 2: Wake Word Interruption (requires higher confidence to beat speaker bleed)
-                    elif "heylibra" in model_name_lower or "hey_libra" in model_name_lower:
-                        if score >= 0.72:
-                            consecutive_wake_hits += 1
-                            if consecutive_wake_hits >= 2:
-                                print(
-                                    f"\n[Barge-In]: Wake word confirmed during speech ({score:.2f}). Cutting audio."
-                                )
-                                self.interrupted.set()
-                                playback_thread.join()
-                                return
-                        else:
-                            consecutive_wake_hits = 0
+                    for model_name, score in prediction.items():
+                        model_name_lower = str(model_name).lower()
+
+                        # Priority 1: Dedicated Hardware STOP trigger
+                        if "stop" in model_name_lower:
+                            if score >= 0.50:
+                                consecutive_stop_hits += 1
+                                if consecutive_stop_hits >= 2:
+                                    print(f"\n[Barge-In]: STOP model verified ({score:.2f}). Cutting audio.")
+                                    self.interrupted.set()
+                                    playback_thread.join()
+                                    return
+                            else:
+                                consecutive_stop_hits = 0
+
+                        # Priority 2: Wake Word Interruption
+                        elif "heylibra" in model_name_lower or "hey_libra" in model_name_lower:
+                            if score >= 0.72:
+                                consecutive_wake_hits += 1
+                                if consecutive_wake_hits >= 2:
+                                    print(f"\n[Barge-In]: Wake word confirmed during speech ({score:.2f}). Cutting audio.")
+                                    self.interrupted.set()
+                                    playback_thread.join()
+                                    return
+                            else:
+                                consecutive_wake_hits = 0
 
                 except Exception as e:
                     print(f"[Interruption Loop Warning]: {e}")
@@ -259,7 +266,7 @@ class VoiceAssistantWorker(QThread):
                 speak_interruptible(random.choice(wake_phrases))
 
             # -------------------------------------------------------------
-            # STATE 2: RECORD INPUT (VAD + PRE-ROLL)
+            # STATE 2: RECORD INPUT (SILERO VAD + PRE-ROLL)
             # -------------------------------------------------------------
             if in_followup_mode:
                 self.status_changed.emit("FOLLOW-UP // LISTENING...")
@@ -269,11 +276,11 @@ class VoiceAssistantWorker(QThread):
             recorded_chunks = list(pre_roll_buffer) if not in_followup_mode else []
             pre_roll_buffer.clear()
 
-            silence_start = None
             speech_started = False
-            # 1.1s allows natural pauses between words without cutting you off
-            silence_timeout = 1.15       
-            energy_threshold = 520  
+            silence_start = None
+            silence_timeout = 1.0  # 1 full second of true silence required to end turn
+            vad_speech_threshold = 0.5  # Voice probability threshold (0.0 to 1.0)
+            
             followup_wait_timeout = 4.5 if in_followup_mode else 12.0
             listen_start_time = time.time()
 
@@ -281,14 +288,24 @@ class VoiceAssistantWorker(QThread):
                 chunk = input_stream.read(1280, exception_on_overflow=False)
                 recorded_chunks.append(chunk)
 
-                rms = calculate_rms(chunk)
-                if rms > energy_threshold:
+                # Convert int16 chunk to float32
+                audio_np = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+
+                # Silero requires strictly 512-sample blocks at 16kHz.
+                # Take the first 512 samples (or max confidence across slices)
+                chunk_512 = audio_np[:512]
+                audio_tensor = torch.from_numpy(chunk_512)
+
+                speech_prob = vad_model(audio_tensor, 16000).item()
+
+                if speech_prob >= vad_speech_threshold:
                     speech_started = True
                     silence_start = None
                 elif speech_started:
+                    # Voice was active, now silent
                     if silence_start is None:
                         silence_start = time.time()
-                    elif (time.time() - silence_start) > silence_timeout:
+                    elif (time.time() - silence_start) >= silence_timeout:
                         break
 
             if not speech_started or not recorded_chunks:
