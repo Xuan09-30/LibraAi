@@ -2,285 +2,235 @@ import os
 import sys
 import time
 import math
-import struct
 import random
 import threading
-from datetime import datetime
-from collections import deque
+import warnings
 import numpy as np
 import pyaudio
 import torch
-from silero_vad import load_silero_vad, get_speech_timestamps
+import keyboard
 
-# Ensure project root is in sys.path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QTextEdit, QFrame, QGraphicsDropShadowEffect
+)
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QRectF, QUrl
+from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QLinearGradient
+from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from openwakeword.model import Model
-from core.tts import TextToSpeech
+from silero_vad import load_silero_vad
+from core.kokoro_tts import KokoroTTS
 from core.stt import SpeechToText
 from core.llm import LocalLLM
-from tools.weather import get_weekly_forecast, get_forecast_for_iso_date
-from tools.system_actions import launch_any_application, web_search
 
-from PyQt6.QtCore import Qt, QTimer, QUrl, QThread, pyqtSignal, QEvent
-from PyQt6.QtGui import QColor, QAction
-from PyQt6.QtWidgets import (
-    QApplication,
-    QMainWindow,
-    QWidget,
-    QHBoxLayout,
-    QVBoxLayout,
-    QLabel,
-    QPushButton,
-    QFrame,
-    QTableWidget,
-    QTableWidgetItem,
-    QHeaderView,
-    QStackedWidget,
-    QSystemTrayIcon,
-    QMenu,
-)
-from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEngineSettings
+warnings.filterwarnings("ignore")
 
 
-def calculate_rms(audio_bytes):
-    count = len(audio_bytes) // 2
-    if count == 0:
-        return 0
-    shorts = struct.unpack(f"{count}h", audio_bytes)
-    return math.sqrt(sum(s * s for s in shorts) / count)
+class CyberAudioVisualizer(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(50)
+        self.num_bars = 36
+        self.bar_heights = [0.1] * self.num_bars
+        self.target_heights = [0.1] * self.num_bars
+        self.is_active = False
+
+        self.anim_timer = QTimer(self)
+        self.anim_timer.timeout.connect(self._animate_bars)
+        self.anim_timer.start(30)
+
+    def set_active(self, active: bool):
+        self.is_active = active
+
+    def _animate_bars(self):
+        for i in range(self.num_bars):
+            if self.is_active:
+                center_dist = abs(i - self.num_bars / 2) / (self.num_bars / 2)
+                boost = max(0.2, 1.0 - (center_dist * 0.6))
+                self.target_heights[i] = random.uniform(0.15, 0.95) * boost
+            else:
+                self.target_heights[i] = 0.08 + 0.04 * math.sin(time.time() * 3 + i * 0.3)
+            self.bar_heights[i] += (self.target_heights[i] - self.bar_heights[i]) * 0.35
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        bar_width = (w - (self.num_bars * 3)) / self.num_bars
+
+        for i in range(self.num_bars):
+            x = i * (bar_width + 3)
+            bar_h = self.bar_heights[i] * (h - 8)
+            y = (h - bar_h) / 2
+
+            gradient = QLinearGradient(x, y, x, y + bar_h)
+            if self.is_active:
+                gradient.setColorAt(0.0, QColor(0, 255, 204, 255))
+                gradient.setColorAt(1.0, QColor(138, 43, 226, 200))
+            else:
+                gradient.setColorAt(0.0, QColor(0, 229, 255, 120))
+                gradient.setColorAt(1.0, QColor(15, 30, 60, 180))
+
+            painter.setBrush(QBrush(gradient))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.drawRoundedRect(QRectF(x, y, bar_width, bar_h), 2, 2)
 
 
 class VoiceAssistantWorker(QThread):
     status_changed = pyqtSignal(str)
-    show_table_signal = pyqtSignal(list)
-    hide_table_signal = pyqtSignal()
+    visualizer_state = pyqtSignal(bool)
+    log_received = pyqtSignal(str, str)
+    telemetry_update = pyqtSignal(str, str)
 
-    def __init__(self, model_path="assets/wakewords/Hey_Libra.onnx", threshold=0.35):
+    def __init__(self):
         super().__init__()
-        self.model_path = model_path
-        self.threshold = threshold
         self.running = True
         self.interrupted = threading.Event()
 
+    def stop(self):
+        self.running = False
+        self.interrupted.set()
+
     def run(self):
         print("\n--- [WORKER THREAD INITIALIZING] ---")
-
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        # In VoiceAssistantWorker.run()
-        abs_model_path = os.path.join(project_root, "assets", "wakewords", "Hey_Libra.onnx")
-        stop_model_path = os.path.join(project_root, "assets", "wakewords", "stop.onnx")
-        
-        models_to_load = [abs_model_path]
-        if os.path.exists(stop_model_path):
-            models_to_load.append(stop_model_path)
-            print("[Worker] Loaded stop.onnx for dedicated hardware barge-in.")
+        wakewords_dir = os.path.join(project_root, "assets", "wakewords")
+        libra_model = os.path.join(wakewords_dir, "Hey_Libra.onnx")
 
-        oww_model = Model(wakeword_models=models_to_load)
+        active_models = [libra_model] if os.path.exists(libra_model) else []
+        oww_model = Model(wakeword_models=active_models)
+        self.telemetry_update.emit("WAKEWORD", "HEY LIBRA [ONLINE]")
 
-        self.status_changed.emit("INITIALIZING SYSTEM ENGINES...")
+        tts = KokoroTTS(voice="af_heart")
+        self.telemetry_update.emit("TTS_ENGINE", "KOKORO-82M [24kHz]")
 
-        try:
-            print("[Worker] Loading OpenWakeWord...")
-            oww_model = Model(wakeword_models=[abs_model_path])
-            print("[Worker] Initializing Piper TTS...")
-            tts = TextToSpeech()
-            print("[Worker] Initializing Whisper STT...")
-            stt = SpeechToText()
-            print("[Worker] Connecting to Local LLM Core...")
-            llm = LocalLLM()
-            print("[Worker] Initializing Silero VAD turn detector...")
-            vad_model = load_silero_vad()
-        except Exception as e:
-            print(f"[Worker FATAL ERROR during initialization]: {e}")
-            self.status_changed.emit("INIT ERROR")
-            return
+        stt = SpeechToText()
+        self.telemetry_update.emit("STT_ENGINE", f"WHISPER [{stt.device.upper()}]")
 
-        try:
-            pa = pyaudio.PyAudio()
-            default_input = pa.get_default_input_device_info()
-            print(f"[Worker] Audio In: {default_input['name']}")
+        llm = LocalLLM()
+        self.telemetry_update.emit("LLM_CORE", "QWEN3-INSTRUCT [LOCAL]")
 
-            input_stream = pa.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=16000,
-                input=True,
-                frames_per_buffer=1280
-            )
-        except Exception as e:
-            print(f"[Worker Mic Stream Error]: {e}")
-            self.status_changed.emit("MIC STREAM ERROR")
-            return
+        vad_model = load_silero_vad()
+        self.telemetry_update.emit("VAD_DETECTOR", "SILERO V4 [ACTIVE]")
+
+        pa = pyaudio.PyAudio()
+        input_stream = pa.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1280)
+        self.status_changed.emit("SYSTEM READY // AWAITING VOCAL PROMPT")
 
         def speak_interruptible(text: str):
-            """Synthesizes and plays audio asynchronously while actively monitoring
-
-            the microphone for hardware-level barge-in ('stop' or wake word).
-            """
             if not text or not text.strip():
                 return
 
             self.interrupted.clear()
-            sample_rate = getattr(tts.voice.config, "sample_rate", 22050)
+            self.status_changed.emit("SPEAKING... [SPACE TO STOP]")
+            self.visualizer_state.emit(True)
 
-            # 1. Synthesize audio buffer using Piper
             audio_buffer = []
             try:
-                for chunk in tts.voice.synthesize(text):
-                    data = getattr(chunk, "audio_int16_bytes", chunk)
-                    if isinstance(data, bytes):
-                        audio_buffer.append(data)
+                for chunk_bytes in tts.synthesize_stream(text):
+                    if chunk_bytes:
+                        audio_buffer.append(chunk_bytes)
             except Exception as ex:
-                print(f"[TTS Synthesis Error]: {ex}")
+                print(f"[Kokoro Synthesis Error]: {ex}")
+                self.visualizer_state.emit(False)
                 return
 
             full_audio = b"".join(audio_buffer)
             if not full_audio:
+                self.visualizer_state.emit(False)
                 return
 
             playback_finished = threading.Event()
+            out_stream_holder = [None]
 
-            # 2. Background audio playback thread
+            def on_space_pressed(e):
+                if e.name == "space":
+                    print("\n[Barge-In]: SPACEBAR pressed! Cutting audio.")
+                    self.interrupted.set()
+                    if out_stream_holder[0]:
+                        try:
+                            out_stream_holder[0].stop_stream()
+                        except Exception:
+                            pass
+
+            space_hook = keyboard.on_press(on_space_pressed)
+
             def play_audio():
+                pa_out = pyaudio.PyAudio()
                 try:
-                    out_stream = pa.open(
-                        format=pyaudio.paInt16,
-                        channels=1,
-                        rate=sample_rate,
-                        output=True,
-                    )
-                    chunk_size = 2048
-                    for i in range(0, len(full_audio), chunk_size):
+                    out_stream = pa_out.open(format=pyaudio.paInt16, channels=1, rate=24000, output=True, frames_per_buffer=2400)
+                    out_stream_holder[0] = out_stream
+                    chunk_bytes = 2400 * 2
+                    for i in range(0, len(full_audio), chunk_bytes):
                         if self.interrupted.is_set():
                             break
-                        out_stream.write(full_audio[i : i + chunk_size])
+                        out_stream.write(full_audio[i:i + chunk_bytes])
                     out_stream.stop_stream()
                     out_stream.close()
                 except Exception as ex:
-                    print(f"[Playback Stream Error]: {ex}")
+                    print(f"[Playback Error]: {ex}")
                 finally:
+                    pa_out.terminate()
                     playback_finished.set()
 
-            playback_start_time = time.time()
             playback_thread = threading.Thread(target=play_audio, daemon=True)
             playback_thread.start()
 
-            # 3. Interruption detection loop (runs on the main worker thread)
-            consecutive_wake_hits = 0
-            consecutive_stop_hits = 0
-            oww_model.reset()
-
-            while not playback_finished.is_set():
-                try:
-                    # 1. Read fresh audio frame from microphone
-                    mic_data = input_stream.read(1280, exception_on_overflow=False)
-                    frame = np.frombuffer(mic_data, dtype=np.int16)
-
-                    # 2. Skip first 0.35s to prevent audio clicks/pops from triggering barge-in
-                    if (time.time() - playback_start_time) < 0.35:
-                        continue
-
-                    # 3. Predict wake words
-                    prediction = oww_model.predict(frame)
-
-                    for model_name, score in prediction.items():
-                        model_name_lower = str(model_name).lower()
-
-                        # Priority 1: Dedicated Hardware STOP trigger
-                        if "stop" in model_name_lower:
-                            if score >= 0.50:
-                                consecutive_stop_hits += 1
-                                if consecutive_stop_hits >= 2:
-                                    print(f"\n[Barge-In]: STOP model verified ({score:.2f}). Cutting audio.")
-                                    self.interrupted.set()
-                                    playback_thread.join()
-                                    return
-                            else:
-                                consecutive_stop_hits = 0
-
-                        # Priority 2: Wake Word Interruption
-                        elif "heylibra" in model_name_lower or "hey_libra" in model_name_lower:
-                            if score >= 0.72:
-                                consecutive_wake_hits += 1
-                                if consecutive_wake_hits >= 2:
-                                    print(f"\n[Barge-In]: Wake word confirmed during speech ({score:.2f}). Cutting audio.")
-                                    self.interrupted.set()
-                                    playback_thread.join()
-                                    return
-                            else:
-                                consecutive_wake_hits = 0
-
-                except Exception as e:
-                    print(f"[Interruption Loop Warning]: {e}")
+            while not playback_finished.is_set() and not self.interrupted.is_set():
                 time.sleep(0.01)
 
-            playback_thread.join()
-
-            # 4. Flush residual speaker bleed and echo from the microphone buffer
-            oww_model.reset()
             try:
-                while input_stream.get_read_available() > 0:
-                    input_stream.read(
-                        input_stream.get_read_available(),
-                        exception_on_overflow=False,
-                    )
+                keyboard.unhook(space_hook)
             except Exception:
                 pass
 
-        print("[Worker] Engines online. Entering listening cycle.")
-        self.status_changed.emit("ONLINE // READY")
+            playback_thread.join()
+            self.visualizer_state.emit(False)
 
-        # Rolling ring buffer to prevent clipping leading phonemes
-        pre_roll_buffer = deque(maxlen=4)
+            try:
+                while input_stream.get_read_available() > 0:
+                    input_stream.read(input_stream.get_read_available(), exception_on_overflow=False)
+            except Exception:
+                pass
+
         in_followup_mode = False
+        pre_roll_buffer = []
 
         while self.running:
-            # -------------------------------------------------------------
-            # STATE 1: PASSIVE DETECTION (Bypassed during follow-up)
-            # -------------------------------------------------------------
             if not in_followup_mode:
-                try:
-                    raw_audio = input_stream.read(1280, exception_on_overflow=False)
-                except Exception as e:
-                    time.sleep(0.05)
-                    continue
+                self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
+                self.visualizer_state.emit(False)
+                oww_model.reset()
 
-                pre_roll_buffer.append(raw_audio)
-                audio_frame = np.frombuffer(raw_audio, dtype=np.int16)
-                prediction = oww_model.predict(audio_frame)
+                while self.running and not in_followup_mode:
+                    audio_data = input_stream.read(1280, exception_on_overflow=False)
+                    pre_roll_buffer.append(audio_data)
+                    if len(pre_roll_buffer) > 10:
+                        pre_roll_buffer.pop(0)
 
-                wake_detected = False
-                for _, score in prediction.items():
-                    if score >= self.threshold:
-                        print(f"\n[Worker] Wake word triggered! Score: {score:.3f}")
-                        wake_detected = True
-                        break
+                    audio_frame = np.frombuffer(audio_data, dtype=np.int16)
+                    prediction = oww_model.predict(audio_frame)
 
-                if not wake_detected:
-                    continue
+                    for model_name, score in prediction.items():
+                        if "libra" in str(model_name).lower() and score >= 0.50:
+                            print(f"\n[Worker] Wake word triggered! Score: {score:.3f}")
+                            break
+                    else:
+                        continue
+                    break
 
-                self.status_changed.emit("WAKE DETECTED // LISTENING...")
-                wake_phrases = ["I'm listening.", "Online.", "Yes?", "Listening."]
-                speak_interruptible(random.choice(wake_phrases))
-
-            # -------------------------------------------------------------
-            # STATE 2: RECORD INPUT (SILERO VAD + PRE-ROLL)
-            # -------------------------------------------------------------
             if in_followup_mode:
-                self.status_changed.emit("FOLLOW-UP // LISTENING...")
+                self.status_changed.emit("CONVERSATIONAL FOLLOW-UP ACTIVE...")
             else:
-                self.status_changed.emit("RECORDING VOCAL INPUT...")
+                self.status_changed.emit("RECORDING USER INPUT...")
 
             recorded_chunks = list(pre_roll_buffer) if not in_followup_mode else []
             pre_roll_buffer.clear()
 
             speech_started = False
             silence_start = None
-            silence_timeout = 1.0  # 1 full second of true silence required to end turn
-            vad_speech_threshold = 0.5  # Voice probability threshold (0.0 to 1.0)
-            
             followup_wait_timeout = 4.5 if in_followup_mode else 12.0
             listen_start_time = time.time()
 
@@ -288,393 +238,254 @@ class VoiceAssistantWorker(QThread):
                 chunk = input_stream.read(1280, exception_on_overflow=False)
                 recorded_chunks.append(chunk)
 
-                # Convert int16 chunk to float32
                 audio_np = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                audio_tensor = torch.from_numpy(audio_np[:512])
 
-                # Silero requires strictly 512-sample blocks at 16kHz.
-                # Take the first 512 samples (or max confidence across slices)
-                chunk_512 = audio_np[:512]
-                audio_tensor = torch.from_numpy(chunk_512)
-
-                speech_prob = vad_model(audio_tensor, 16000).item()
-
-                if speech_prob >= vad_speech_threshold:
+                if vad_model(audio_tensor, 16000).item() >= 0.50:
                     speech_started = True
                     silence_start = None
                 elif speech_started:
-                    # Voice was active, now silent
                     if silence_start is None:
                         silence_start = time.time()
-                    elif (time.time() - silence_start) >= silence_timeout:
+                    elif (time.time() - silence_start) >= 1.0:
                         break
 
             if not speech_started or not recorded_chunks:
-                if in_followup_mode:
-                    print("[Worker] Follow-up window idle. Returning to standby.")
-                    in_followup_mode = False
-                self.status_changed.emit("ONLINE // READY")
-                continue
-
-            # -------------------------------------------------------------
-            # STATE 3: TRANSCRIBE
-            # -------------------------------------------------------------
-            self.status_changed.emit("PROCESSING AUDIO...")
-            raw_data = b"".join(recorded_chunks)
-            audio_np = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
-
-            user_query = stt.transcribe(audio_np).lower().strip()
-            print(f"[Captured Input]: {user_query}")
-
-            if not user_query or len(user_query) < 2:
                 in_followup_mode = False
-                self.status_changed.emit("ONLINE // READY")
+                self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
                 continue
 
-            # Dismissal keywords
-            if any(w in user_query for w in ["thank you", "thanks", "bye", "goodbye", "never mind", "that's all", "im good"]):
-                speak_interruptible("You're welcome. Standing by.")
+            self.status_changed.emit("NEURAL TRANSCRIBING...")
+            t0 = time.time()
+            raw_audio = b"".join(recorded_chunks)
+            audio_array = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
+            user_text = stt.transcribe(audio_array)
+            stt_latency = (time.time() - t0) * 1000
+            self.telemetry_update.emit("STT_LATENCY", f"{stt_latency:.0f} ms")
+
+            if not user_text.strip():
                 in_followup_mode = False
-                self.status_changed.emit("ONLINE // READY")
+                self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
                 continue
 
-            # -------------------------------------------------------------
-            # STATE 4: REASONING & EXECUTION (QWEN3:8B)
-            # -------------------------------------------------------------
-            self.status_changed.emit("NEURAL REASONING...")
-            decision = llm.plan_and_respond(user_query)
-            action = decision.get("action")
-            voice_response = decision.get("voice_response")
-            print(f"[Libra Core]: {decision}")
+            print(f"[Captured Input]: {user_text}")
+            self.log_received.emit("USER", user_text)
 
-            if action in ["live_research", "recommend_music"]:
-                self.status_changed.emit("WEB SYNTHESIS...")
-                speak_interruptible(voice_response or "Research completed.")
-            elif action == "open_app":
-                target_app = decision.get("target_app", "")
-                self.status_changed.emit(f"LAUNCHING {target_app.upper()}...")
-                success, msg = launch_any_application(target_app)
-                speak_interruptible(voice_response or msg)
-            elif action == "web_search":
-                platform = decision.get("platform", "google")
-                query = decision.get("search_query", "")
-                self.status_changed.emit(f"SEARCHING {platform.upper()}...")
-                msg = web_search(query, platform=platform)
-                speak_interruptible(voice_response or msg)
-            elif action == "remember_fact":
-                self.status_changed.emit("MEMORY COMMITTED...")
-                speak_interruptible(voice_response or "Recorded.")
-            elif action == "get_weekly_weather":
-                self.status_changed.emit("QUERYING 7-DAY TELEMETRY...")
-                forecast = get_weekly_forecast()
-                if forecast:
-                    self.show_table_signal.emit(forecast)
-                    speak_interruptible("This is the prediction for the next week.")
-                else:
-                    speak_interruptible("I was unable to retrieve the weekly atmospheric data.")
-            elif action == "get_daily_weather":
-                target_date = decision.get("target_date")
-                self.status_changed.emit("QUERYING DATE TELEMETRY...")
-                answer = get_forecast_for_iso_date(target_date)
-                speak_interruptible(answer)
-            elif action == "unsupported_weather_range":
-                self.status_changed.emit("ATMOSPHERIC LIMIT...")
-                speak_interruptible(voice_response or "Atmospheric models only predict up to 14 days ahead.")
+            self.status_changed.emit("PROCESSING REASONING...")
+            t_llm = time.time()
+            response_data = llm.plan_and_respond(user_text)
+            llm_latency = (time.time() - t_llm) * 1000
+            self.telemetry_update.emit("LLM_LATENCY", f"{llm_latency:.0f} ms")
+
+            voice_msg = ""
+            action = response_data.get("action", "chat")
+            if "voice_response" in response_data and response_data["voice_response"]:
+                voice_msg = response_data["voice_response"]
+            elif action in ["web_search", "lookup_entity"]:
+                query = response_data.get("search_query") or response_data.get("target_entity", "")
+                voice_msg = f"Searching archives for {query}."
             else:
-                self.status_changed.emit("LIBRA SPEAKING...")
-                speak_interruptible(voice_response or "Online and listening.")
+                voice_msg = "Task processed."
 
-            # Flush residual audio buffers to prevent self-echo
-            # Flush mic buffer so speaker output is discarded
-            oww_model.reset()
-            try:
-                while input_stream.get_read_available() > 0:
-                    input_stream.read(input_stream.get_read_available(), exception_on_overflow=False)
-            except Exception:
-                pass
-            time.sleep(0.3)
-
-            # Only enter follow-up mode if an action was actually executed
-            if decision and decision.get("action"):
-                in_followup_mode = True
-                self.status_changed.emit("FOLLOW-UP // LISTENING...")
-            else:
-                in_followup_mode = False
-                self.status_changed.emit("ONLINE // READY")
+            self.log_received.emit("LIBRA", voice_msg)
+            speak_interruptible(voice_msg)
+            in_followup_mode = True
 
         input_stream.stop_stream()
         input_stream.close()
         pa.terminate()
 
-    def stop(self):
-        self.running = False
-        self.interrupted.set()
-        self.wait()
 
-
-class LibraGUI(QMainWindow):
+class FuturisticVoiceAssistantUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("LIBRA // ADVANCED SYSTEM OVERVIEW")
-        self.resize(1440, 840)
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #030708;
-            }
-            * {
-                color: #00f0ff;
-                font-family: 'Consolas', 'Courier New', monospace;
-            }
+        self.init_ui()
+        self.init_worker()
+
+    def init_ui(self):
+        self.setWindowTitle("LIBRA // CYBERNETIC NEURAL INTERFACE")
+        self.resize(1180, 720)
+        self.setStyleSheet("background-color: #04070f;")
+
+        central = QWidget(self)
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(20, 18, 20, 18)
+        main_layout.setSpacing(12)
+
+        # 1. Header
+        header = QHBoxLayout()
+        title_box = QVBoxLayout()
+        title_label = QLabel("LIBRA AI // NEURAL TERMINAL")
+        title_label.setFont(QFont("Consolas", 14, QFont.Weight.Bold))
+        title_label.setStyleSheet("color: #00ffcc; letter-spacing: 3px;")
+        sub_label = QLabel("QUANTUM REASONING CORE // ARCHITECTURE V3.2")
+        sub_label.setFont(QFont("Consolas", 8))
+        sub_label.setStyleSheet("color: #0088aa; letter-spacing: 1.5px;")
+        title_box.addWidget(title_label)
+        title_box.addWidget(sub_label)
+        header.addLayout(title_box)
+
+        header.addStretch()
+
+        self.stat_box = QLabel("INFERENCE: NOMINAL | VRAM: ACTIVE")
+        self.stat_box.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        self.stat_box.setStyleSheet("color: #00e5ff; background: #0c1524; border: 1px solid #142845; border-radius: 4px; padding: 6px 12px;")
+        header.addWidget(self.stat_box)
+
+        self.clock_label = QLabel()
+        self.clock_label.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
+        self.clock_label.setStyleSheet("color: #64748b; margin-left: 10px;")
+        header.addWidget(self.clock_label)
+        main_layout.addLayout(header)
+
+        # 2. Status Banner
+        self.status_banner = QLabel("SYSTEM INITIALIZING...")
+        self.status_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_banner.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+        self.status_banner.setStyleSheet("""
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #091322, stop:0.5 #13243d, stop:1 #091322);
+            color: #00ffcc; border: 1px solid #00e5ff; border-radius: 6px;
+            padding: 9px; letter-spacing: 2px;
         """)
+        main_layout.addWidget(self.status_banner)
 
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
-        main_layout.setContentsMargins(24, 24, 24, 24)
-        main_layout.setSpacing(24)
+        # 3. Main Workspace: 3D Orb Core (Left) + Terminal & Telemetry (Right)
+        workspace = QHBoxLayout()
+        workspace.setSpacing(14)
 
-        # Left HUD Control Panel
-        sidebar = QFrame()
-        sidebar.setFixedWidth(310)
-        sidebar.setStyleSheet("""
-            QFrame {
-                border: 1px solid rgba(0, 240, 255, 0.25);
-                border-top: 2px solid #00f0ff;
-                border-bottom: 2px solid #00f0ff;
-                background-color: rgba(3, 15, 20, 0.65);
-            }
-            QPushButton {
-                background-color: rgba(0, 240, 255, 0.04);
-                border: 1px solid rgba(0, 240, 255, 0.25);
-                color: #8be9fd;
-                padding: 12px 14px;
-                text-align: left;
-                font-weight: 600;
-                font-size: 11px;
-                letter-spacing: 1px;
-                margin-bottom: 8px;
-            }
-            QPushButton:hover {
-                background-color: rgba(0, 240, 255, 0.16);
-                border: 1px solid #00f0ff;
-                color: #ffffff;
-            }
-        """)
-        sidebar_layout = QVBoxLayout(sidebar)
-        sidebar_layout.setContentsMargins(16, 20, 16, 20)
-
-        panel_tag = QLabel("+ CONTROLES_SYSTEME // MENU")
-        panel_tag.setStyleSheet("color: #00ffff; font-size: 11px; font-weight: bold; border: none; margin-bottom: 16px;")
-        sidebar_layout.addWidget(panel_tag)
-
-        section_ai = QLabel("INTELLIGENCE ARTIFICIELLE")
-        section_ai.setStyleSheet("color: rgba(0, 240, 255, 0.45); font-size: 9px; font-weight: bold; border: none; margin-top: 4px; margin-bottom: 6px;")
-        sidebar_layout.addWidget(section_ai)
-
-        sidebar_layout.addWidget(QPushButton("● WAKE MONITOR [ACTIVE]"))
-        sidebar_layout.addWidget(QPushButton("● ACTIVER LA VISION"))
-
-        section_perf = QLabel("PERFORMANCES & ACCÈS")
-        section_perf.setStyleSheet("color: rgba(0, 240, 255, 0.45); font-size: 9px; font-weight: bold; border: none; margin-top: 8px; margin-bottom: 6px;")
-        sidebar_layout.addWidget(section_perf)
-
-        sidebar_layout.addWidget(QPushButton("⚡ GPU BOOST (RTX MODE)"))
-        btn_weather = QPushButton("🌦 METEO PREDICTIONS")
-        sidebar_layout.addWidget(btn_weather)
-        sidebar_layout.addWidget(QPushButton("⚙ CONFIGURATION CORE"))
-
-        sidebar_layout.addStretch()
-
-        system_readout = QLabel(
-            "SYS.OS: WIN_X64\n"
-            "ENGINE: TENSOR_ONNX\n"
-            "NET: LOCALHOST_OFFLINE"
-        )
-        system_readout.setStyleSheet("color: rgba(0, 240, 255, 0.35); font-size: 9px; border: none; line-height: 140%;")
-        sidebar_layout.addWidget(system_readout)
-
-        main_layout.addWidget(sidebar)
-
-        # Right Telemetry + Orb/HUD Area
-        right_area = QWidget()
-        right_layout = QVBoxLayout(right_area)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(14)
-
-        self.hud_header = QFrame()
-        self.hud_header.setFixedHeight(84)
-        self.hud_header.setStyleSheet("""
-            QFrame {
-                border: 1px solid rgba(0, 240, 255, 0.25);
-                background-color: rgba(3, 15, 20, 0.55);
-            }
-        """)
-        header_layout = QHBoxLayout(self.hud_header)
-        header_layout.setContentsMargins(20, 8, 20, 8)
-
-        left_stat = QLabel("SYS_STABLE\nLATENCY: 12ms")
-        left_stat.setStyleSheet("font-size: 9px; color: rgba(0, 240, 255, 0.5); border: none;")
-        header_layout.addWidget(left_stat, alignment=Qt.AlignmentFlag.AlignVCenter)
-
-        clock_container = QVBoxLayout()
-        clock_subtag = QLabel("+ LOCAL TIME // UTC+8 +")
-        clock_subtag.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        clock_subtag.setStyleSheet("font-size: 9px; color: rgba(0, 240, 255, 0.55); border: none; letter-spacing: 1px;")
-
-        self.clock_label = QLabel("00:00:00")
-        self.clock_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.clock_label.setStyleSheet("font-size: 32px; font-weight: bold; color: #00f0ff; border: none; letter-spacing: 3px;")
-
-        self.date_label = QLabel("00/00/0000")
-        self.date_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.date_label.setStyleSheet("font-size: 9px; color: rgba(0, 240, 255, 0.65); border: none;")
-
-        clock_container.addWidget(clock_subtag)
-        clock_container.addWidget(self.clock_label)
-        clock_container.addWidget(self.date_label)
-        header_layout.addLayout(clock_container)
-
-        right_stat = QLabel("STATUS: SECURE\nLINK: STANDALONE")
-        right_stat.setAlignment(Qt.AlignmentFlag.AlignRight)
-        right_stat.setStyleSheet("font-size: 9px; color: rgba(0, 240, 255, 0.5); border: none;")
-        header_layout.addWidget(right_stat, alignment=Qt.AlignmentFlag.AlignVCenter)
-
-        right_layout.addWidget(self.hud_header)
-
-        self.center_stack = QStackedWidget()
+        # LEFT PANE: 3D Three.js Orb Canvas
+        orb_container = QFrame()
+        orb_container.setStyleSheet("background-color: #030708; border: 1px solid #142238; border-radius: 8px;")
+        orb_layout = QVBoxLayout(orb_container)
+        orb_layout.setContentsMargins(4, 4, 4, 4)
 
         self.orb_view = QWebEngineView()
-        self.orb_view.setStyleSheet("background: transparent; border: none;")
-        self.orb_view.page().setBackgroundColor(QColor(0, 0, 0, 0))
-        self.orb_view.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
-        self.orb_view.settings().setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, True)
+        self.orb_view.setStyleSheet("background: transparent;")
+        
+        # Load local assets/index.html
+        # Target ui/orb/index.html directly
+        orb_file_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "orb", "index.html"))
+        print(f"[GUI] Loading WebGL Core from: {orb_file_path}")
+        self.orb_view.setUrl(QUrl.fromLocalFile(orb_file_path))
+        orb_layout.addWidget(self.orb_view)
 
-        base_path = os.path.dirname(os.path.abspath(__file__))
-        orb_html_path = os.path.join(base_path, "orb", "index.html")
-        if os.path.exists(orb_html_path):
-            self.orb_view.setUrl(QUrl.fromLocalFile(orb_html_path))
-        self.center_stack.addWidget(self.orb_view)
+        workspace.addWidget(orb_container, stretch=5)
 
-        self.weather_table = QTableWidget(7, 3)
-        self.weather_table.setHorizontalHeaderLabels(["DATE", "TEMPERATURE", "CONDITION"])
-        self.weather_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.weather_table.verticalHeader().setVisible(False)
-        self.weather_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.weather_table.setStyleSheet("""
-            QTableWidget {
-                background-color: rgba(3, 15, 20, 0.7);
-                color: #00f0ff;
-                font-size: 14px;
-                gridline-color: rgba(0, 240, 255, 0.15);
-                border: 1px solid rgba(0, 240, 255, 0.3);
-            }
-            QHeaderView::section {
-                background-color: rgba(0, 40, 50, 0.85);
-                color: #ffffff;
-                font-weight: bold;
-                font-size: 12px;
-                border: 1px solid rgba(0, 240, 255, 0.25);
-                padding: 10px;
-            }
-            QTableWidget::item { padding: 12px; }
+        # RIGHT PANE: Chat Terminal + Visualizer + Telemetry
+        right_container = QVBoxLayout()
+        right_container.setSpacing(10)
+
+        # Audio visualizer
+        self.visualizer = CyberAudioVisualizer(self)
+        right_container.addWidget(self.visualizer)
+
+        # Bottom row: Terminal + Telemetry
+        chat_telemetry_row = QHBoxLayout()
+        chat_telemetry_row.setSpacing(10)
+
+        self.terminal = QTextEdit()
+        self.terminal.setReadOnly(True)
+        self.terminal.setFont(QFont("Consolas", 10))
+        self.terminal.setStyleSheet("""
+            background-color: #04060c; color: #cbd5e1;
+            border: 1px solid #152238; border-radius: 8px;
+            padding: 12px; line-height: 1.5;
         """)
-        self.center_stack.addWidget(self.weather_table)
-        right_layout.addWidget(self.center_stack, stretch=1)
+        chat_telemetry_row.addWidget(self.terminal, stretch=7)
 
-        self.status_display = QLabel("[ INITIALIZING TELEMETRY... ]")
-        self.status_display.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_display.setStyleSheet("""
-            font-size: 11px;
-            font-weight: bold;
-            color: #00f0ff;
-            border: 1px solid rgba(0, 240, 255, 0.3);
-            border-left: 3px solid #00f0ff;
-            border-right: 3px solid #00f0ff;
-            padding: 8px 30px;
-            background-color: rgba(3, 15, 20, 0.8);
-            letter-spacing: 2px;
-        """)
-        right_layout.addWidget(self.status_display, alignment=Qt.AlignmentFlag.AlignHCenter)
+        # Telemetry list
+        sidebar = QVBoxLayout()
+        sidebar.setSpacing(6)
+        sidebar_title = QLabel("SYSTEM TELEMETRY")
+        sidebar_title.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        sidebar_title.setStyleSheet("color: #00ffcc; border-bottom: 1px solid #152238; padding-bottom: 2px;")
+        sidebar.addWidget(sidebar_title)
 
-        main_layout.addWidget(right_area, stretch=1)
+        self.telemetry_labels = {}
+        for key in ["WAKEWORD", "STT_ENGINE", "STT_LATENCY", "LLM_CORE", "LLM_LATENCY", "TTS_ENGINE", "VAD_DETECTOR"]:
+            k_lbl = QLabel(key.replace("_", " "))
+            k_lbl.setFont(QFont("Consolas", 7))
+            k_lbl.setStyleSheet("color: #475569;")
+            v_lbl = QLabel("--")
+            v_lbl.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+            v_lbl.setStyleSheet("color: #38bdf8; margin-bottom: 3px;")
+            sidebar.addWidget(k_lbl)
+            sidebar.addWidget(v_lbl)
+            self.telemetry_labels[key] = v_lbl
 
-        self.clock_timer = QTimer(self)
-        self.clock_timer.timeout.connect(self.update_time_display)
-        self.clock_timer.start(1000)
-        self.update_time_display()
+        sidebar.addStretch()
+        space_badge = QLabel("[SPACE] INTERRUPT")
+        space_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        space_badge.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        space_badge.setStyleSheet("background: #111d2e; color: #f59e0b; border: 1px dashed #d97706; border-radius: 4px; padding: 4px;")
+        sidebar.addWidget(space_badge)
 
-        btn_weather.clicked.connect(self.toggle_weather_demo)
+        chat_telemetry_row.addLayout(sidebar, stretch=3)
+        right_container.addLayout(chat_telemetry_row)
 
-        # System Tray Integration
-        self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_ComputerIcon))
-        tray_menu = QMenu()
-        show_action = QAction("Open HUD", self)
-        show_action.triggered.connect(self.showNormal)
-        quit_action = QAction("Shutdown Libra", self)
-        quit_action.triggered.connect(QApplication.instance().quit)
-        tray_menu.addAction(show_action)
-        tray_menu.addAction(quit_action)
-        self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.show()
+        workspace.addLayout(right_container, stretch=7)
+        main_layout.addLayout(workspace)
 
-        # Start background worker
+        # Clock
+        timer = QTimer(self)
+        timer.timeout.connect(self.update_clock)
+        timer.start(1000)
+        self.update_clock()
+
+    def update_clock(self):
+        self.clock_label.setText(time.strftime("%H:%M:%S // %Y-%m-%d"))
+
+    def update_telemetry(self, key: str, val: str):
+        if key in self.telemetry_labels:
+            self.telemetry_labels[key].setText(val)
+        if "LATENCY" in key:
+            self.stat_box.setText(f"INFERENCE: {val} | VRAM: ACTIVE")
+
+    def set_vis_state(self, active: bool):
+        self.visualizer.set_active(active)
+        # Accelerate Three.js orbital rotation when speaking
+        js_cmd = f"if (window.setSpeechActive) {{ window.setSpeechActive({str(active).lower()}); }}"
+        self.orb_view.page().runJavaScript(js_cmd)
+
+    def update_status(self, text: str):
+        self.status_banner.setText(text)
+        if "SPEAKING" in text:
+            self.status_banner.setStyleSheet("background: #160f29; color: #c084fc; border: 1px solid #9333ea; border-radius: 6px; padding: 9px;")
+        elif "RECORDING" in text or "FOLLOW-UP" in text:
+            self.status_banner.setStyleSheet("background: #092019; color: #34d399; border: 1px solid #059669; border-radius: 6px; padding: 9px;")
+        elif "PROCESSING" in text or "TRANSCRIBING" in text:
+            self.status_banner.setStyleSheet("background: #231608; color: #fbbf24; border: 1px solid #d97706; border-radius: 6px; padding: 9px;")
+        else:
+            self.status_banner.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #091322, stop:0.5 #13243d, stop:1 #091322); color: #00ffcc; border: 1px solid #00e5ff; border-radius: 6px; padding: 9px;")
+
+    def append_log(self, sender: str, msg: str):
+        color = "#00ffcc" if sender == "LIBRA" else "#fbbf24"
+        html = f"""
+        <div style='margin-bottom: 8px; padding: 5px 8px; background: #080d19; border-left: 3px solid {color}; border-radius: 3px;'>
+            <span style='color: {color}; font-weight: bold;'>[{sender}]:</span> 
+            <span style='color: #f8fafc; font-size: 13px;'>{msg}</span>
+        </div>
+        """
+        self.terminal.append(html)
+        self.terminal.verticalScrollBar().setValue(self.terminal.verticalScrollBar().maximum())
+
+    def init_worker(self):
         self.worker = VoiceAssistantWorker()
         self.worker.status_changed.connect(self.update_status)
-        self.worker.show_table_signal.connect(self.show_weather_table)
-        self.worker.hide_table_signal.connect(self.hide_weather_table)
+        self.worker.visualizer_state.connect(self.set_vis_state)
+        self.worker.telemetry_update.connect(self.update_telemetry)
+        self.worker.log_received.connect(self.append_log)
         self.worker.start()
 
-    def update_time_display(self):
-        now = datetime.now()
-        self.clock_label.setText(now.strftime("%H:%M:%S"))
-        self.date_label.setText(now.strftime("%d/%m/%Y"))
-
-    def update_status(self, text):
-        self.status_display.setText(f"[ {text.upper()} ]")
-
-    def show_weather_table(self, forecast_data):
-        self.weather_table.setRowCount(len(forecast_data))
-        for row, entry in enumerate(forecast_data):
-            d_item = QTableWidgetItem(entry.get("date", "--"))
-            t_item = QTableWidgetItem(entry.get("temp", "--"))
-            c_item = QTableWidgetItem(entry.get("condition", "--"))
-            for item in (d_item, t_item, c_item):
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.weather_table.setItem(row, 0, d_item)
-            self.weather_table.setItem(row, 1, t_item)
-            self.weather_table.setItem(row, 2, c_item)
-        self.center_stack.setCurrentWidget(self.weather_table)
-        QTimer.singleShot(12000, self.hide_weather_table)
-
-    def hide_weather_table(self):
-        self.center_stack.setCurrentWidget(self.orb_view)
-
-    def toggle_weather_demo(self):
-        if self.center_stack.currentWidget() == self.weather_table:
-            self.hide_weather_table()
-        else:
-            self.show_weather_table(get_weekly_forecast())
-
-    def changeEvent(self, event):
-        if event.type() == QEvent.Type.WindowStateChange:
-            if self.isMinimized():
-                self.hide()
-                self.tray_icon.showMessage(
-                    "Libra AI",
-                    "Running in background. Say 'Hey Libra' anytime.",
-                    QSystemTrayIcon.MessageIcon.Information,
-                    2000
-                )
-        super().changeEvent(event)
-
     def closeEvent(self, event):
-        if hasattr(self, "worker") and self.worker.isRunning():
-            self.worker.stop()
+        self.worker.stop()
+        self.worker.wait()
         event.accept()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = LibraGUI()
+    window = FuturisticVoiceAssistantUI()
     window.show()
     sys.exit(app.exec())

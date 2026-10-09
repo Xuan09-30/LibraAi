@@ -13,10 +13,9 @@
       justify-content: center;
       align-items: center;
     }
-    canvas { display: block; }
+    canvas { display: block; outline: none; }
   </style>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-</head>
+  <script src="three.min.js"></script></head>
 <body>
 <script>
   const scene = new THREE.Scene();
@@ -25,7 +24,7 @@
 
   const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
   renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
   document.body.appendChild(renderer.domElement);
 
   const particleCount = 280;
@@ -41,7 +40,7 @@
     const y = radius * Math.sin(theta) * Math.sin(phi);
     const z = radius * Math.cos(phi);
 
-    positions[i * 3] = x;
+    positions[i * 3]     = x;
     positions[i * 3 + 1] = y;
     positions[i * 3 + 2] = z;
 
@@ -92,16 +91,22 @@
   scene.add(core);
 
   let clock = new THREE.Clock();
+  let speedMultiplier = 1.0;
+
+  // Reactivity hook: accelerates spin rate when speaking
+  window.setSpeechActive = function(active) {
+    speedMultiplier = active ? 2.5 : 1.0;
+  };
 
   function animate() {
     requestAnimationFrame(animate);
-    const elapsedTime = clock.getElapsedTime();
+    const elapsedTime = clock.getElapsedTime() * speedMultiplier;
     const pos = pGeo.attributes.position.array;
 
     for (let i = 0; i < particleCount; i++) {
-      pos[i * 3]     += velocities[i].x;
-      pos[i * 3 + 1] += velocities[i].y;
-      pos[i * 3 + 2] += velocities[i].z;
+      pos[i * 3]     += velocities[i].x * speedMultiplier;
+      pos[i * 3 + 1] += velocities[i].y * speedMultiplier;
+      pos[i * 3 + 2] += velocities[i].z * speedMultiplier;
 
       const d = Math.sqrt(pos[i * 3] ** 2 + pos[i * 3 + 1] ** 2 + pos[i * 3 + 2] ** 2);
       if (d > radius * 1.15 || d < radius * 0.85) {
@@ -110,12 +115,12 @@
     }
     pGeo.attributes.position.needsUpdate = true;
 
-    // Recalculate dynamic plexus connections
+    // Dynamic plexus connections
     const linePositions = [];
     const maxDistance = 2.4;
     for (let i = 0; i < particleCount; i++) {
       for (let j = i + 1; j < particleCount; j++) {
-        const dx = pos[i * 3] - pos[j * 3];
+        const dx = pos[i * 3]     - pos[j * 3];
         const dy = pos[i * 3 + 1] - pos[j * 3 + 1];
         const dz = pos[i * 3 + 2] - pos[j * 3 + 2];
         const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
@@ -129,14 +134,14 @@
     }
     lineGeo.setAttribute('position', new THREE.Float32BufferAttribute(linePositions, 3));
 
-    // Global rotation
+    // Orbital Rotations
     pointCloud.rotation.y = elapsedTime * 0.08;
-    lineMesh.rotation.y = elapsedTime * 0.08;
-    core.rotation.x = -elapsedTime * 0.12;
-    core.rotation.y = elapsedTime * 0.15;
-    hudRing.rotation.z = elapsedTime * 0.05;
+    lineMesh.rotation.y   = elapsedTime * 0.08;
+    core.rotation.x       = -elapsedTime * 0.12;
+    core.rotation.y       = elapsedTime * 0.15;
+    hudRing.rotation.z    = elapsedTime * 0.05;
 
-    // Organic core scale oscillation
+    // Pulsing core oscillation
     const scale = 1.0 + Math.sin(elapsedTime * 2.0) * 0.05;
     core.scale.set(scale, scale, scale);
 

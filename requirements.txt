@@ -2,3 +2,7 @@ ollama>=0.5.1
 requests>=2.31.0silero-vad
 nvidia-cublas-cu12
 nvidia-cudnn-cu12
+kokoro>=0.9.4
+soundfile
+
+keyboard
