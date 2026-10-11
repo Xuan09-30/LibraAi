@@ -15,41 +15,28 @@ except ImportError:
 
 
 class KokoroTTS:
-    def __init__(self, voice="af_heart", lang_code="a", device="cuda"):
-        """Initializes Kokoro-82M TTS pipeline.
-
-        Voices:
-        - af_heart (warm, natural female)
-        - af_bella, af_sarah, af_sky
-        - am_adam, am_michael (male)
-        """
+    def __init__(self, voice="af_heart", lang_code="a"):
+        # Auto-detect CUDA availability
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[Kokoro TTS] Initializing pipeline on device: {self.device} (Voice: {voice})...")
+        
+        # Initialize KPipeline on CUDA
+        self.pipeline = KPipeline(lang_code=lang_code, device=self.device)
         self.voice = voice
-        self.lang_code = lang_code
-        self.device = "cuda" if (torch.cuda.is_available() and device == "cuda") else "cpu"
-        self.sample_rate = 24000
-        self.pipeline = None
 
-        if not KOKORO_AVAILABLE:
-            print("[Kokoro Warning]: kokoro package not found.")
-            return
-
-        print(f"[Kokoro TTS] Loading 82M model onto {self.device} (Voice: {self.voice})...")
-        try:
-            # Explicitly specify repo_id to prevent Hugging Face default warning
-            self.pipeline = KPipeline(
-                repo_id="hexgrad/Kokoro-82M",
-                lang_code=self.lang_code,
-                device=self.device
-            )
-            print(f"[Kokoro TTS] Engine online on {self.device}.")
-        except Exception as e:
-            print(f"[Kokoro Init Error]: {e}. Falling back to CPU...")
-            self.device = "cpu"
-            self.pipeline = KPipeline(
-                repo_id="hexgrad/Kokoro-82M",
-                lang_code=self.lang_code,
-                device="cpu"
-            )
+    def generate_audio(self, text: str):
+        """Generates raw audio chunks directly on device."""
+        generator = self.pipeline(text, voice=self.voice, speed=1.0, split_pattern=r'\n+')
+        audio_segments = []
+        for _, _, audio in generator:
+            audio_segments.append(audio)
+            
+        if not audio_segments:
+            return None
+            
+        if len(audio_segments) == 1:
+            return audio_segments[0]
+        return torch.cat(audio_segments, dim=0)
 
     def synthesize_stream(self, text: str):
         """Yields raw int16 PCM bytes per sentence for low-latency streaming playback."""

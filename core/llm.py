@@ -8,6 +8,9 @@ from core.memory import MemoryCore
 from tools.search_agent import search_live_web
 from tools.spotify_agent import SpotifyAgent
 from tools.knowledge_agent import get_entity_summary
+from core.memory import MemoryCore
+
+memory = MemoryCore()
 
 
 def extract_valid_json(text: str) -> dict:
@@ -42,7 +45,7 @@ class LocalLLM:
     def __init__(self, config_path="config.json"):
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         self.config_path = os.path.join(project_root, config_path)
-
+        self.memory = MemoryCore()
         self.base_url = "http://localhost:11434"
         self.city = "Kuala Lumpur"
         self.models = {
@@ -144,23 +147,39 @@ class LocalLLM:
         # -------------------------------------------------------------
         router_model = self.models.get("router", "qwen3:8b")
         memory_ctx = self.memory.get_context_summary()
+        user_memory_context = self.memory.get_context_summary()
 
         system_instructions = (
             f"You are Libra, an elite autonomous cybernetic assistant. Current Date: {today_str}. Location: {self.city}.\n"
             f"Context Memory: {memory_ctx}\n"
+            f"User Memory: {user_memory_context}\n"
             "Analyze intent and reply ONLY with a valid JSON object matching the requested schema."
         )
 
         prompt = f"""User request: "{user_query}"
 
 Allowed actions:
-- "lookup_entity": Biographical or factual questions about a specific person, place, or concept. ("target_entity": name)
-- "live_research": Current news, recent tournament scores, sports results. ("search_query": keyword string)
-- "open_app": Launching desktop software/games. ("target_app": app name)
-- "web_search": Explicitly asking to search Google or YouTube. ("platform": "google"|"youtube", "search_query": query)
-- "get_daily_weather": Specific day weather. ("target_date": "YYYY-MM-DD")
-- "get_weekly_weather": 7-day weather overview.
-- "chat": Greetings, jokes, opinions, or conversational follow-ups. ("voice_response": concise spoken text)
+- "remember_fact": Saving user preferences, names, habits, or facts explicitly told to you (e.g., "remember that I prefer Python", "my name is Alex"). ("fact": concise statement to store, "voice_response": verbal confirmation)
+- "live_research": MANDATORY for any questions asking for real-time facts, current numbers, live data, or current conditions where the user wants you to TELL or ANSWER them verbally. ("search_query": concise search terms)
+- "web_search": ONLY trigger this if the user EXPLICITLY asks to open a browser, Google, or YouTube. ("platform": "google"|"youtube", "search_query": query)
+- "lookup_entity": Biographical or historical knowledge lookups for established entities. ("target_entity": name)
+- "open_app": Launching desktop software or games. ("target_app": app name)
+- "open_file": Opening local documents or code files. ("target_file": filename)
+- "get_daily_weather": Specific day weather request. ("target_date": "YYYY-MM-DD")
+- "get_weekly_weather": 7-day weather forecast.
+- "chat": Greetings, casual conversation, opinions, or general chat where no search is required. ("voice_response": concise spoken text)
+
+Decision Rules & Examples:
+- User: "What is the current haze number in Malaysia?" -> {{"action": "live_research", "search_query": "current haze air pollutant index API Malaysia"}}
+- User: "Help me open Google and search for the current haze in Malaysia" -> {{"action": "web_search", "platform": "google", "search_query": "current haze Malaysia"}}
+- User: "Who won the race?" -> {{"action": "live_research", "search_query": "latest F1 race winner"}}
+- User: "Search YouTube for lo-fi beats" -> {{"action": "web_search", "platform": "youtube", "search_query": "lo-fi beats"}}
+
+- User: "Remember that my favorite Hobby is Sleeping" -> {{"action": "remember_fact", "fact": "User's favorite Hobby is Sleeping", "voice_response": "I've noted that Sleeping is your favorite hobby."}}
+
+Respond ONLY with valid JSON matching one of the schemas above.
+
+User request: "{user_query}"
 
 Output JSON:"""
 
@@ -216,6 +235,22 @@ Output JSON:"""
         # Commit this interaction to persistent rolling session history
         self._record_turn(user_query, decision.get("voice_response", ""))
         return decision
+
+    def synthesize_research(self, user_query: str, search_context: str) -> str:
+        """
+        Synthesizes web snippets into a concise spoken answer using the existing LLM pipeline.
+        """
+        if not search_context:
+            return "I was unable to retrieve live information on that topic."
+
+        synth_prompt = (
+            f"You are Libra, an elite cybernetic voice assistant. "
+            f"Based on these web search snippets:\n{search_context}\n\n"
+            f"Provide a direct, conversational 1 to 2 sentence answer to this question: '{user_query}'."
+        )
+
+        result = self.plan_and_respond(synth_prompt)
+        return result.get("voice_response", "Information retrieved.")
 
     def _execute_entity_lookup(self, entity: str, original_query: str, today_str: str) -> dict:
         print(f"[Knowledge Engine] Entity Lookup: '{entity}'")

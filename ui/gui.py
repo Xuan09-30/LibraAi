@@ -9,6 +9,8 @@ import numpy as np
 import pyaudio
 import torch
 import keyboard
+from tools.system_actions import launch_any_application, web_search, open_url, find_and_open_file
+from tools.search_agent import search_live_web
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -145,22 +147,31 @@ class VoiceAssistantWorker(QThread):
             playback_finished = threading.Event()
             out_stream_holder = [None]
 
-            def on_space_pressed(e):
-                if e.name == "space":
-                    print("\n[Barge-In]: SPACEBAR pressed! Cutting audio.")
-                    self.interrupted.set()
-                    if out_stream_holder[0]:
-                        try:
-                            out_stream_holder[0].stop_stream()
-                        except Exception:
-                            pass
+            # Use an explicit hotkey combination that won't fire during standard typing/gaming
+            INTERRUPT_HOTKEY = "ctrl+space"
 
-            space_hook = keyboard.on_press(on_space_pressed)
+            def trigger_barge_in():
+                print(f"\n[Barge-In]: '{INTERRUPT_HOTKEY}' triggered! Cutting speech.")
+                self.interrupted.set()
+                if out_stream_holder[0]:
+                    try:
+                        out_stream_holder[0].stop_stream()
+                    except Exception:
+                        pass
+
+            # Register specific chord instead of bare key press
+            hotkey_handle = keyboard.add_hotkey(INTERRUPT_HOTKEY, trigger_barge_in)
 
             def play_audio():
                 pa_out = pyaudio.PyAudio()
                 try:
-                    out_stream = pa_out.open(format=pyaudio.paInt16, channels=1, rate=24000, output=True, frames_per_buffer=2400)
+                    out_stream = pa_out.open(
+                        format=pyaudio.paInt16,
+                        channels=1,
+                        rate=24000,
+                        output=True,
+                        frames_per_buffer=2400
+                    )
                     out_stream_holder[0] = out_stream
                     chunk_bytes = 2400 * 2
                     for i in range(0, len(full_audio), chunk_bytes):
@@ -181,8 +192,9 @@ class VoiceAssistantWorker(QThread):
             while not playback_finished.is_set() and not self.interrupted.is_set():
                 time.sleep(0.01)
 
+            # Clean up the hotkey listener immediately after playback ends
             try:
-                keyboard.unhook(space_hook)
+                keyboard.remove_hotkey(hotkey_handle)
             except Exception:
                 pass
 
@@ -271,21 +283,54 @@ class VoiceAssistantWorker(QThread):
             print(f"[Captured Input]: {user_text}")
             self.log_received.emit("USER", user_text)
 
+            # STATE 4: REASON & DISPATCH TOOLS
             self.status_changed.emit("PROCESSING REASONING...")
             t_llm = time.time()
             response_data = llm.plan_and_respond(user_text)
             llm_latency = (time.time() - t_llm) * 1000
             self.telemetry_update.emit("LLM_LATENCY", f"{llm_latency:.0f} ms")
+            print(f"[Libra Core]: {response_data}")
 
-            voice_msg = ""
             action = response_data.get("action", "chat")
-            if "voice_response" in response_data and response_data["voice_response"]:
-                voice_msg = response_data["voice_response"]
-            elif action in ["web_search", "lookup_entity"]:
-                query = response_data.get("search_query") or response_data.get("target_entity", "")
-                voice_msg = f"Searching archives for {query}."
+            voice_msg = ""
+
+            # 1. APP LAUNCHING
+            if action == "open_app":
+                target = response_data.get("target_app", "")
+                success, msg = launch_any_application(target)
+                voice_msg = msg
+
+            # 2. OPEN SPECIFIC FILE
+            elif action == "open_file":
+                target = response_data.get("target_file", "")
+                success, msg = find_and_open_file(target)
+                voice_msg = msg
+
+            # 3. SAVE MEMORY FACT
+            elif action == "remember_fact":
+                new_fact = response_data.get("fact", "")
+                if new_fact:
+                    llm.memory.add_fact(new_fact)
+                voice_msg = response_data.get("voice_response", "I have remembered that.")
+
+            # 4. LIVE WEB RESEARCH
+            elif action in ["live_research", "lookup_entity"]:
+                if response_data.get("voice_response"):
+                    voice_msg = response_data["voice_response"]
+                else:
+                    query = response_data.get("search_query") or response_data.get("target_entity", "")
+                    snippets = search_live_web(query)
+                    voice_msg = llm.synthesize_research(user_text, snippets) if snippets else f"I could not retrieve data for {query}."
+
+            # 5. EXPLICIT BROWSER SEARCH
+            elif action == "web_search":
+                query = response_data.get("search_query", "")
+                platform = response_data.get("platform", "google")
+                voice_msg = web_search(query, platform=platform)
+
+            # 6. GENERAL CHAT
             else:
-                voice_msg = "Task processed."
+                voice_msg = response_data.get("voice_response", "I am listening.")
 
             self.log_received.emit("LIBRA", voice_msg)
             speak_interruptible(voice_msg)
@@ -415,7 +460,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             self.telemetry_labels[key] = v_lbl
 
         sidebar.addStretch()
-        space_badge = QLabel("[SPACE] INTERRUPT")
+        space_badge = QLabel("[CTRL + SPACE] INTERRUPT")
         space_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         space_badge.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
         space_badge.setStyleSheet("background: #111d2e; color: #f59e0b; border: 1px dashed #d97706; border-radius: 4px; padding: 4px;")
