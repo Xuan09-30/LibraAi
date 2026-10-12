@@ -5,97 +5,67 @@ import requests
 from datetime import datetime
 
 from core.memory import MemoryCore
-from tools.search_agent import search_live_web
-from tools.spotify_agent import SpotifyAgent
 from tools.knowledge_agent import get_entity_summary
-from core.memory import MemoryCore
+from tools.search_agent import search_live_web
+from tools.system_actions import launch_any_application, close_any_application, find_and_open_file, web_search
+from tools.weather import get_forecast_for_iso_date, get_weekly_forecast
 
-memory = MemoryCore()
+
+def condense_spelling(text: str) -> str:
+    """Condenses spaced-out spellings (e.g., 'M E S S I' -> 'MESSI')."""
+    return re.sub(r"(?:\b[a-zA-Z]\b\s+){2,}\b[a-zA-Z]\b", lambda m: m.group(0).replace(" ", ""), text)
 
 
 def extract_valid_json(text: str) -> dict:
-    """Safely extracts and parses JSON even if wrapped in markdown blocks or chat fluff."""
+    """Extracts and parses JSON object from an LLM response string."""
     if not text:
         return {}
+    match = re.search(r"(\{.*\})", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except Exception:
+            pass
     try:
-        return json.loads(text.strip())
+        return json.loads(text)
     except Exception:
-        pass
-
-    # Match ```json { ... } ```
-    match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except Exception:
-            pass
-
-    # Match outermost { ... }
-    match = re.search(r'(\{.*\})', text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except Exception:
-            pass
-
-    return {}
+        return {}
 
 
 class LocalLLM:
-    def __init__(self, config_path="config.json"):
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        self.config_path = os.path.join(project_root, config_path)
-        self.memory = MemoryCore()
-        self.base_url = "http://localhost:11434"
-        self.city = "Kuala Lumpur"
+    def __init__(self, host="http://localhost:11434"):
+        self.host = host
         self.models = {
             "router": "qwen3:8b",
-            "web_research": "qwen3:8b",
-            "chat": "qwen3:8b"
+            "chat": "qwen3:8b",
+            "web_research": "qwen3:8b"
+        }
+        self.city = "Kuala Lumpur"
+        self.memory = MemoryCore()
+        self.conversation_history = []
+        self.session_state = {
+            "active_apps": [],
+            "last_target": None,
+            "last_action": None,
+            "current_entity": None
         }
 
-        self.load_config()
-        self.memory = MemoryCore()
-        self.spotify = SpotifyAgent()
-        
-        # Real conversation history tracking across turns
-        # Structure: [{"role": "user"|"assistant", "content": str}, ...]
-        self.conversation_history = []
-
-    def load_config(self):
-        if os.path.exists(self.config_path):
-            try:
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                    self.base_url = cfg.get("ollama_base_url", self.base_url)
-                    self.city = cfg.get("city", self.city)
-                    default_m = cfg.get("ollama_model") or cfg.get("default_model", "qwen3:8b")
-                    for k in self.models:
-                        self.models[k] = default_m
-                    model_pool = cfg.get("models", {})
-                    for role, name in model_pool.items():
-                        self.models[role] = name
-            except Exception as e:
-                print(f"[LLM Config Error]: {e}")
-
     def call_ollama(
-        self, 
-        model: str, 
-        prompt: str, 
-        system_prompt: str = "", 
-        as_json: bool = False, 
-        timeout: int = 60, 
+        self,
+        model: str,
+        prompt: str,
+        system_prompt: str = "",
+        as_json: bool = False,
+        timeout: int = 40,
         include_history: bool = False
     ) -> str:
-        """Invokes Ollama's chat API with thinking disabled and options configured."""
-        url = f"{self.base_url.rstrip('/')}/api/chat"
+        url = f"{self.host}/api/chat"
         messages = []
 
-        # /no_think informs Qwen3 to skip internal reasoning tokens
-        base_system = (system_prompt + " /no_think").strip() if system_prompt else "/no_think"
-        messages.append({"role": "system", "content": base_system})
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
 
-        # Inject real conversation history so pronouns and follow-ups resolve
+        # ONLY pass conversational history for 'chat', not for structured routing
         if include_history and self.conversation_history:
             messages.extend(self.conversation_history[-6:])
 
@@ -105,190 +75,293 @@ class LocalLLM:
             "model": model,
             "messages": messages,
             "stream": False,
-            "think": False,  # API-level reasoning disable
-            "options": {
-                "num_ctx": 4096,  # Lean context for fast latency
-                "temperature": 0.3
-            }
+            "options": {"temperature": 0.1}
         }
         if as_json:
             payload["format"] = "json"
 
         try:
-            res = requests.post(url, json=payload, timeout=timeout)
-            if res.status_code == 200:
-                data = res.json()
-                return data.get("message", {}).get("content", "").strip()
+            response = requests.post(url, json=payload, timeout=timeout)
+            if response.status_code == 200:
+                content = response.json().get("message", {}).get("content", "").strip()
+                return content
             else:
-                print(f"[Ollama Error {res.status_code}]: {res.text}")
+                print(f"[Ollama Error Status]: {response.status_code} - {response.text}")
         except Exception as e:
-            print(f"[Ollama Call Failed for {model}]: {e}")
+            print(f"[Ollama Call Exception]: {e}")
         return ""
 
     def plan_and_respond(self, user_query: str) -> dict:
         today = datetime.now()
         today_str = today.strftime("%A, %B %d, %Y")
-        q_lower = user_query.lower().strip()
+
+        cleaned_query = condense_spelling(user_query)
+        q_lower = cleaned_query.lower().strip()
 
         # -------------------------------------------------------------
-        # TIGHTENED ENTITY MATCHER (No broad "what is" trap)
+        # 1. DIRECT MEMORY FAST-TRACK ("Remember that...")
         # -------------------------------------------------------------
-        entity_match = re.search(r'^(?:who is|tell me about)\s+([a-zA-Z0-9\s]+?)(?:\?|$)', q_lower)
+        mem_match = re.search(r"(?:remember\s+(?:that\s+)?|save\s+(?:that\s+)?|note\s+(?:that\s+)?)(.+)", q_lower)
+        if mem_match and any(trigger in q_lower for trigger in ["remember", "note that", "save that"]):
+            raw_fact = mem_match.group(1).strip()
+            # Clean leading polite prefixes
+            raw_fact = re.sub(r"^(?:please\s+|can\s+you\s+)", "", raw_fact)
+            # Normalize first-person phrasing (e.g. "my favorite" stays or "I am")
+            clean_fact = raw_fact.rstrip(".?!")
+            self.memory.add_fact(clean_fact)
+            ack_msg = f"Got it. I've committed that to memory: {clean_fact}."
+            decision = {"action": "remember_fact", "fact": clean_fact, "voice_response": ack_msg}
+            self._record_turn(user_query, ack_msg)
+            return decision
+
+        # -------------------------------------------------------------
+        # 2. PRONOUN RESOLUTION VIA SESSION STATE (App Termination)
+        # -------------------------------------------------------------
+        if any(w in q_lower for w in ["close it", "shut it down", "exit it", "kill it"]):
+            if self.session_state["last_target"]:
+                target = self.session_state["last_target"]
+                print(f"[State Engine] Pronoun 'it' -> '{target}'")
+                success, msg = close_any_application(target)
+                if target in self.session_state["active_apps"]:
+                    self.session_state["active_apps"].remove(target)
+                decision = {"action": "close_app", "target_app": target, "voice_response": msg}
+                self._record_turn(user_query, msg)
+                return decision
+
+        # -------------------------------------------------------------
+        # 3. COMPOUND ACTION: OPEN BROWSER + READ SUMMARY ALOUD
+        # -------------------------------------------------------------
+        # Matches: "open google and search for X and read one for me / tell me"
+        wants_read_aloud = any(p in q_lower for p in ["read one", "tell me one", "summarize", "read it", "tell me about it", "read for me"])
+        explicit_search = re.search(
+            r"(?:open\s+(?:google|chrome|browser)\s+and\s+search(?:\s+for)?|search\s+(?:on\s+)?(google|youtube)(?:\s+for)?)\s+(.+)",
+            q_lower
+        )
+
+        if explicit_search:
+            platform = "youtube" if "youtube" in q_lower else "google"
+            raw_search_query = explicit_search.group(2).strip()
+
+            # Separate search terms from the conversational read command
+            clean_search_query = re.sub(r"(?:and\s+)?(?:read|tell|summarize).*", "", raw_search_query).strip()
+            clean_search_query = re.sub(r"[?!.]+$", "", clean_search_query).strip()
+
+            # Launch browser
+            web_search(clean_search_query, platform=platform)
+
+            # If user also asked to read/summarize, pull live research and speak it!
+            if wants_read_aloud:
+                print(f"[Compound Action] Opened browser for '{clean_search_query}', now gathering verbal summary...")
+                snippets = search_live_web(f"{clean_search_query} top headlines latest")
+                synth_prompt = (
+                    f"You are Libra. Today is {today_str}.\n"
+                    f"The user opened Google for '{clean_search_query}' and asked you to read one key piece of news or result aloud.\n"
+                    f"Based on these live search results:\n{snippets}\n\n"
+                    f"State that you opened the browser, then read out ONE prominent story or finding concisely in 2 spoken sentences.\n"
+                    f"Do not use markdown formatting or asterisks."
+                )
+                spoken = self.call_ollama(self.models.get("web_research", "qwen3:8b"), synth_prompt, timeout=40)
+                spoken_response = spoken or f"I opened Google for {clean_search_query}."
+            else:
+                spoken_response = f"Opening {platform.capitalize()} search for {clean_search_query}."
+
+            decision = {
+                "action": "compound_web_search",
+                "platform": platform,
+                "search_query": clean_search_query,
+                "voice_response": spoken_response
+            }
+            self._record_turn(user_query, spoken_response)
+            return decision
+
+        # -------------------------------------------------------------
+        # 4. FAST-TRACK ENTITY MATCHER (Guarded against pronouns)
+        # -------------------------------------------------------------
+        pronoun_words = {"he", "his", "him", "she", "her", "hers", "it", "its", "they", "them", "their"}
+        entity_match = re.search(r"^(?:who is|tell me about)\s+([a-zA-Z0-9\s]+?)(?:\?|$)", q_lower)
+
         if entity_match:
-            target_entity = entity_match.group(1).strip()
-            if not any(w in target_entity for w in ["the weather", "running", "today", "tomorrow"]):
-                print(f"[FastTrack] Targeted Entity: '{target_entity}'")
-                decision = self._execute_entity_lookup(target_entity, user_query, today_str)
+            candidate_entity = entity_match.group(1).strip()
+            tokens = set(candidate_entity.split())
+
+            if not tokens.intersection(pronoun_words) and not any(w in candidate_entity for w in ["the weather", "running", "today", "tomorrow"]):
+                self.session_state["current_entity"] = candidate_entity
+                decision = self._execute_entity_lookup(candidate_entity, user_query, today_str)
                 self._record_turn(user_query, decision.get("voice_response", ""))
                 return decision
 
         # -------------------------------------------------------------
-        # ROUTER CLASSIFICATION PASS (With History Awareness)
+        # 5. ROUTER PASS WITH QUERY-AWARE CONTEXT & FEW-SHOT EXAMPLES
         # -------------------------------------------------------------
         router_model = self.models.get("router", "qwen3:8b")
-        memory_ctx = self.memory.get_context_summary()
-        user_memory_context = self.memory.get_context_summary()
+        memory_ctx = self.memory.get_context_summary(current_query=cleaned_query)
+        active_apps_str = ", ".join(self.session_state["active_apps"]) or "None"
+        current_subject = self.session_state.get("current_entity") or "None"
 
         system_instructions = (
-            f"You are Libra, an elite autonomous cybernetic assistant. Current Date: {today_str}. Location: {self.city}.\n"
-            f"Context Memory: {memory_ctx}\n"
-            f"User Memory: {user_memory_context}\n"
-            "Analyze intent and reply ONLY with a valid JSON object matching the requested schema."
+            f"You are Libra, an elite autonomous cybernetic desktop assistant. Date: {today_str}. Location: {self.city}.\n"
+            f"Active Apps: [{active_apps_str}] | Active Conversation Subject: {current_subject}\n"
+            f"User Profile Memory:\n{memory_ctx}\n"
+            "Analyze intent and respond with ONLY a single raw JSON object matching the schemas below."
         )
 
-        prompt = f"""User request: "{user_query}"
+        prompt = f"""Select the best matching action for the request.
 
-Allowed actions:
-- "remember_fact": Saving user preferences, names, habits, or facts explicitly told to you (e.g., "remember that I prefer Python", "my name is Alex"). ("fact": concise statement to store, "voice_response": verbal confirmation)
-- "live_research": MANDATORY for any questions asking for real-time facts, current numbers, live data, or current conditions where the user wants you to TELL or ANSWER them verbally. ("search_query": concise search terms)
-- "web_search": ONLY trigger this if the user EXPLICITLY asks to open a browser, Google, or YouTube. ("platform": "google"|"youtube", "search_query": query)
-- "lookup_entity": Biographical or historical knowledge lookups for established entities. ("target_entity": name)
-- "open_app": Launching desktop software or games. ("target_app": app name)
-- "open_file": Opening local documents or code files. ("target_file": filename)
-- "get_daily_weather": Specific day weather request. ("target_date": "YYYY-MM-DD")
-- "get_weekly_weather": 7-day weather forecast.
-- "chat": Greetings, casual conversation, opinions, or general chat where no search is required. ("voice_response": concise spoken text)
+Schemas and Examples:
+- Launch app: {{"action": "open_app", "target_app": "name"}}
+- Close app: {{"action": "close_app", "target_app": "name"}}
+- Open file: {{"action": "open_file", "target_file": "filename"}}
+- Weather: {{"action": "get_daily_weather", "target_date": "YYYY-MM-DD"}} or {{"action": "get_weekly_weather"}}
+- Entity bio: {{"action": "lookup_entity", "target_entity": "person or topic"}}
+- Verbal live research: {{"action": "live_research", "search_query": "specific search terms"}}
+- Conversational chat / questions about stored memory / capabilities: {{"action": "chat", "voice_response": "spoken message"}}
 
-Decision Rules & Examples:
-- User: "What is the current haze number in Malaysia?" -> {{"action": "live_research", "search_query": "current haze air pollutant index API Malaysia"}}
-- User: "Help me open Google and search for the current haze in Malaysia" -> {{"action": "web_search", "platform": "google", "search_query": "current haze Malaysia"}}
-- User: "Who won the race?" -> {{"action": "live_research", "search_query": "latest F1 race winner"}}
-- User: "Search YouTube for lo-fi beats" -> {{"action": "web_search", "platform": "youtube", "search_query": "lo-fi beats"}}
-
-- User: "Remember that my favorite Hobby is Sleeping" -> {{"action": "remember_fact", "fact": "User's favorite Hobby is Sleeping", "voice_response": "I've noted that Sleeping is your favorite hobby."}}
-
-Respond ONLY with valid JSON matching one of the schemas above.
-
-User request: "{user_query}"
-
-Output JSON:"""
+Request: "{cleaned_query}"
+JSON:"""
 
         raw_json = self.call_ollama(
-            router_model, 
-            prompt, 
-            system_prompt=system_instructions, 
-            as_json=True, 
-            timeout=45, 
-            include_history=True
+            router_model,
+            prompt,
+            system_prompt=system_instructions,
+            as_json=True,
+            timeout=40,
+            include_history=False,
         )
-        decision = extract_valid_json(raw_json)
 
-        if not decision or "action" not in decision:
-            decision = {"action": "chat", "voice_response": "I'm online. How can I assist you?"}
+        decision = extract_valid_json(raw_json)
+        if not decision or "action" not in decision or decision.get("action") == "":
+            # Fallback to conversational chat using memory context
+            chat_reply = self.call_ollama(
+                self.models.get("chat", "qwen3:8b"),
+                f"Respond conversationally in 1-2 spoken sentences to: '{cleaned_query}'. Use the provided User Profile Memory if relevant. Do not output JSON.",
+                system_prompt=system_instructions,
+                timeout=30,
+                include_history=True
+            )
+            clean_reply = re.sub(r"\{.*?\}", "", chat_reply, flags=re.DOTALL).strip() or chat_reply
+            decision = {"action": "chat", "voice_response": clean_reply or "Understood. How can I assist you?"}
 
         action = decision.get("action")
 
         # -------------------------------------------------------------
-        # DISPATCH EXECUTION
+        # 6. ACTION DISPATCH & EXECUTION
         # -------------------------------------------------------------
         if action == "lookup_entity":
-            target = decision.get("target_entity") or user_query
+            target = decision.get("target_entity", cleaned_query)
+            if any(p in target.lower().split() for p in pronoun_words) and self.session_state.get("current_entity"):
+                target = self.session_state["current_entity"]
+            self.session_state["current_entity"] = target
             decision = self._execute_entity_lookup(target, user_query, today_str)
 
         elif action == "live_research":
-            query = decision.get("search_query", user_query)
+            query = decision.get("search_query", cleaned_query)
+            if self.session_state.get("current_entity") and any(p in query.lower().split() for p in pronoun_words):
+                query = f"{self.session_state['current_entity']} {query}"
+
             snippets = search_live_web(query)
-            
             synth_model = self.models.get("web_research", "qwen3:8b")
             synth_prompt = (
                 f"You are Libra. Today is {today_str}.\n"
-                f"Summarize these search results to answer '{user_query}' in 2 spoken sentences.\n"
-                f"Do not read out URLs or snippet headers. No markdown asterisks.\n\n"
-                f"Search Intel:\n{snippets}"
+                f"Answer the user's question: '{cleaned_query}' in 2 spoken sentences based strictly on these search results:\n{snippets}\n"
+                f"Do not use markdown formatting or asterisks."
             )
-            spoken = self.call_ollama(synth_model, synth_prompt, timeout=60)
+            spoken = self.call_ollama(synth_model, synth_prompt, timeout=45)
             decision["voice_response"] = spoken or "I reviewed the search results, but could not formulate a clear answer."
 
+        elif action == "open_app":
+            target = decision.get("target_app", "").strip()
+            success, msg = launch_any_application(target)
+            if success:
+                if target.lower() not in self.session_state["active_apps"]:
+                    self.session_state["active_apps"].append(target.lower())
+                self.session_state["last_target"] = target.lower()
+                self.session_state["last_action"] = "open_app"
+            decision["voice_response"] = msg
+
+        elif action == "close_app":
+            target = decision.get("target_app", "").strip().lower() or self.session_state["last_target"]
+            if target:
+                success, msg = close_any_application(target)
+                if target in self.session_state["active_apps"]:
+                    self.session_state["active_apps"].remove(target)
+                decision["voice_response"] = msg
+            else:
+                decision["voice_response"] = "No active application was targeted for termination."
+
+        elif action == "open_file":
+            target = decision.get("target_file", "")
+            success, msg = find_and_open_file(target)
+            decision["voice_response"] = msg
+
+        elif action == "get_daily_weather":
+            target_date = decision.get("target_date", datetime.today().strftime("%Y-%m-%d"))
+            decision["voice_response"] = get_forecast_for_iso_date(target_date)
+
+        elif action == "get_weekly_weather":
+            table = get_weekly_forecast()
+            if table:
+                decision["voice_response"] = (
+                    f"Here is the upcoming forecast for {self.city}: "
+                    f"{table[0]['date']} starts with {table[0]['condition']} at {table[0]['temp']}."
+                )
+            else:
+                decision["voice_response"] = "Atmospheric telemetry is currently unavailable."
+
         elif action == "chat":
-            # If router didn't generate a conversational line, generate it using full history
-            if not decision.get("voice_response") or decision.get("voice_response") in ["{}", "{\n\n}"]:
+            if not decision.get("voice_response"):
                 chat_model = self.models.get("chat", "qwen3:8b")
                 reply = self.call_ollama(
-                    chat_model, 
-                    user_query, 
-                    system_prompt=system_instructions, 
-                    timeout=30, 
-                    include_history=True
+                    chat_model,
+                    cleaned_query,
+                    system_prompt=system_instructions,
+                    timeout=30,
+                    include_history=True,
                 )
-                decision["voice_response"] = reply or "Understood. Standing by."
+                decision["voice_response"] = reply or "Acknowledged."
 
-        # Commit this interaction to persistent rolling session history
         self._record_turn(user_query, decision.get("voice_response", ""))
         return decision
 
-    def synthesize_research(self, user_query: str, search_context: str) -> str:
-        """
-        Synthesizes web snippets into a concise spoken answer using the existing LLM pipeline.
-        """
-        if not search_context:
-            return "I was unable to retrieve live information on that topic."
+    def _execute_entity_lookup(self, entity: str, user_query: str, today_str: str) -> dict:
+        print(f"[Knowledge Engine] Querying entity: '{entity}' for query: '{user_query}'")
+
+        # Strip relational tokens to locate base Wikipedia article
+        clean_target = entity
+        for noise in [" wife", " husband", " net worth", " career", " salary", " age", " kids", " height"]:
+            clean_target = clean_target.replace(noise, "")
+        clean_target = clean_target.strip()
+
+        summary = get_entity_summary(clean_target) if clean_target else ""
+
+        # Check if query requests relational or fast-moving facts
+        search_intel = ""
+        needs_search = any(w in user_query.lower() for w in ["wife", "husband", "married", "net worth", "contract", "salary", "team currently", "currently"])
+
+        if not summary or needs_search:
+            print(f"[Knowledge Engine] Querying live web search for: '{entity}'")
+            search_query = f"{clean_target} {user_query}" if clean_target else entity
+            search_intel = search_live_web(search_query)
+
+        combined_facts = f"Wikipedia Context:\n{summary}\n\nLive Search Intel:\n{search_intel}".strip()
+
+        if not combined_facts or combined_facts == "Wikipedia Context:\n\nLive Search Intel:":
+            return {"action": "chat", "voice_response": f"I couldn't locate verified records for {entity}."}
 
         synth_prompt = (
-            f"You are Libra, an elite cybernetic voice assistant. "
-            f"Based on these web search snippets:\n{search_context}\n\n"
-            f"Provide a direct, conversational 1 to 2 sentence answer to this question: '{user_query}'."
-        )
-
-        result = self.plan_and_respond(synth_prompt)
-        return result.get("voice_response", "Information retrieved.")
-
-    def _execute_entity_lookup(self, entity: str, original_query: str, today_str: str) -> dict:
-        print(f"[Knowledge Engine] Entity Lookup: '{entity}'")
-        summary = get_entity_summary(entity)
-        if not summary:
-            raw_web = search_live_web(f"{entity} biography overview")
-            snippets = re.findall(r'Snippet:\s*(.+)', raw_web)
-            summary = " ".join(snippets[:2]) if snippets else ""
-
-        if not summary:
-            return {
-                "action": "chat",
-                "voice_response": f"I couldn't verify records for {entity}."
-            }
-
-        synth_prompt = (
-            f"You are Libra. State who {entity} is in 2 spoken sentences based on these facts:\n"
-            f"Focus on who they are, their role/identity, and where they are from (avoid rattling off raw stats).\n"
-            f"No markdown asterisks.\n\n"
-            f"Facts:\n{summary}"
+            f"You are Libra. Today is {today_str}.\n"
+            f"User Question: '{user_query}'\n"
+            f"Available Intel:\n{combined_facts}\n\n"
+            f"Provide a direct, conversational 1 to 2 sentence answer addressing the user's specific question.\n"
+            f"Do not mention 'according to Wikipedia' or 'search results'. No asterisks or bullet points."
         )
         voice_text = self.call_ollama(self.models.get("chat", "qwen3:8b"), synth_prompt, timeout=35)
-        
-        # Guard: clean out any raw snippet debris if the synthesis failed
-        if not voice_text:
-            clean = re.sub(r'Title:.*?\n|Snippet:\s*', '', summary)
-            voice_text = clean[:220].strip()
-
-        return {
-            "action": "lookup_entity",
-            "voice_response": voice_text
-        }
+        return {"action": "lookup_entity", "voice_response": voice_text or summary[:200]}
 
     def _record_turn(self, user_text: str, assistant_text: str):
+        """Maintains the sliding window conversation history."""
         if user_text:
             self.conversation_history.append({"role": "user", "content": user_text})
         if assistant_text:
             self.conversation_history.append({"role": "assistant", "content": assistant_text})
-        # Keep recent 8 conversational turns (4 exchanges) in memory window
         if len(self.conversation_history) > 8:
             self.conversation_history = self.conversation_history[-8:]

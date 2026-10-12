@@ -1,9 +1,17 @@
 import os
+import logging
 import warnings
 import torch
 import numpy as np
+import torch
 
-# Suppress PyTorch deprecation warnings to keep the worker logs clean
+# Bypass cuDNN sub-library version mismatch while keeping GPU CUDA acceleration
+if torch.cuda.is_available():
+    torch.backends.cudnn.enabled = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+# Suppress phonemizer and PyTorch deprecation warnings
+logging.getLogger("phonemizer").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -15,28 +23,35 @@ except ImportError:
 
 
 class KokoroTTS:
-    def __init__(self, voice="af_heart", lang_code="a"):
-        # Auto-detect CUDA availability
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[Kokoro TTS] Initializing pipeline on device: {self.device} (Voice: {voice})...")
-        
-        # Initialize KPipeline on CUDA
-        self.pipeline = KPipeline(lang_code=lang_code, device=self.device)
+    def __init__(self, voice="af_heart", lang_code="a", device="cuda"):
+        """Initializes Kokoro-82M TTS pipeline with CUDA priority."""
         self.voice = voice
+        self.lang_code = lang_code
+        self.device = "cuda" if (torch.cuda.is_available() and device == "cuda") else "cpu"
+        self.sample_rate = 24000
+        self.pipeline = None
 
-    def generate_audio(self, text: str):
-        """Generates raw audio chunks directly on device."""
-        generator = self.pipeline(text, voice=self.voice, speed=1.0, split_pattern=r'\n+')
-        audio_segments = []
-        for _, _, audio in generator:
-            audio_segments.append(audio)
-            
-        if not audio_segments:
-            return None
-            
-        if len(audio_segments) == 1:
-            return audio_segments[0]
-        return torch.cat(audio_segments, dim=0)
+        if not KOKORO_AVAILABLE:
+            print("[Kokoro Warning]: kokoro package not found.")
+            return
+
+        print(f"[Kokoro TTS] Loading 82M model onto {self.device} (Voice: {self.voice})...")
+        try:
+            # Explicitly pass repo_id and device to KPipeline
+            self.pipeline = KPipeline(
+                repo_id="hexgrad/Kokoro-82M",
+                lang_code=self.lang_code,
+                device=self.device
+            )
+            print(f"[Kokoro TTS] Engine online on {self.device.upper()}.")
+        except Exception as e:
+            print(f"[Kokoro CUDA Warning]: {e}. Retrying on CPU...")
+            self.device = "cpu"
+            self.pipeline = KPipeline(
+                repo_id="hexgrad/Kokoro-82M",
+                lang_code=self.lang_code,
+                device="cpu"
+            )
 
     def synthesize_stream(self, text: str):
         """Yields raw int16 PCM bytes per sentence for low-latency streaming playback."""
