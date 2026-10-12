@@ -9,12 +9,11 @@ import numpy as np
 import pyaudio
 import torch
 import keyboard
-from tools.system_actions import launch_any_application, web_search, open_url, find_and_open_file
-from tools.search_agent import search_live_web
+import queue
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QTextEdit, QFrame, QGraphicsDropShadowEffect
+    QLabel, QTextEdit, QFrame
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QRectF, QUrl
 from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QLinearGradient
@@ -83,6 +82,7 @@ class CyberAudioVisualizer(QWidget):
 class VoiceAssistantWorker(QThread):
     status_changed = pyqtSignal(str)
     visualizer_state = pyqtSignal(bool)
+    mic_level = pyqtSignal(float)
     log_received = pyqtSignal(str, str)
     telemetry_update = pyqtSignal(str, str)
 
@@ -90,6 +90,7 @@ class VoiceAssistantWorker(QThread):
         super().__init__()
         self.running = True
         self.interrupted = threading.Event()
+        self.input_stream = None  # Holds the PyAudio input handle to clear Pylance closure warning
 
     def stop(self):
         self.running = False
@@ -105,8 +106,8 @@ class VoiceAssistantWorker(QThread):
         oww_model = Model(wakeword_models=active_models)
         self.telemetry_update.emit("WAKEWORD", "HEY LIBRA [ONLINE]")
 
-        tts = KokoroTTS(voice="af_heart")
-        self.telemetry_update.emit("TTS_ENGINE", "KOKORO-82M [24kHz]")
+        tts = KokoroTTS(voice="af_heart", device="cuda")
+        self.telemetry_update.emit("TTS_ENGINE", "KOKORO-82M [CUDA]")
 
         stt = SpeechToText()
         self.telemetry_update.emit("STT_ENGINE", f"WHISPER [{stt.device.upper()}]")
@@ -117,8 +118,17 @@ class VoiceAssistantWorker(QThread):
         vad_model = load_silero_vad()
         self.telemetry_update.emit("VAD_DETECTOR", "SILERO V4 [ACTIVE]")
 
+        # 1. Initialize persistent PyAudio input & output streams before defining helpers
         pa = pyaudio.PyAudio()
-        input_stream = pa.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1280)
+        self.input_stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=16000,
+            input=True,
+            frames_per_buffer=1280
+        )
+
+        pa_out_master = pyaudio.PyAudio()
         self.status_changed.emit("SYSTEM READY // AWAITING VOCAL PROMPT")
 
         def speak_interruptible(text: str):
@@ -126,29 +136,14 @@ class VoiceAssistantWorker(QThread):
                 return
 
             self.interrupted.clear()
-            self.status_changed.emit("SPEAKING... [SPACE TO STOP]")
+            self.status_changed.emit("SPEAKING... [CTRL+SPACE TO STOP]")
             self.visualizer_state.emit(True)
 
-            audio_buffer = []
-            try:
-                for chunk_bytes in tts.synthesize_stream(text):
-                    if chunk_bytes:
-                        audio_buffer.append(chunk_bytes)
-            except Exception as ex:
-                print(f"[Kokoro Synthesis Error]: {ex}")
-                self.visualizer_state.emit(False)
-                return
-
-            full_audio = b"".join(audio_buffer)
-            if not full_audio:
-                self.visualizer_state.emit(False)
-                return
-
-            playback_finished = threading.Event()
-            out_stream_holder = [None]
-
-            # Use an explicit hotkey combination that won't fire during standard typing/gaming
+            audio_queue = queue.Queue()
             INTERRUPT_HOTKEY = "ctrl+space"
+            out_stream_holder = [None]
+            synthesis_done = threading.Event()
+            playback_finished = threading.Event()
 
             def trigger_barge_in():
                 print(f"\n[Barge-In]: '{INTERRUPT_HOTKEY}' triggered! Cutting speech.")
@@ -159,10 +154,14 @@ class VoiceAssistantWorker(QThread):
                     except Exception:
                         pass
 
-            # Register specific chord instead of bare key press
-            hotkey_handle = keyboard.add_hotkey(INTERRUPT_HOTKEY, trigger_barge_in)
+            hotkey_handle = None
+            try:
+                hotkey_handle = keyboard.add_hotkey(INTERRUPT_HOTKEY, trigger_barge_in)
+            except Exception:
+                pass
 
-            def play_audio():
+            # CONSUMER THREAD: Stays alive until synthesis completes AND queue drains
+            def playback_worker():
                 pa_out = pyaudio.PyAudio()
                 try:
                     out_stream = pa_out.open(
@@ -173,11 +172,26 @@ class VoiceAssistantWorker(QThread):
                         frames_per_buffer=2400
                     )
                     out_stream_holder[0] = out_stream
-                    chunk_bytes = 2400 * 2
-                    for i in range(0, len(full_audio), chunk_bytes):
-                        if self.interrupted.is_set():
+
+                    while not self.interrupted.is_set():
+                        try:
+                            # Short block wait so thread remains responsive to barge-in
+                            chunk = audio_queue.get(timeout=0.1)
+                        except queue.Empty:
+                            # Only exit if the producer has explicitly finished synthesizing
+                            if synthesis_done.is_set():
+                                break
+                            continue
+
+                        if chunk is None or self.interrupted.is_set():
                             break
-                        out_stream.write(full_audio[i:i + chunk_bytes])
+
+                        chunk_size = 2400 * 2
+                        for i in range(0, len(chunk), chunk_size):
+                            if self.interrupted.is_set():
+                                break
+                            out_stream.write(chunk[i:i + chunk_size])
+
                     out_stream.stop_stream()
                     out_stream.close()
                 except Exception as ex:
@@ -186,24 +200,41 @@ class VoiceAssistantWorker(QThread):
                     pa_out.terminate()
                     playback_finished.set()
 
-            playback_thread = threading.Thread(target=play_audio, daemon=True)
-            playback_thread.start()
+            consumer_thread = threading.Thread(target=playback_worker, daemon=True)
+            consumer_thread.start()
 
+            # PRODUCER: Synthesizes via Kokoro and pushes into queue
+            try:
+                for chunk_bytes in tts.synthesize_stream(text):
+                    if self.interrupted.is_set():
+                        break
+                    if chunk_bytes:
+                        audio_queue.put(chunk_bytes)
+            except Exception as ex:
+                print(f"[Kokoro Synthesis Error]: {ex}")
+            finally:
+                # Mark producer finished and signal consumer
+                synthesis_done.set()
+                audio_queue.put(None)
+
+            # Wait until playback naturally ends or user interrupts
             while not playback_finished.is_set() and not self.interrupted.is_set():
                 time.sleep(0.01)
 
-            # Clean up the hotkey listener immediately after playback ends
-            try:
-                keyboard.remove_hotkey(hotkey_handle)
-            except Exception:
-                pass
+            if hotkey_handle:
+                try:
+                    keyboard.remove_hotkey(hotkey_handle)
+                except Exception:
+                    pass
 
-            playback_thread.join()
+            consumer_thread.join(timeout=1.0)
             self.visualizer_state.emit(False)
 
+            # Flush mic buffer to prevent echo pickup
             try:
-                while input_stream.get_read_available() > 0:
-                    input_stream.read(input_stream.get_read_available(), exception_on_overflow=False)
+                if self.input_stream:
+                    while self.input_stream.get_read_available() > 0:
+                        self.input_stream.read(self.input_stream.get_read_available(), exception_on_overflow=False)
             except Exception:
                 pass
 
@@ -217,7 +248,7 @@ class VoiceAssistantWorker(QThread):
                 oww_model.reset()
 
                 while self.running and not in_followup_mode:
-                    audio_data = input_stream.read(1280, exception_on_overflow=False)
+                    audio_data = self.input_stream.read(1280, exception_on_overflow=False)
                     pre_roll_buffer.append(audio_data)
                     if len(pre_roll_buffer) > 10:
                         pre_roll_buffer.pop(0)
@@ -243,23 +274,47 @@ class VoiceAssistantWorker(QThread):
 
             speech_started = False
             silence_start = None
-            followup_wait_timeout = 4.5 if in_followup_mode else 12.0
-            listen_start_time = time.time()
 
-            while self.running and (time.time() - listen_start_time) < followup_wait_timeout:
-                chunk = input_stream.read(1280, exception_on_overflow=False)
+            # Relaxed timing: 10s wait for next prompt, 25s maximum sentence length
+            followup_wait_timeout = 10.0 if in_followup_mode else 15.0
+            max_recording_time = 25.0
+            listen_start_time = time.time()
+            speech_start_time = None
+
+            while self.running:
+                now = time.time()
+
+                if not speech_started and (now - listen_start_time) > followup_wait_timeout:
+                    break
+
+                if speech_started and (now - speech_start_time) > max_recording_time:
+                    break
+
+                chunk = self.input_stream.read(1280, exception_on_overflow=False)
                 recorded_chunks.append(chunk)
 
                 audio_np = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
-                audio_tensor = torch.from_numpy(audio_np[:512])
 
-                if vad_model(audio_tensor, 16000).item() >= 0.50:
-                    speech_started = True
+                # Calculate live microphone RMS amplitude and emit for Three.js orb
+                rms = float(np.sqrt(np.mean(audio_np ** 2)))
+                self.mic_level.emit(min(1.0, rms * 8.0))
+
+                # Feed 512-sample slice to Silero VAD
+                chunk_512 = torch.from_numpy(audio_np[:512])
+                with torch.no_grad():
+                    speech_prob = vad_model(chunk_512, 16000).item()
+
+                if speech_prob >= 0.50:
+                    if not speech_started:
+                        speech_started = True
+                        speech_start_time = now
                     silence_start = None
                 elif speech_started:
                     if silence_start is None:
-                        silence_start = time.time()
-                    elif (time.time() - silence_start) >= 1.0:
+                        silence_start = now
+                    # 2.2 seconds of silence required to end turn
+                    elif (now - silence_start) >= 2.2:
+                        print(f"[VAD] End of speech detected (Silence: {now - silence_start:.2f}s).")
                         break
 
             if not speech_started or not recorded_chunks:
@@ -283,7 +338,7 @@ class VoiceAssistantWorker(QThread):
             print(f"[Captured Input]: {user_text}")
             self.log_received.emit("USER", user_text)
 
-            # STATE 4: REASON & DISPATCH TOOLS
+            # STATE 4: REASON & EXECUTE VIA LLM CORE
             self.status_changed.emit("PROCESSING REASONING...")
             t_llm = time.time()
             response_data = llm.plan_and_respond(user_text)
@@ -291,54 +346,18 @@ class VoiceAssistantWorker(QThread):
             self.telemetry_update.emit("LLM_LATENCY", f"{llm_latency:.0f} ms")
             print(f"[Libra Core]: {response_data}")
 
-            action = response_data.get("action", "chat")
-            voice_msg = ""
-
-            # 1. APP LAUNCHING
-            if action == "open_app":
-                target = response_data.get("target_app", "")
-                success, msg = launch_any_application(target)
-                voice_msg = msg
-
-            # 2. OPEN SPECIFIC FILE
-            elif action == "open_file":
-                target = response_data.get("target_file", "")
-                success, msg = find_and_open_file(target)
-                voice_msg = msg
-
-            # 3. SAVE MEMORY FACT
-            elif action == "remember_fact":
-                new_fact = response_data.get("fact", "")
-                if new_fact:
-                    llm.memory.add_fact(new_fact)
-                voice_msg = response_data.get("voice_response", "I have remembered that.")
-
-            # 4. LIVE WEB RESEARCH
-            elif action in ["live_research", "lookup_entity"]:
-                if response_data.get("voice_response"):
-                    voice_msg = response_data["voice_response"]
-                else:
-                    query = response_data.get("search_query") or response_data.get("target_entity", "")
-                    snippets = search_live_web(query)
-                    voice_msg = llm.synthesize_research(user_text, snippets) if snippets else f"I could not retrieve data for {query}."
-
-            # 5. EXPLICIT BROWSER SEARCH
-            elif action == "web_search":
-                query = response_data.get("search_query", "")
-                platform = response_data.get("platform", "google")
-                voice_msg = web_search(query, platform=platform)
-
-            # 6. GENERAL CHAT
-            else:
-                voice_msg = response_data.get("voice_response", "I am listening.")
+            # Grab final voice response formulated and executed by LocalLLM
+            voice_msg = response_data.get("voice_response", "Understood.")
 
             self.log_received.emit("LIBRA", voice_msg)
             speak_interruptible(voice_msg)
             in_followup_mode = True
 
-        input_stream.stop_stream()
-        input_stream.close()
+        if self.input_stream:
+            self.input_stream.stop_stream()
+            self.input_stream.close()
         pa.terminate()
+        pa_out_master.terminate()
 
 
 class FuturisticVoiceAssistantUI(QMainWindow):
@@ -375,7 +394,9 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
         self.stat_box = QLabel("INFERENCE: NOMINAL | VRAM: ACTIVE")
         self.stat_box.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
-        self.stat_box.setStyleSheet("color: #00e5ff; background: #0c1524; border: 1px solid #142845; border-radius: 4px; padding: 6px 12px;")
+        self.stat_box.setStyleSheet(
+            "color: #00e5ff; background: #0c1524; border: 1px solid #142845; border-radius: 4px; padding: 6px 12px;"
+        )
         header.addWidget(self.stat_box)
 
         self.clock_label = QLabel()
@@ -399,7 +420,6 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         workspace = QHBoxLayout()
         workspace.setSpacing(14)
 
-        # LEFT PANE: 3D Three.js Orb Canvas
         orb_container = QFrame()
         orb_container.setStyleSheet("background-color: #030708; border: 1px solid #142238; border-radius: 8px;")
         orb_layout = QVBoxLayout(orb_container)
@@ -407,9 +427,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
         self.orb_view = QWebEngineView()
         self.orb_view.setStyleSheet("background: transparent;")
-        
-        # Load local assets/index.html
-        # Target ui/orb/index.html directly
+
         orb_file_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "orb", "index.html"))
         print(f"[GUI] Loading WebGL Core from: {orb_file_path}")
         self.orb_view.setUrl(QUrl.fromLocalFile(orb_file_path))
@@ -417,15 +435,12 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
         workspace.addWidget(orb_container, stretch=5)
 
-        # RIGHT PANE: Chat Terminal + Visualizer + Telemetry
         right_container = QVBoxLayout()
         right_container.setSpacing(10)
 
-        # Audio visualizer
         self.visualizer = CyberAudioVisualizer(self)
         right_container.addWidget(self.visualizer)
 
-        # Bottom row: Terminal + Telemetry
         chat_telemetry_row = QHBoxLayout()
         chat_telemetry_row.setSpacing(10)
 
@@ -439,7 +454,6 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         """)
         chat_telemetry_row.addWidget(self.terminal, stretch=7)
 
-        # Telemetry list
         sidebar = QVBoxLayout()
         sidebar.setSpacing(6)
         sidebar_title = QLabel("SYSTEM TELEMETRY")
@@ -463,7 +477,9 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         space_badge = QLabel("[CTRL + SPACE] INTERRUPT")
         space_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         space_badge.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-        space_badge.setStyleSheet("background: #111d2e; color: #f59e0b; border: 1px dashed #d97706; border-radius: 4px; padding: 4px;")
+        space_badge.setStyleSheet(
+            "background: #111d2e; color: #f59e0b; border: 1px dashed #d97706; border-radius: 4px; padding: 4px;"
+        )
         sidebar.addWidget(space_badge)
 
         chat_telemetry_row.addLayout(sidebar, stretch=3)
@@ -472,7 +488,6 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         workspace.addLayout(right_container, stretch=7)
         main_layout.addLayout(workspace)
 
-        # Clock
         timer = QTimer(self)
         timer.timeout.connect(self.update_clock)
         timer.start(1000)
@@ -489,20 +504,32 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
     def set_vis_state(self, active: bool):
         self.visualizer.set_active(active)
-        # Accelerate Three.js orbital rotation when speaking
         js_cmd = f"if (window.setSpeechActive) {{ window.setSpeechActive({str(active).lower()}); }}"
+        self.orb_view.page().runJavaScript(js_cmd)
+
+    def on_mic_level(self, level: float):
+        js_cmd = f"if (window.setMicAmplitude) {{ window.setMicAmplitude({level:.3f}); }}"
         self.orb_view.page().runJavaScript(js_cmd)
 
     def update_status(self, text: str):
         self.status_banner.setText(text)
         if "SPEAKING" in text:
-            self.status_banner.setStyleSheet("background: #160f29; color: #c084fc; border: 1px solid #9333ea; border-radius: 6px; padding: 9px;")
+            self.status_banner.setStyleSheet(
+                "background: #160f29; color: #c084fc; border: 1px solid #9333ea; border-radius: 6px; padding: 9px;"
+            )
         elif "RECORDING" in text or "FOLLOW-UP" in text:
-            self.status_banner.setStyleSheet("background: #092019; color: #34d399; border: 1px solid #059669; border-radius: 6px; padding: 9px;")
+            self.status_banner.setStyleSheet(
+                "background: #092019; color: #34d399; border: 1px solid #059669; border-radius: 6px; padding: 9px;"
+            )
         elif "PROCESSING" in text or "TRANSCRIBING" in text:
-            self.status_banner.setStyleSheet("background: #231608; color: #fbbf24; border: 1px solid #d97706; border-radius: 6px; padding: 9px;")
+            self.status_banner.setStyleSheet(
+                "background: #231608; color: #fbbf24; border: 1px solid #d97706; border-radius: 6px; padding: 9px;"
+            )
         else:
-            self.status_banner.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #091322, stop:0.5 #13243d, stop:1 #091322); color: #00ffcc; border: 1px solid #00e5ff; border-radius: 6px; padding: 9px;")
+            self.status_banner.setStyleSheet(
+                "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #091322, stop:0.5 #13243d, stop:1 #091322); "
+                "color: #00ffcc; border: 1px solid #00e5ff; border-radius: 6px; padding: 9px;"
+            )
 
     def append_log(self, sender: str, msg: str):
         color = "#00ffcc" if sender == "LIBRA" else "#fbbf24"
@@ -519,6 +546,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.worker = VoiceAssistantWorker()
         self.worker.status_changed.connect(self.update_status)
         self.worker.visualizer_state.connect(self.set_vis_state)
+        self.worker.mic_level.connect(self.on_mic_level)
         self.worker.telemetry_update.connect(self.update_telemetry)
         self.worker.log_received.connect(self.append_log)
         self.worker.start()
