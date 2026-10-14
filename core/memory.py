@@ -1,165 +1,314 @@
 import os
 import json
 import sqlite3
-import re
+import sqlite_vec
+import requests
 from datetime import datetime
 
 
-class MemoryCore:
-    def __init__(self, db_filename="assets/libra_memory.db", legacy_json="assets/user_memory.json"):
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        self.db_path = os.path.join(project_root, db_filename)
-        self.legacy_json_path = os.path.join(project_root, legacy_json)
-        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+class SemanticMemory:
+    """
+    Hardened semantic vector memory powered by sqlite-vec and Ollama's nomic-embed-text.
+    Maintains a SQLite database with facts and vec0 virtual table for low-latency KNN searches.
+    """
+
+    def __init__(
+        self,
+        db_filename: str = "assets/libra_memory.db",
+        ollama_base_url: str = "http://localhost:11434",
+        embed_model: str = "nomic-embed-text",
+        dim: int = 768,
+    ):
+        if db_filename == ":memory:":
+            self.db_path = ":memory:"
+            self._shared_conn = None
+        else:
+            project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            self.db_path = os.path.join(project_root, db_filename)
+            os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+            self._shared_conn = None
+
+        self.ollama_base_url = ollama_base_url.rstrip("/")
+        self.embed_model = embed_model
+        self.dim = dim
 
         self._init_db()
-        self._migrate_legacy_json()
+        self._backfill_missing_embeddings()
 
-    def _get_connection(self):
-        return sqlite3.connect(self.db_path)
+    def _get_connection(self) -> sqlite3.Connection:
+        if self.db_path == ":memory:":
+            if self._shared_conn is None:
+                conn = sqlite3.connect(":memory:")
+                conn.enable_load_extension(True)
+                sqlite_vec.load(conn)
+                conn.enable_load_extension(False)
+                self._shared_conn = conn
+            return self._shared_conn
+
+        conn = sqlite3.connect(self.db_path)
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        return conn
 
     def _init_db(self):
-        """Initializes tables for structured facts and user preferences."""
-        with self._get_connection() as conn:
+        """Initializes tables for structured facts and vector index."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        # Check existing table schema and migrate if needed
+        table_info = cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='facts'"
+        ).fetchone()
+        if table_info:
+            cols = [col[1] for col in cursor.execute("PRAGMA table_info(facts)").fetchall()]
+            if "fact_text" in cols and "content" not in cols:
+                cursor.execute("ALTER TABLE facts RENAME COLUMN fact_text TO content")
+
+        # 1. Regular facts table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                content TEXT NOT NULL,
+                category TEXT DEFAULT 'general',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 2. Vector virtual table using vec0
+        cursor.execute(f"""
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_facts USING vec0(
+                fact_id INTEGER PRIMARY KEY,
+                embedding float[{self.dim}] distance_metric=cosine
+            )
+        """)
+
+        # 3. Preferences table for key-value backwards compatibility
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS preferences (
+                pref_key TEXT PRIMARY KEY,
+                pref_value TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        conn.commit()
+        if self.db_path != ":memory:":
+            conn.close()
+
+    def _backfill_missing_embeddings(self):
+        """Checks if existing rows in `facts` lack an embedding in `vec_facts`. If so, embed and backfill them automatically."""
+        try:
+            conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS facts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    category TEXT DEFAULT 'general',
-                    fact_text TEXT UNIQUE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
+                SELECT f.id, f.content
+                FROM facts f
+                LEFT JOIN vec_facts v ON f.id = v.fact_id
+                WHERE v.fact_id IS NULL
             """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS preferences (
-                    pref_key TEXT PRIMARY KEY,
-                    pref_value TEXT,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            conn.commit()
+            missing = cursor.fetchall()
+            if missing:
+                for fact_id, content in missing:
+                    clean = (content or "").strip()
+                    if clean:
+                        emb = self.embed_text(clean)
+                        if emb and any(emb):
+                            cursor.execute(
+                                "INSERT INTO vec_facts (fact_id, embedding) VALUES (?, ?)",
+                                (fact_id, sqlite_vec.serialize_float32(emb))
+                            )
+                conn.commit()
+            if self.db_path != ":memory:":
+                conn.close()
+        except Exception as e:
+            print(f"[SemanticMemory Backfill Warning]: {e}")
 
-    def _migrate_legacy_json(self):
-        """One-time migration: imports existing assets/user_memory.json data into SQLite."""
-        if os.path.exists(self.legacy_json_path):
-            try:
-                with open(self.legacy_json_path, "r", encoding="utf-8") as f:
-                    legacy_data = json.load(f)
+    def embed_text(self, text: str) -> list[float]:
+        """Queries Ollama /api/embeddings with model nomic-embed-text."""
+        clean_text = text.strip()
+        if not clean_text:
+            return [0.0] * self.dim
+        try:
+            resp = requests.post(
+                f"{self.ollama_base_url}/api/embeddings",
+                json={"model": self.embed_model, "prompt": clean_text},
+                timeout=25
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                emb = data.get("embedding", [])
+                if emb and len(emb) == self.dim:
+                    return emb
+            print(f"[SemanticMemory Embedding Warning]: HTTP {resp.status_code} - {resp.text}")
+            return [0.0] * self.dim
+        except Exception as e:
+            print(f"[SemanticMemory Embedding Error]: {e}")
+            return [0.0] * self.dim
 
-                # Migrate custom facts
-                for fact in legacy_data.get("custom_facts", []):
-                    self.add_fact(fact, category="imported")
-
-                # Migrate music taste
-                for music in legacy_data.get("music_taste", []):
-                    self.add_fact(f"Likes music/artist: {music}", category="music")
-
-                # Rename legacy file to avoid repeated migration
-                os.rename(self.legacy_json_path, self.legacy_json_path + ".migrated")
-                print("[Memory Core] Successfully migrated legacy JSON memory to SQLite.")
-            except Exception as e:
-                print(f"[Memory Migration Warning]: {e}")
-
-    def add_fact(self, fact: str, category: str = "general") -> bool:
-        """Stores a unique fact into SQLite, auto-categorizing if necessary."""
+    def remember_fact(self, fact: str, category: str = "user_fact") -> int:
+        """Stores fact in `facts` and embedding in `vec_facts`. Returns inserted fact id."""
         clean_fact = fact.strip()
         if not clean_fact:
-            return False
+            return -1
 
-        # Auto-detect category from text
-        f_lower = clean_fact.lower()
-        if any(w in f_lower for w in ["music", "song", "band", "artist", "track"]):
-            category = "music"
-        elif any(w in f_lower for w in ["prefer", "like", "favorite", "love", "hate", "dislike"]):
-            category = "preference"
-        elif any(w in f_lower for w in ["name is", "live in", "work as", "study", "birthday"]):
-            category = "profile"
+        emb = self.embed_text(clean_fact)
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO facts (content, category, created_at) VALUES (?, ?, ?)",
+            (clean_fact, category, datetime.now().isoformat())
+        )
+        fact_id = cursor.lastrowid
 
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    INSERT OR IGNORE INTO facts (category, fact_text, created_at)
-                    VALUES (?, ?, ?)
-                """, (category, clean_fact, datetime.now().isoformat()))
+        if emb and any(emb):
+            cursor.execute(
+                "INSERT INTO vec_facts (fact_id, embedding) VALUES (?, ?)",
+                (fact_id, sqlite_vec.serialize_float32(emb))
+            )
+        conn.commit()
+        if self.db_path != ":memory:":
+            conn.close()
+        return fact_id
+
+    def recall_relevant(self, query: str, limit: int = 3, distance_threshold: float = 0.75) -> list[dict]:
+        """Runs KNN vector search against `vec_facts` JOIN `facts` ORDER BY distance LIMIT k."""
+        clean_query = query.strip()
+        if not clean_query:
+            return []
+
+        emb = self.embed_text(clean_query)
+        if not emb or not any(emb):
+            return []
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        sql = """
+            SELECT
+                f.id,
+                f.content,
+                f.category,
+                f.created_at,
+                v.distance
+            FROM vec_facts v
+            JOIN facts f ON f.id = v.fact_id
+            WHERE v.embedding MATCH ? AND k = ?
+            ORDER BY v.distance ASC
+        """
+        cursor.execute(sql, (sqlite_vec.serialize_float32(emb), limit))
+        rows = cursor.fetchall()
+
+        results = []
+        for r in rows:
+            dist = float(r[4])
+            if dist <= distance_threshold:
+                results.append({
+                    "id": r[0],
+                    "content": r[1],
+                    "category": r[2],
+                    "created_at": r[3],
+                    "distance": dist
+                })
+
+        if self.db_path != ":memory:":
+            conn.close()
+        return results
+
+    def forget_fact(self, query: str, distance_threshold: float = 0.75) -> str | None:
+        """Finds closest matching fact in `vec_facts`. If distance <= threshold, deletes the record from both tables and returns the purged text."""
+        clean_query = query.strip()
+        if not clean_query:
+            return None
+
+        emb = self.embed_text(clean_query)
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        purged_text = None
+
+        if emb and any(emb):
+            sql = """
+                SELECT f.id, f.content, v.distance
+                FROM vec_facts v
+                JOIN facts f ON f.id = v.fact_id
+                WHERE v.embedding MATCH ? AND k = 1
+                ORDER BY v.distance ASC
+            """
+            cursor.execute(sql, (sqlite_vec.serialize_float32(emb),))
+            match = cursor.fetchone()
+            if match:
+                fact_id, content, dist = match
+                if dist <= distance_threshold:
+                    cursor.execute("DELETE FROM vec_facts WHERE fact_id = ?", (fact_id,))
+                    cursor.execute("DELETE FROM facts WHERE id = ?", (fact_id,))
+                    conn.commit()
+                    purged_text = content
+
+        # Substring / exact fallback if vector match was slightly above threshold or empty
+        if purged_text is None:
+            cursor.execute("SELECT id, content FROM facts WHERE content LIKE ? LIMIT 1", (f"%{clean_query}%",))
+            sub_match = cursor.fetchone()
+            if sub_match:
+                fact_id, content = sub_match
+                cursor.execute("DELETE FROM vec_facts WHERE fact_id = ?", (fact_id,))
+                cursor.execute("DELETE FROM facts WHERE id = ?", (fact_id,))
                 conn.commit()
-                return cursor.rowcount > 0
+                purged_text = content
+
+        if self.db_path != ":memory:":
+            conn.close()
+        return purged_text
+
+    def get_profile_summary(self, limit: int = 10) -> list[str]:
+        """Returns the most recent facts stored about the user."""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT content FROM facts ORDER BY id DESC LIMIT ?", (limit,))
+            rows = cursor.fetchall()
+            if self.db_path != ":memory:":
+                conn.close()
+            return [r[0] for r in rows]
         except Exception as e:
-            print(f"[Memory Insert Error]: {e}")
-            return False
+            print(f"[SemanticMemory Profile Error]: {e}")
+            return []
+
+    # Backwards compatibility methods
+    def add_fact(self, fact: str, category: str = "general") -> bool:
+        fid = self.remember_fact(fact, category)
+        return fid > 0
 
     def remove_fact(self, fact_query: str) -> bool:
-        """Removes facts matching search words (e.g. 'forget my hobby')."""
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
-                    DELETE FROM facts WHERE fact_text LIKE ?
-                """, (f"%{fact_query.strip()}%",))
-                conn.commit()
-                return cursor.rowcount > 0
-        except Exception as e:
-            print(f"[Memory Delete Error]: {e}")
-            return False
-
-    def set_preference(self, key: str, value: str):
-        """Sets or updates a key-value user preference."""
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO preferences (pref_key, pref_value, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(pref_key) DO UPDATE SET
-                    pref_value=excluded.pref_value,
-                    updated_at=excluded.updated_at
-            """, (key.strip(), value.strip(), datetime.now().isoformat()))
-            conn.commit()
+        purged = self.forget_fact(fact_query)
+        return purged is not None
 
     def get_context_summary(self, current_query: str = "") -> str:
-        """
-        Retrieves memory context.
-        If current_query is provided, ranks facts by relevance to prevent context bloat.
-        """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-
-            # 1. Fetch fixed profile & preferences
-            cursor.execute("SELECT pref_key, pref_value FROM preferences")
-            prefs = [f"{k}: {v}" for k, v in cursor.fetchall()]
-
-            # 2. Fetch all facts
-            cursor.execute("SELECT category, fact_text FROM facts ORDER BY id DESC")
-            all_facts = cursor.fetchall()
-
-        if not all_facts and not prefs:
-            return "No prior user preferences recorded."
-
-        relevant_facts = []
-
         if current_query:
-            # Extract keywords from the query
-            words = set(re.findall(r"\w+", current_query.lower()))
-            # Filter out common stop words
-            words = {w for w in words if w not in {"what", "who", "where", "when", "how", "the", "a", "is", "my", "me", "can", "you", "tell"}}
+            relevant = self.recall_relevant(current_query, limit=3)
+            facts = [r["content"] for r in relevant]
+            if not facts:
+                facts = self.get_profile_summary(limit=3)
+        else:
+            facts = self.get_profile_summary(limit=6)
 
-            scored_facts = []
-            for category, text in all_facts:
-                fact_words = set(re.findall(r"\w+", text.lower()))
-                overlap = len(words.intersection(fact_words))
-                scored_facts.append((overlap, text))
+        if not facts:
+            return "No prior user preferences recorded."
+        return "Relevant Stored Facts: " + "; ".join(facts)
 
-            # Sort by keyword overlap descending, keep top 5
-            scored_facts.sort(key=lambda x: x[0], reverse=True)
-            relevant_facts = [text for score, text in scored_facts[:5] if score > 0]
+    def set_preference(self, key: str, value: str):
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO preferences (pref_key, pref_value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(pref_key) DO UPDATE SET
+                pref_value=excluded.pref_value,
+                updated_at=excluded.updated_at
+        """, (key.strip(), value.strip(), datetime.now().isoformat()))
+        conn.commit()
+        if self.db_path != ":memory:":
+            conn.close()
 
-        # If no specific query overlap, keep the 6 most recent facts
-        if not relevant_facts:
-            relevant_facts = [text for _, text in all_facts[:6]]
 
-        summary_parts = []
-        if prefs:
-            summary_parts.append("Active Preferences: " + "; ".join(prefs))
-        if relevant_facts:
-            summary_parts.append("Relevant Stored Facts: " + "; ".join(relevant_facts))
-
-        return "\n".join(summary_parts)
+# Backward compatibility alias
+MemoryCore = SemanticMemory

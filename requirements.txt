@@ -14,4 +14,5 @@ trafilatura
 duckduckgo-search
 sqlite-vec
 dateparser
+pytz
 keyring
