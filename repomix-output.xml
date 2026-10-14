@@ -1,10 +1,10 @@
-This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+This file is a merged representation of a subset of the codebase, containing files not matching ignore patterns, combined into a single document by Repomix.
 
 <file_summary>
 This section contains a summary of this file.
 
 <purpose>
-This file contains a packed representation of the entire repository's contents.
+This file contains a packed representation of a subset of the repository's contents that is considered the most important context.
 It is designed to be easily consumable by AI systems for analysis, code review,
 or other automated processes.
 </purpose>
@@ -32,6 +32,7 @@ The content is organized as follows:
 <notes>
 - Some files may have been excluded based on .gitignore rules and Repomix's configuration
 - Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching these patterns are excluded: venv/**, **/__pycache__/**
 - Files matching patterns in .gitignore are excluded
 - Files matching default ignore patterns are excluded
 - Files are sorted by Git change count (files with more changes are at the bottom)
@@ -48,6 +49,8 @@ assets/
     Hey_Libra.onnx
     Hey_Libra.onnx.data
     stop.onnx
+  libra_memory.db
+  user_memory.json.migrated
 core/
   kokoro_tts.py
   llm.py
@@ -67,7 +70,6 @@ ui/
   gui.py
 .gitignore
 config.json
-main.py
 requirements.txt
 </directory_structure>
 
@@ -570,127 +572,15 @@ This section contains the contents of the repository's files.
 }
 </file>
 
-<file path="core/kokoro_tts.py">
-import os
-import warnings
-import torch
-import numpy as np
-
-# Suppress PyTorch deprecation warnings to keep the worker logs clean
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=UserWarning)
-
-try:
-    from kokoro import KPipeline
-    KOKORO_AVAILABLE = True
-except ImportError:
-    KOKORO_AVAILABLE = False
-
-
-class KokoroTTS:
-    def __init__(self, voice="af_heart", lang_code="a", device="cuda"):
-        """Initializes Kokoro-82M TTS pipeline.
-
-        Voices:
-        - af_heart (warm, natural female)
-        - af_bella, af_sarah, af_sky
-        - am_adam, am_michael (male)
-        """
-        self.voice = voice
-        self.lang_code = lang_code
-        self.device = "cuda" if (torch.cuda.is_available() and device == "cuda") else "cpu"
-        self.sample_rate = 24000
-        self.pipeline = None
-
-        if not KOKORO_AVAILABLE:
-            print("[Kokoro Warning]: kokoro package not found.")
-            return
-
-        print(f"[Kokoro TTS] Loading 82M model onto {self.device} (Voice: {self.voice})...")
-        try:
-            # Explicitly specify repo_id to prevent Hugging Face default warning
-            self.pipeline = KPipeline(
-                repo_id="hexgrad/Kokoro-82M",
-                lang_code=self.lang_code,
-                device=self.device
-            )
-            print(f"[Kokoro TTS] Engine online on {self.device}.")
-        except Exception as e:
-            print(f"[Kokoro Init Error]: {e}. Falling back to CPU...")
-            self.device = "cpu"
-            self.pipeline = KPipeline(
-                repo_id="hexgrad/Kokoro-82M",
-                lang_code=self.lang_code,
-                device="cpu"
-            )
-
-    def synthesize_stream(self, text: str):
-        """Yields raw int16 PCM bytes per sentence for low-latency streaming playback."""
-        if not self.pipeline or not text.strip():
-            return
-
-        generator = self.pipeline(text, voice=self.voice, speed=1.0)
-        for _, _, audio in generator:
-            if audio is None or len(audio) == 0:
-                continue
-
-            audio_np = audio.cpu().numpy() if hasattr(audio, "cpu") else np.array(audio)
-            audio_int16 = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16)
-            yield audio_int16.tobytes()
-</file>
-
-<file path="core/memory.py">
-import os
-import json
-
-class MemoryCore:
-    def __init__(self, filename="assets/user_memory.json"):
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        self.file_path = os.path.join(project_root, filename)
-        os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
-        self.memory = self.load_memory()
-
-    def load_memory(self):
-        if os.path.exists(self.file_path):
-            try:
-                with open(self.file_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {
-            "user_preferences": {},
-            "music_taste": [],
-            "custom_facts": []
-        }
-
-    def save_memory(self):
-        try:
-            with open(self.file_path, "w", encoding="utf-8") as f:
-                json.dump(self.memory, f, indent=4)
-        except Exception as e:
-            print(f"[Memory Save Error]: {e}")
-
-    def update_music_taste(self, artists_or_tracks: list):
-        for item in artists_or_tracks:
-            if item not in self.memory["music_taste"]:
-                self.memory["music_taste"].append(item)
-        self.memory["music_taste"] = self.memory["music_taste"][-25:]  # Keep top 25
-        self.save_memory()
-
-    def add_fact(self, fact: str):
-        if fact not in self.memory["custom_facts"]:
-            self.memory["custom_facts"].append(fact)
-            self.save_memory()
-
-    def get_context_summary(self) -> str:
-        taste = ", ".join(self.memory.get("music_taste", []))
-        facts = "; ".join(self.memory.get("custom_facts", []))
-        summary = ""
-        if taste:
-            summary += f"\nKnown Music Preferences: {taste}"
-        if facts:
-            summary += f"\nSaved User Facts: {facts}"
-        return summary
+<file path="assets/user_memory.json.migrated">
+{
+    "user_preferences": {},
+    "music_taste": [],
+    "custom_facts": [
+        "User's favourite food is Paku Teh",
+        "User's favourite hobby is to sleep and play basketball"
+    ]
+}
 </file>
 
 <file path="core/tts.py">
@@ -735,72 +625,6 @@ class TextToSpeech:
 
     def terminate(self):
         self.audio.terminate()
-</file>
-
-<file path="tools/knowledge_agent.py">
-import wikipedia
-import requests
-
-# MediaWiki requires a descriptive User-Agent header to avoid 403 blocks
-wikipedia.set_lang("en")
-session = requests.Session()
-session.headers.update({"User-Agent": "LibraAI_Assistant/1.0 (local_assistant@localhost)"})
-wikipedia.requests = session
-
-def get_entity_summary(entity_name: str) -> str:
-    """Fetches a clean 2-sentence summary directly from Wikipedia."""
-    try:
-        results = wikipedia.search(entity_name)
-        if not results:
-            return ""
-        # Get page summary directly
-        page = wikipedia.page(results[0], auto_suggest=False)
-        return wikipedia.summary(page.title, sentences=2, auto_suggest=False).strip()
-    except Exception as e:
-        print(f"[Knowledge Agent Error]: {e}")
-        return ""
-</file>
-
-<file path="tools/search_agent.py">
-from datetime import datetime
-from ddgs import DDGS
-
-def search_live_web(query: str, max_results: int = 4) -> str:
-    """Performs a live web search with automated date anchoring."""
-    now = datetime.now()
-    current_year = str(now.year)
-    current_month_str = now.strftime("%B %Y")
-
-    # Replace relative date words with concrete dates
-    clean_query = query.lower()
-    if "today" in clean_query:
-        clean_query = clean_query.replace("today", f"{now.strftime('%B %d, %Y')}")
-    elif "yesterday" in clean_query:
-        from datetime import timedelta
-        yest = now - timedelta(days=1)
-        clean_query = clean_query.replace("yesterday", f"{yest.strftime('%B %d, %Y')}")
-    
-    # Ensure current year is part of the query to prevent pulling 2025/2024 stale records
-    if current_year not in clean_query:
-        clean_query += f" {current_year}"
-
-    print(f"[Anchored Search Query]: {clean_query}")
-
-    try:
-        with DDGS() as ddgs:
-            results = list(ddgs.text(clean_query, max_results=max_results))
-            if not results:
-                return "No real-time search results found."
-
-            formatted = []
-            for r in results:
-                title = r.get("title", "")
-                snippet = r.get("body", "")
-                formatted.append(f"Title: {title}\nSnippet: {snippet}")
-            return "\n\n".join(formatted)
-    except Exception as e:
-        print(f"[Search Engine Error]: {e}")
-        return "Search failed due to network timeout."
 </file>
 
 <file path="tools/spotify_agent.py">
@@ -849,91 +673,6 @@ class SpotifyAgent:
         except Exception as e:
             print(f"[Spotify Read Error]: {e}")
             return []
-</file>
-
-<file path="tools/system_actions.py">
-import os
-import glob
-import subprocess
-import webbrowser
-import urllib.parse
-
-def get_installed_shortcuts():
-    """Scans Windows Start Menu directories for all installed application shortcuts."""
-    shortcut_dirs = [
-        os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs"),
-        os.path.expandvars(r"%PROGRAMDATA%\Microsoft\Windows\Start Menu\Programs"),
-    ]
-    
-    apps = {}
-    for base in shortcut_dirs:
-        if os.path.exists(base):
-            for path in glob.glob(f"{base}/**/*.lnk", recursive=True):
-                filename = os.path.basename(path).lower()
-                clean_name = filename.replace(".lnk", "").strip()
-                # Exclude uninstaller shortcuts
-                if "uninstall" not in clean_name and "help" not in clean_name:
-                    apps[clean_name] = path
-    return apps
-
-def launch_any_application(target_name: str) -> tuple[bool, str]:
-    """Dynamically finds and launches any installed Windows application or game."""
-    target = target_name.lower().strip()
-    
-    # 1. Direct system shortcuts scan
-    installed_apps = get_installed_shortcuts()
-    for app_name, path in installed_apps.items():
-        if target in app_name or app_name in target:
-            try:
-                os.startfile(path)
-                return True, f"Launching {app_name.title()}."
-            except Exception as e:
-                print(f"[Launch Error]: {e}")
-
-    # 2. Known common launchers fallback paths
-    common_roots = [
-        os.path.expandvars(r"%LOCALAPPDATA%"),
-        os.path.expandvars(r"%PROGRAMFILES%"),
-        os.path.expandvars(r"%PROGRAMFILES(X86)%"),
-        r"C:\Riot Games",
-    ]
-    for root in common_roots:
-        if os.path.exists(root):
-            matches = glob.glob(f"{root}/**/{target}*.exe", recursive=True)
-            if matches:
-                try:
-                    subprocess.Popen(matches[0], shell=True)
-                    return True, f"Launching {target.title()}."
-                except Exception as e:
-                    print(f"[Executable Launch Error]: {e}")
-
-    # 3. Direct Windows Shell execute (calc, notepad, cmd, or URI protocol like spotify:)
-    try:
-        os.system(f"start {target}")
-        return True, f"Attempting to launch {target.title()}."
-    except Exception:
-        pass
-
-    return False, f"I could not locate an application named {target_name} on your system."
-
-def web_search(query: str, platform: str = "google") -> str:
-    """Performs web searches or opens queries across platforms."""
-    encoded = urllib.parse.quote_plus(query.strip())
-    
-    if platform.lower() == "youtube":
-        url = f"https://www.youtube.com/results?search_query={encoded}"
-        webbrowser.open(url)
-        return f"Searching YouTube for {query}."
-    else:
-        url = f"https://www.google.com/search?q={encoded}"
-        webbrowser.open(url)
-        return f"Searching Google for {query}."
-
-def open_url(url: str) -> str:
-    if not url.startswith("http"):
-        url = f"https://{url}"
-    webbrowser.open(url)
-    return f"Opening {url}."
 </file>
 
 <file path="tools/weather.py">
@@ -1060,266 +799,172 @@ __pycache__/
 .env
 </file>
 
-<file path="core/llm.py">
+<file path="core/memory.py">
 import os
-import re
 import json
-import requests
+import sqlite3
+import re
 from datetime import datetime
 
-from core.memory import MemoryCore
-from tools.search_agent import search_live_web
-from tools.spotify_agent import SpotifyAgent
-from tools.knowledge_agent import get_entity_summary
 
-
-def extract_valid_json(text: str) -> dict:
-    """Safely extracts and parses JSON even if wrapped in markdown blocks or chat fluff."""
-    if not text:
-        return {}
-    try:
-        return json.loads(text.strip())
-    except Exception:
-        pass
-
-    # Match ```json { ... } ```
-    match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except Exception:
-            pass
-
-    # Match outermost { ... }
-    match = re.search(r'(\{.*\})', text, re.DOTALL)
-    if match:
-        try:
-            return json.loads(match.group(1))
-        except Exception:
-            pass
-
-    return {}
-
-
-class LocalLLM:
-    def __init__(self, config_path="config.json"):
+class MemoryCore:
+    def __init__(self, db_filename="assets/libra_memory.db", legacy_json="assets/user_memory.json"):
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        self.config_path = os.path.join(project_root, config_path)
+        self.db_path = os.path.join(project_root, db_filename)
+        self.legacy_json_path = os.path.join(project_root, legacy_json)
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
 
-        self.base_url = "http://localhost:11434"
-        self.city = "Kuala Lumpur"
-        self.models = {
-            "router": "qwen3:8b",
-            "web_research": "qwen3:8b",
-            "chat": "qwen3:8b"
-        }
+        self._init_db()
+        self._migrate_legacy_json()
 
-        self.load_config()
-        self.memory = MemoryCore()
-        self.spotify = SpotifyAgent()
-        
-        # Real conversation history tracking across turns
-        # Structure: [{"role": "user"|"assistant", "content": str}, ...]
-        self.conversation_history = []
+    def _get_connection(self):
+        return sqlite3.connect(self.db_path)
 
-    def load_config(self):
-        if os.path.exists(self.config_path):
+    def _init_db(self):
+        """Initializes tables for structured facts and user preferences."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category TEXT DEFAULT 'general',
+                    fact_text TEXT UNIQUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS preferences (
+                    pref_key TEXT PRIMARY KEY,
+                    pref_value TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+
+    def _migrate_legacy_json(self):
+        """One-time migration: imports existing assets/user_memory.json data into SQLite."""
+        if os.path.exists(self.legacy_json_path):
             try:
-                with open(self.config_path, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                    self.base_url = cfg.get("ollama_base_url", self.base_url)
-                    self.city = cfg.get("city", self.city)
-                    default_m = cfg.get("ollama_model") or cfg.get("default_model", "qwen3:8b")
-                    for k in self.models:
-                        self.models[k] = default_m
-                    model_pool = cfg.get("models", {})
-                    for role, name in model_pool.items():
-                        self.models[role] = name
+                with open(self.legacy_json_path, "r", encoding="utf-8") as f:
+                    legacy_data = json.load(f)
+
+                # Migrate custom facts
+                for fact in legacy_data.get("custom_facts", []):
+                    self.add_fact(fact, category="imported")
+
+                # Migrate music taste
+                for music in legacy_data.get("music_taste", []):
+                    self.add_fact(f"Likes music/artist: {music}", category="music")
+
+                # Rename legacy file to avoid repeated migration
+                os.rename(self.legacy_json_path, self.legacy_json_path + ".migrated")
+                print("[Memory Core] Successfully migrated legacy JSON memory to SQLite.")
             except Exception as e:
-                print(f"[LLM Config Error]: {e}")
+                print(f"[Memory Migration Warning]: {e}")
 
-    def call_ollama(
-        self, 
-        model: str, 
-        prompt: str, 
-        system_prompt: str = "", 
-        as_json: bool = False, 
-        timeout: int = 60, 
-        include_history: bool = False
-    ) -> str:
-        """Invokes Ollama's chat API with thinking disabled and options configured."""
-        url = f"{self.base_url.rstrip('/')}/api/chat"
-        messages = []
+    def add_fact(self, fact: str, category: str = "general") -> bool:
+        """Stores a unique fact into SQLite, auto-categorizing if necessary."""
+        clean_fact = fact.strip()
+        if not clean_fact:
+            return False
 
-        # /no_think informs Qwen3 to skip internal reasoning tokens
-        base_system = (system_prompt + " /no_think").strip() if system_prompt else "/no_think"
-        messages.append({"role": "system", "content": base_system})
-
-        # Inject real conversation history so pronouns and follow-ups resolve
-        if include_history and self.conversation_history:
-            messages.extend(self.conversation_history[-6:])
-
-        messages.append({"role": "user", "content": prompt})
-
-        payload = {
-            "model": model,
-            "messages": messages,
-            "stream": False,
-            "think": False,  # API-level reasoning disable
-            "options": {
-                "num_ctx": 4096,  # Lean context for fast latency
-                "temperature": 0.3
-            }
-        }
-        if as_json:
-            payload["format"] = "json"
+        # Auto-detect category from text
+        f_lower = clean_fact.lower()
+        if any(w in f_lower for w in ["music", "song", "band", "artist", "track"]):
+            category = "music"
+        elif any(w in f_lower for w in ["prefer", "like", "favorite", "love", "hate", "dislike"]):
+            category = "preference"
+        elif any(w in f_lower for w in ["name is", "live in", "work as", "study", "birthday"]):
+            category = "profile"
 
         try:
-            res = requests.post(url, json=payload, timeout=timeout)
-            if res.status_code == 200:
-                data = res.json()
-                return data.get("message", {}).get("content", "").strip()
-            else:
-                print(f"[Ollama Error {res.status_code}]: {res.text}")
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT OR IGNORE INTO facts (category, fact_text, created_at)
+                    VALUES (?, ?, ?)
+                """, (category, clean_fact, datetime.now().isoformat()))
+                conn.commit()
+                return cursor.rowcount > 0
         except Exception as e:
-            print(f"[Ollama Call Failed for {model}]: {e}")
-        return ""
+            print(f"[Memory Insert Error]: {e}")
+            return False
 
-    def plan_and_respond(self, user_query: str) -> dict:
-        today = datetime.now()
-        today_str = today.strftime("%A, %B %d, %Y")
-        q_lower = user_query.lower().strip()
+    def remove_fact(self, fact_query: str) -> bool:
+        """Removes facts matching search words (e.g. 'forget my hobby')."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    DELETE FROM facts WHERE fact_text LIKE ?
+                """, (f"%{fact_query.strip()}%",))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"[Memory Delete Error]: {e}")
+            return False
 
-        # -------------------------------------------------------------
-        # TIGHTENED ENTITY MATCHER (No broad "what is" trap)
-        # -------------------------------------------------------------
-        entity_match = re.search(r'^(?:who is|tell me about)\s+([a-zA-Z0-9\s]+?)(?:\?|$)', q_lower)
-        if entity_match:
-            target_entity = entity_match.group(1).strip()
-            if not any(w in target_entity for w in ["the weather", "running", "today", "tomorrow"]):
-                print(f"[FastTrack] Targeted Entity: '{target_entity}'")
-                decision = self._execute_entity_lookup(target_entity, user_query, today_str)
-                self._record_turn(user_query, decision.get("voice_response", ""))
-                return decision
+    def set_preference(self, key: str, value: str):
+        """Sets or updates a key-value user preference."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO preferences (pref_key, pref_value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(pref_key) DO UPDATE SET
+                    pref_value=excluded.pref_value,
+                    updated_at=excluded.updated_at
+            """, (key.strip(), value.strip(), datetime.now().isoformat()))
+            conn.commit()
 
-        # -------------------------------------------------------------
-        # ROUTER CLASSIFICATION PASS (With History Awareness)
-        # -------------------------------------------------------------
-        router_model = self.models.get("router", "qwen3:8b")
-        memory_ctx = self.memory.get_context_summary()
+    def get_context_summary(self, current_query: str = "") -> str:
+        """
+        Retrieves memory context.
+        If current_query is provided, ranks facts by relevance to prevent context bloat.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
 
-        system_instructions = (
-            f"You are Libra, an elite autonomous cybernetic assistant. Current Date: {today_str}. Location: {self.city}.\n"
-            f"Context Memory: {memory_ctx}\n"
-            "Analyze intent and reply ONLY with a valid JSON object matching the requested schema."
-        )
+            # 1. Fetch fixed profile & preferences
+            cursor.execute("SELECT pref_key, pref_value FROM preferences")
+            prefs = [f"{k}: {v}" for k, v in cursor.fetchall()]
 
-        prompt = f"""User request: "{user_query}"
+            # 2. Fetch all facts
+            cursor.execute("SELECT category, fact_text FROM facts ORDER BY id DESC")
+            all_facts = cursor.fetchall()
 
-Allowed actions:
-- "lookup_entity": Biographical or factual questions about a specific person, place, or concept. ("target_entity": name)
-- "live_research": Current news, recent tournament scores, sports results. ("search_query": keyword string)
-- "open_app": Launching desktop software/games. ("target_app": app name)
-- "web_search": Explicitly asking to search Google or YouTube. ("platform": "google"|"youtube", "search_query": query)
-- "get_daily_weather": Specific day weather. ("target_date": "YYYY-MM-DD")
-- "get_weekly_weather": 7-day weather overview.
-- "chat": Greetings, jokes, opinions, or conversational follow-ups. ("voice_response": concise spoken text)
+        if not all_facts and not prefs:
+            return "No prior user preferences recorded."
 
-Output JSON:"""
+        relevant_facts = []
 
-        raw_json = self.call_ollama(
-            router_model, 
-            prompt, 
-            system_prompt=system_instructions, 
-            as_json=True, 
-            timeout=45, 
-            include_history=True
-        )
-        decision = extract_valid_json(raw_json)
+        if current_query:
+            # Extract keywords from the query
+            words = set(re.findall(r"\w+", current_query.lower()))
+            # Filter out common stop words
+            words = {w for w in words if w not in {"what", "who", "where", "when", "how", "the", "a", "is", "my", "me", "can", "you", "tell"}}
 
-        if not decision or "action" not in decision:
-            decision = {"action": "chat", "voice_response": "I'm online. How can I assist you?"}
+            scored_facts = []
+            for category, text in all_facts:
+                fact_words = set(re.findall(r"\w+", text.lower()))
+                overlap = len(words.intersection(fact_words))
+                scored_facts.append((overlap, text))
 
-        action = decision.get("action")
+            # Sort by keyword overlap descending, keep top 5
+            scored_facts.sort(key=lambda x: x[0], reverse=True)
+            relevant_facts = [text for score, text in scored_facts[:5] if score > 0]
 
-        # -------------------------------------------------------------
-        # DISPATCH EXECUTION
-        # -------------------------------------------------------------
-        if action == "lookup_entity":
-            target = decision.get("target_entity") or user_query
-            decision = self._execute_entity_lookup(target, user_query, today_str)
+        # If no specific query overlap, keep the 6 most recent facts
+        if not relevant_facts:
+            relevant_facts = [text for _, text in all_facts[:6]]
 
-        elif action == "live_research":
-            query = decision.get("search_query", user_query)
-            snippets = search_live_web(query)
-            
-            synth_model = self.models.get("web_research", "qwen3:8b")
-            synth_prompt = (
-                f"You are Libra. Today is {today_str}.\n"
-                f"Summarize these search results to answer '{user_query}' in 2 spoken sentences.\n"
-                f"Do not read out URLs or snippet headers. No markdown asterisks.\n\n"
-                f"Search Intel:\n{snippets}"
-            )
-            spoken = self.call_ollama(synth_model, synth_prompt, timeout=60)
-            decision["voice_response"] = spoken or "I reviewed the search results, but could not formulate a clear answer."
+        summary_parts = []
+        if prefs:
+            summary_parts.append("Active Preferences: " + "; ".join(prefs))
+        if relevant_facts:
+            summary_parts.append("Relevant Stored Facts: " + "; ".join(relevant_facts))
 
-        elif action == "chat":
-            # If router didn't generate a conversational line, generate it using full history
-            if not decision.get("voice_response") or decision.get("voice_response") in ["{}", "{\n\n}"]:
-                chat_model = self.models.get("chat", "qwen3:8b")
-                reply = self.call_ollama(
-                    chat_model, 
-                    user_query, 
-                    system_prompt=system_instructions, 
-                    timeout=30, 
-                    include_history=True
-                )
-                decision["voice_response"] = reply or "Understood. Standing by."
-
-        # Commit this interaction to persistent rolling session history
-        self._record_turn(user_query, decision.get("voice_response", ""))
-        return decision
-
-    def _execute_entity_lookup(self, entity: str, original_query: str, today_str: str) -> dict:
-        print(f"[Knowledge Engine] Entity Lookup: '{entity}'")
-        summary = get_entity_summary(entity)
-        if not summary:
-            raw_web = search_live_web(f"{entity} biography overview")
-            snippets = re.findall(r'Snippet:\s*(.+)', raw_web)
-            summary = " ".join(snippets[:2]) if snippets else ""
-
-        if not summary:
-            return {
-                "action": "chat",
-                "voice_response": f"I couldn't verify records for {entity}."
-            }
-
-        synth_prompt = (
-            f"You are Libra. State who {entity} is in 2 spoken sentences based on these facts:\n"
-            f"Focus on who they are, their role/identity, and where they are from (avoid rattling off raw stats).\n"
-            f"No markdown asterisks.\n\n"
-            f"Facts:\n{summary}"
-        )
-        voice_text = self.call_ollama(self.models.get("chat", "qwen3:8b"), synth_prompt, timeout=35)
-        
-        # Guard: clean out any raw snippet debris if the synthesis failed
-        if not voice_text:
-            clean = re.sub(r'Title:.*?\n|Snippet:\s*', '', summary)
-            voice_text = clean[:220].strip()
-
-        return {
-            "action": "lookup_entity",
-            "voice_response": voice_text
-        }
-
-    def _record_turn(self, user_text: str, assistant_text: str):
-        if user_text:
-            self.conversation_history.append({"role": "user", "content": user_text})
-        if assistant_text:
-            self.conversation_history.append({"role": "assistant", "content": assistant_text})
-        # Keep recent 8 conversational turns (4 exchanges) in memory window
-        if len(self.conversation_history) > 8:
-            self.conversation_history = self.conversation_history[-8:]
+        return "\n".join(summary_parts)
 </file>
 
 <file path="core/stt.py">
@@ -1435,6 +1080,347 @@ class SpeechToText:
         return text
 </file>
 
+<file path="tools/knowledge_agent.py">
+import requests
+import urllib.parse
+
+# Wikimedia Foundation User-Agent Policy requires an explicit identifier and contact/app info
+HEADERS = {
+    "User-Agent": "LibraAI_Assistant/1.0 (https://github.com/libra; contact@localhost)"
+}
+
+def get_entity_summary(entity_name: str) -> str:
+    """
+    Fetches a clean summary directly from Wikipedia's official REST API endpoint.
+    Bypasses legacy wikipedia library JSONDecodeErrors and 403 blocks.
+    """
+    if not entity_name or not entity_name.strip():
+        return ""
+
+    clean_entity = entity_name.strip().replace(" ", "_")
+    encoded_title = urllib.parse.quote(clean_entity)
+    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded_title}"
+
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=6)
+        
+        # 1. Direct page match
+        if response.status_code == 200:
+            data = response.json()
+            extract = data.get("extract", "").strip()
+            if extract:
+                return extract
+
+        # 2. If direct title 404s, query OpenSearch to find the closest page title
+        search_url = (
+            f"https://en.wikipedia.org/w/api.php?action=opensearch&search="
+            f"{urllib.parse.quote(entity_name)}&limit=1&namespace=0&format=json"
+        )
+        search_resp = requests.get(search_url, headers=HEADERS, timeout=6)
+        
+        if search_resp.status_code == 200:
+            search_data = search_resp.json()
+            if len(search_data) > 1 and search_data[1]:
+                matched_title = search_data[1][0].replace(" ", "_")
+                fallback_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{urllib.parse.quote(matched_title)}"
+                fb_resp = requests.get(fallback_url, headers=HEADERS, timeout=6)
+                if fb_resp.status_code == 200:
+                    return fb_resp.json().get("extract", "").strip()
+
+    except Exception as e:
+        print(f"[Knowledge Agent Error]: {e}")
+
+    return ""
+</file>
+
+<file path="tools/search_agent.py">
+import warnings
+from ddgs import DDGS
+
+warnings.filterwarnings("ignore")
+
+
+def search_live_web(query: str, max_results: int = 4) -> str:
+    """
+    Queries DuckDuckGo silently in the background and aggregates concise snippets.
+    Imported by core.llm and ui.gui for live research.
+    """
+    clean_query = query.strip().strip('"').strip("'")
+    if not clean_query:
+        return ""
+
+    context_snippets = []
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(clean_query, max_results=max_results))
+            for res in results:
+                title = res.get("title", "")
+                body = res.get("body", "")
+                if body:
+                    context_snippets.append(f"{title}: {body}")
+    except Exception as e:
+        print(f"[Search Engine Warning]: {e}")
+        return ""
+
+    return "\n".join(context_snippets)
+
+
+# Alias in case another module calls perform_live_search
+perform_live_search = search_live_web
+</file>
+
+<file path="config.json">
+{
+  "city": "Kuala Lumpur",
+  "ollama_base_url": "http://localhost:11434",
+  "default_model": "qwen3:8b",
+  "models": {
+    "router": "qwen3:8b",
+    "web_research": "qwen3:8b",
+    "coding": "qwen2.5-coder:7b",
+    "chat": "qwen3:8b"
+  }
+}
+</file>
+
+<file path="core/kokoro_tts.py">
+import os
+import logging
+import warnings
+import torch
+import numpy as np
+import torch
+
+# Bypass cuDNN sub-library version mismatch while keeping GPU CUDA acceleration
+if torch.cuda.is_available():
+    torch.backends.cudnn.enabled = False
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+# Suppress phonemizer and PyTorch deprecation warnings
+logging.getLogger("phonemizer").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+try:
+    from kokoro import KPipeline
+    KOKORO_AVAILABLE = True
+except ImportError:
+    KOKORO_AVAILABLE = False
+
+
+class KokoroTTS:
+    def __init__(self, voice="af_heart", lang_code="a", device="cuda"):
+        """Initializes Kokoro-82M TTS pipeline with CUDA priority."""
+        self.voice = voice
+        self.lang_code = lang_code
+        self.device = "cuda" if (torch.cuda.is_available() and device == "cuda") else "cpu"
+        self.sample_rate = 24000
+        self.pipeline = None
+
+        if not KOKORO_AVAILABLE:
+            print("[Kokoro Warning]: kokoro package not found.")
+            return
+
+        print(f"[Kokoro TTS] Loading 82M model onto {self.device} (Voice: {self.voice})...")
+        try:
+            # Explicitly pass repo_id and device to KPipeline
+            self.pipeline = KPipeline(
+                repo_id="hexgrad/Kokoro-82M",
+                lang_code=self.lang_code,
+                device=self.device
+            )
+            print(f"[Kokoro TTS] Engine online on {self.device.upper()}.")
+        except Exception as e:
+            print(f"[Kokoro CUDA Warning]: {e}. Retrying on CPU...")
+            self.device = "cpu"
+            self.pipeline = KPipeline(
+                repo_id="hexgrad/Kokoro-82M",
+                lang_code=self.lang_code,
+                device="cpu"
+            )
+
+    def synthesize_stream(self, text: str):
+        """Yields raw int16 PCM bytes per sentence for low-latency streaming playback."""
+        if not self.pipeline or not text.strip():
+            return
+
+        generator = self.pipeline(text, voice=self.voice, speed=1.0)
+        for _, _, audio in generator:
+            if audio is None or len(audio) == 0:
+                continue
+
+            audio_np = audio.cpu().numpy() if hasattr(audio, "cpu") else np.array(audio)
+            audio_int16 = (np.clip(audio_np, -1.0, 1.0) * 32767).astype(np.int16)
+            yield audio_int16.tobytes()
+</file>
+
+<file path="tools/system_actions.py">
+import os
+import glob
+import subprocess
+import webbrowser
+import urllib.parse
+
+
+def get_installed_shortcuts():
+    """Scans Windows Start Menu directories for installed application shortcuts."""
+    shortcut_dirs = [
+        os.path.expandvars(r"%APPDATA%\Microsoft\Windows\Start Menu\Programs"),
+        os.path.expandvars(r"%PROGRAMDATA%\Microsoft\Windows\Start Menu\Programs"),
+    ]
+
+    apps = {}
+    for base in shortcut_dirs:
+        if os.path.exists(base):
+            for path in glob.glob(f"{base}/**/*.lnk", recursive=True):
+                filename = os.path.basename(path).lower()
+                clean_name = filename.replace(".lnk", "").strip()
+                if "uninstall" not in clean_name and "help" not in clean_name:
+                    apps[clean_name] = path
+    return apps
+
+
+def launch_any_application(target_name: str) -> tuple[bool, str]:
+    """Dynamically finds and launches any installed Windows application or game."""
+    target = target_name.lower().strip()
+
+    # 1. Direct Game/App Protocol URI Handlers (Bypasses shortcut scanning entirely)
+    protocol_map = {
+        "roblox": "roblox-player:",
+        "roblox player": "roblox-player:",
+        "spotify": "spotify:",
+        "steam": "steam:",
+        "discord": "discord:",
+    }
+
+    if target in protocol_map:
+        try:
+            subprocess.Popen(f'start "" "{protocol_map[target]}"', shell=True)
+            return True, f"Launching {target.title()}."
+        except Exception as e:
+            print(f"[Protocol Launch Failed]: {e}")
+
+    # 2. Check Start Menu Shortcuts (.lnk)
+    installed_apps = get_installed_shortcuts()
+    for app_name, path in installed_apps.items():
+        if target in app_name or app_name in target:
+            try:
+                subprocess.Popen(f'start "" "{path}"', shell=True)
+                return True, f"Launching {app_name.title()}."
+            except Exception as e:
+                print(f"[Shell Start Error]: {e}")
+                try:
+                    os.startfile(path)
+                    return True, f"Launching {app_name.title()}."
+                except Exception as ex:
+                    print(f"[Fallback startfile Error]: {ex}")
+
+    # 3. Known Common Launcher Folders and Executable Locations
+    common_roots = [
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs"),
+        os.path.expandvars(r"%LOCALAPPDATA%"),
+        os.path.expandvars(r"%APPDATA%"),
+        os.path.expandvars(r"%PROGRAMFILES%"),
+        os.path.expandvars(r"%PROGRAMFILES(X86)%"),
+        r"C:\Riot Games",
+    ]
+    for root in common_roots:
+        if os.path.exists(root):
+            matches = glob.glob(f"{root}/**/{target}*.exe", recursive=True)
+            if matches:
+                try:
+                    subprocess.Popen(f'start "" "{matches[0]}"', shell=True)
+                    return True, f"Launching {target.title()}."
+                except Exception as e:
+                    print(f"[Executable Launch Error]: {e}")
+
+    # 4. Built-in Windows Utilities & Commands (calc, notepad, cmd)
+    built_in_tools = ["notepad", "calc", "calculator", "cmd", "explorer", "taskmgr", "regedit"]
+    if target in built_in_tools:
+        try:
+            subprocess.Popen(f'start "" "{target}"', shell=True)
+            return True, f"Launching {target.title()}."
+        except Exception as e:
+            print(f"[Built-in Launch Error]: {e}")
+
+    return False, f"I could not locate an application named {target_name.title()} on your system."
+
+
+def close_any_application(target_name: str) -> tuple[bool, str]:
+    """Forcefully terminates an application process matching the target name."""
+    clean_target = target_name.lower().replace(".exe", "").strip()
+
+    aliases = {
+        "spotify": "Spotify.exe",
+        "valorant": "VALORANT.exe",
+        "roblox": "RobloxPlayerBeta.exe",
+        "roblox player": "RobloxPlayerBeta.exe",
+        "modrinth": "Modrinth App.exe",
+        "modrinth app": "Modrinth App.exe",
+        "riot client": "RiotClientServices.exe",
+        "discord": "Discord.exe",
+        "chrome": "chrome.exe",
+        "steam": "steam.exe",
+        "notepad": "notepad.exe",
+        "calculator": "CalculatorApp.exe",
+    }
+
+    proc_name = aliases.get(clean_target, f"{clean_target}.exe")
+
+    try:
+        res = subprocess.run(["taskkill", "/F", "/IM", proc_name, "/T"], capture_output=True, text=True)
+        if res.returncode == 0:
+            return True, f"Closed {target_name.title()}."
+        return False, f"I could not locate an active process for {target_name.title()}."
+    except Exception as e:
+        return False, f"Failed to close {target_name}: {e}"
+
+
+def find_and_open_file(target_file: str) -> tuple[bool, str]:
+    """Searches common user directories and opens matching files."""
+    search_dirs = [
+        os.path.expanduser("~/Desktop"),
+        os.path.expanduser("~/Documents"),
+        os.path.expanduser("~/Downloads"),
+    ]
+    target_clean = target_file.lower().strip()
+
+    for base in search_dirs:
+        if os.path.exists(base):
+            for root, _, files in os.walk(base):
+                for file in files:
+                    if target_clean in file.lower():
+                        full_path = os.path.join(root, file)
+                        try:
+                            subprocess.Popen(f'start "" "{full_path}"', shell=True)
+                            return True, f"Opening {file}."
+                        except Exception as e:
+                            return False, f"Error opening file: {e}"
+
+    return False, f"Could not find {target_file} in your user directories."
+
+
+def web_search(query: str, platform: str = "google") -> str:
+    """Performs web searches or opens queries across platforms in the browser."""
+    encoded = urllib.parse.quote_plus(query.strip())
+    if platform.lower() == "youtube":
+        url = f"https://www.youtube.com/results?search_query={encoded}"
+        webbrowser.open(url)
+        return f"Searching YouTube for {query}."
+    else:
+        url = f"https://www.google.com/search?q={encoded}"
+        webbrowser.open(url)
+        return f"Searching Google for {query}."
+
+
+def open_url(url: str) -> str:
+    """Navigates the default web browser to the given URL."""
+    if not url.startswith("http"):
+        url = f"https://{url}"
+    webbrowser.open(url)
+    return f"Opening {url}."
+</file>
+
 <file path="ui/orb/index.html">
 <!DOCTYPE html>
 <html lang="en">
@@ -1453,7 +1439,8 @@ class SpeechToText:
     }
     canvas { display: block; outline: none; }
   </style>
-  <script src="three.min.js"></script></head>
+  <script src="three.min.js"></script>
+</head>
 <body>
 <script>
   const scene = new THREE.Scene();
@@ -1466,26 +1453,28 @@ class SpeechToText:
   document.body.appendChild(renderer.domElement);
 
   const particleCount = 280;
-  const radius = 6.2;
+  const baseRadius = 6.2;
   const positions = new Float32Array(particleCount * 3);
+  const baseDirections = [];
   const velocities = [];
 
   for (let i = 0; i < particleCount; i++) {
     const phi = Math.acos(-1 + (2 * i) / particleCount);
     const theta = Math.sqrt(particleCount * Math.PI) * phi;
 
-    const x = radius * Math.cos(theta) * Math.sin(phi);
-    const y = radius * Math.sin(theta) * Math.sin(phi);
-    const z = radius * Math.cos(phi);
+    const x = Math.cos(theta) * Math.sin(phi);
+    const y = Math.sin(theta) * Math.sin(phi);
+    const z = Math.cos(phi);
 
-    positions[i * 3]     = x;
-    positions[i * 3 + 1] = y;
-    positions[i * 3 + 2] = z;
+    positions[i * 3]     = x * baseRadius;
+    positions[i * 3 + 1] = y * baseRadius;
+    positions[i * 3 + 2] = z * baseRadius;
 
+    baseDirections.push(new THREE.Vector3(x, y, z));
     velocities.push(new THREE.Vector3(
-      (Math.random() - 0.5) * 0.015,
-      (Math.random() - 0.5) * 0.015,
-      (Math.random() - 0.5) * 0.015
+      (Math.random() - 0.5) * 0.012,
+      (Math.random() - 0.5) * 0.012,
+      (Math.random() - 0.5) * 0.012
     ));
   }
 
@@ -1511,8 +1500,13 @@ class SpeechToText:
   scene.add(lineMesh);
 
   // Outer orbital HUD ring
-  const ringGeo = new THREE.RingGeometry(8.0, 8.04, 64);
-  const ringMat = new THREE.MeshBasicMaterial({ color: 0x00ffff, side: THREE.DoubleSide, transparent: true, opacity: 0.25 });
+  const ringGeo = new THREE.RingGeometry(8.0, 8.05, 64);
+  const ringMat = new THREE.MeshBasicMaterial({ 
+    color: 0x00ffff, 
+    side: THREE.DoubleSide, 
+    transparent: true, 
+    opacity: 0.25 
+  });
   const hudRing = new THREE.Mesh(ringGeo, ringMat);
   hudRing.rotation.x = Math.PI / 3;
   scene.add(hudRing);
@@ -1530,24 +1524,58 @@ class SpeechToText:
 
   let clock = new THREE.Clock();
   let speedMultiplier = 1.0;
+  let targetSpeedMultiplier = 1.0;
 
-  // Reactivity hook: accelerates spin rate when speaking
+  // Reactivity state variables
+  let targetMicAmplitude = 0.0;
+  let currentMicAmplitude = 0.0;
+
+  // Accelerated orbital spin while TTS is actively speaking
   window.setSpeechActive = function(active) {
-    speedMultiplier = active ? 2.5 : 1.0;
+    targetSpeedMultiplier = active ? 2.8 : 1.0;
   };
+
+  // Called continuously from PyQt6 worker with normalized mic amplitude (0.0 to 1.0)
+  window.setMicAmplitude = function(val) {
+    targetMicAmplitude = Math.min(Math.max(val, 0.0), 1.0);
+  };
+
+  const defaultColor = new THREE.Color(0x00f0ff);
+  const peakColor = new THREE.Color(0xd946ef); // Neon magenta on loud input
+  const currentColor = new THREE.Color();
 
   function animate() {
     requestAnimationFrame(animate);
+
+    // Smooth exponential damping (Lerp)
+    currentMicAmplitude += (targetMicAmplitude - currentMicAmplitude) * 0.18;
+    speedMultiplier += (targetSpeedMultiplier - speedMultiplier) * 0.1;
+    
+    // Decay target amplitude when silence returns
+    targetMicAmplitude *= 0.92;
+
     const elapsedTime = clock.getElapsedTime() * speedMultiplier;
     const pos = pGeo.attributes.position.array;
+
+    // Reactivity scale multipliers
+    const vocalExpansion = 1.0 + currentMicAmplitude * 0.35;
+    const pointScale = 0.22 + currentMicAmplitude * 0.20;
+    pMat.size = pointScale;
+
+    // Color shift based on mic intensity
+    currentColor.copy(defaultColor).lerp(peakColor, currentMicAmplitude * 1.2);
+    pMat.color.copy(currentColor);
+    lineMat.opacity = 0.20 + currentMicAmplitude * 0.45;
 
     for (let i = 0; i < particleCount; i++) {
       pos[i * 3]     += velocities[i].x * speedMultiplier;
       pos[i * 3 + 1] += velocities[i].y * speedMultiplier;
       pos[i * 3 + 2] += velocities[i].z * speedMultiplier;
 
+      // Check distance against dynamically modulated radius
+      const currentRadius = baseRadius * vocalExpansion;
       const d = Math.sqrt(pos[i * 3] ** 2 + pos[i * 3 + 1] ** 2 + pos[i * 3 + 2] ** 2);
-      if (d > radius * 1.15 || d < radius * 0.85) {
+      if (d > currentRadius * 1.15 || d < currentRadius * 0.85) {
         velocities[i].negate();
       }
     }
@@ -1555,7 +1583,7 @@ class SpeechToText:
 
     // Dynamic plexus connections
     const linePositions = [];
-    const maxDistance = 2.4;
+    const maxDistance = 2.4 * vocalExpansion;
     for (let i = 0; i < particleCount; i++) {
       for (let j = i + 1; j < particleCount; j++) {
         const dx = pos[i * 3]     - pos[j * 3];
@@ -1579,9 +1607,13 @@ class SpeechToText:
     core.rotation.y       = elapsedTime * 0.15;
     hudRing.rotation.z    = elapsedTime * 0.05;
 
-    // Pulsing core oscillation
-    const scale = 1.0 + Math.sin(elapsedTime * 2.0) * 0.05;
-    core.scale.set(scale, scale, scale);
+    // Pulse core geometry with vocal scale
+    const corePulse = (1.0 + Math.sin(elapsedTime * 2.0) * 0.05) * (1.0 + currentMicAmplitude * 0.4);
+    core.scale.set(corePulse, corePulse, corePulse);
+
+    // Subtle HUD ring breathing
+    const ringScale = 1.0 + currentMicAmplitude * 0.15;
+    hudRing.scale.set(ringScale, ringScale, ringScale);
 
     renderer.render(scene, camera);
   }
@@ -1597,127 +1629,394 @@ class SpeechToText:
 </html>
 </file>
 
-<file path="config.json">
-{
-  "city": "Kuala Lumpur",
-  "ollama_base_url": "http://localhost:11434",
-  "default_model": "qwen3:8b",
-  "models": {
-    "router": "qwen3:8b",
-    "web_research": "qwen3:8b",
-    "coding": "qwen2.5-coder:7b",
-    "chat": "qwen3:8b"
-  }
-}
+<file path="requirements.txt">
+pyaudio
+faster-whisper
+silero-vad
+openwakeword
+kokoro>=0.9.4
+soundfile
+misaki
+keyboard
+PyQt6
+PyQt6-WebEngine
+requests>=2.31.0
+ollama>=0.5.1
+trafilatura
+duckduckgo-search
+sqlite-vec
+dateparser
+keyring
 </file>
 
-<file path="main.py">
-import json
-import ollama
-from tools.weather import get_weather
-from core.stt import listen
-from core.tts import speak
+<file path="core/llm.py">
+import os
 import re
-from core.tts import TextToSpeech
-from core.stt import SpeechToText
-from tools.weather import get_weather
+import json
+import requests
+from datetime import datetime
 
-# Map available tools by name
-TOOL_MAP = {
-    "get_weather": get_weather
-}
+from core.memory import MemoryCore
+from tools.knowledge_agent import get_entity_summary
+from tools.search_agent import search_live_web
+from tools.system_actions import launch_any_application, close_any_application, find_and_open_file, web_search
+from tools.weather import get_forecast_for_iso_date, get_weekly_forecast
 
-SYSTEM_PROMPT = """You are Libra, an authentic, highly capable AI assistant like JARVIS.
-Default location: Kuala Lumpur, Malaysia. If the user asks about the weather without specifying a location, assume Kuala Lumpur.
-Keep your spoken responses natural, concise, and direct."""
 
-def clean_for_speech(text):
-    """Strips markdown, redundant time formats, and emojis for TTS."""
+def condense_spelling(text: str) -> str:
+    """Condenses spaced-out spellings (e.g., 'M E S S I' -> 'MESSI')."""
+    return re.sub(r"(?:\b[a-zA-Z]\b\s+){2,}\b[a-zA-Z]\b", lambda m: m.group(0).replace(" ", ""), text)
+
+
+def extract_valid_json(text: str) -> dict:
+    """Extracts and parses JSON object from an LLM response string."""
     if not text:
-        return ""
-        
-    # Remove Markdown formatting (like ** or *)
-    text = re.sub(r'\*+', '', text)
-    
-    # Remove redundant 24-hour times in parentheses e.g. (20:00)
-    text = re.sub(r'\(\d{1,2}:\d{2}\)', '', text)
-    
-    # Remove emojis by keeping only standard ASCII characters (letters, numbers, basic punctuation)
-    text = text.encode('ascii', 'ignore').decode('ascii')
-    
-    # Clean up any leftover double spaces
-    text = re.sub(r'\s+', ' ', text).strip()
-    
-    return text
-
-def chat_loop():
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT}
-    ]
-    
-    speak("All systems online. I am ready.")
-    
-    while True:
+        return {}
+    match = re.search(r"(\{.*\})", text, re.DOTALL)
+    if match:
         try:
-            # 1. Listen for voice input
-            user_text = listen(duration=5)
-            
-            if not user_text or len(user_text.strip()) == 0:
-                continue
-                
-            print(f"\n[You]: {user_text}")
-            messages.append({"role": "user", "content": user_text})
-            
-            # 2. First call to Ollama (checking for tool calls)
-            response = ollama.chat(
-                model='qwen3:8b',
-                messages=messages,
-                tools=[get_weather],
-            )
-            
-            # Append model's response (tool call or direct message)
-            messages.append(response.message)
-            
-            # 3. Handle Tool Calls if the model triggered one
-            if response.message.tool_calls:
-                for tool_call in response.message.tool_calls:
-                    func_name = tool_call.function.name
-                    args = tool_call.function.arguments
-                    
-                    if func_name in TOOL_MAP:
-                        print(f"⚙️ [Tool Calling]: {func_name}({args})")
-                        tool_result = TOOL_MAP[func_name](**args)
-                        
-                        # Feed the tool output back into the conversation history
-                        messages.append({
-                            "role": "tool",
-                            "content": json.dumps(tool_result),
-                        })
-                
-                # Ask Ollama to synthesize the final spoken answer using the tool data
-                followup_response = ollama.chat(
-                    model='qwen3:8b',
-                    messages=messages
-                )
-                final_reply = followup_response.message.content
-                messages.append(followup_response.message)
+            return json.loads(match.group(1))
+        except Exception:
+            pass
+    try:
+        return json.loads(text)
+    except Exception:
+        return {}
+
+
+class LocalLLM:
+    def __init__(self, host="http://localhost:11434"):
+        self.host = host
+        self.models = {
+            "router": "qwen3:8b",
+            "chat": "qwen3:8b",
+            "web_research": "qwen3:8b"
+        }
+        self.city = "Kuala Lumpur"
+        self.memory = MemoryCore()
+        self.conversation_history = []
+        self.session_state = {
+            "active_apps": [],
+            "last_target": None,
+            "last_action": None,
+            "current_entity": None
+        }
+
+    def call_ollama(
+        self,
+        model: str,
+        prompt: str,
+        system_prompt: str = "",
+        as_json: bool = False,
+        timeout: int = 40,
+        include_history: bool = False
+    ) -> str:
+        url = f"{self.host}/api/chat"
+        messages = []
+
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+
+        # ONLY pass conversational history for 'chat', not for structured routing
+        if include_history and self.conversation_history:
+            messages.extend(self.conversation_history[-6:])
+
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": 0.1}
+        }
+        if as_json:
+            payload["format"] = "json"
+
+        try:
+            response = requests.post(url, json=payload, timeout=timeout)
+            if response.status_code == 200:
+                content = response.json().get("message", {}).get("content", "").strip()
+                return content
             else:
-                final_reply = response.message.content
-
-            # 4. Speak and display the final reply
-            print(f"\n[Libra]: {final_reply}")
-            if final_reply:
-                spoken_reply = clean_for_speech(final_reply)
-                speak(spoken_reply)
-
-        except KeyboardInterrupt:
-            print("\nShutting down Libra.")
-            break
+                print(f"[Ollama Error Status]: {response.status_code} - {response.text}")
         except Exception as e:
-            print(f"Error encountered: {e}")
+            print(f"[Ollama Call Exception]: {e}")
+        return ""
 
-if __name__ == "__main__":
-    chat_loop()
+    def plan_and_respond(self, user_query: str) -> dict:
+        today = datetime.now()
+        today_str = today.strftime("%A, %B %d, %Y")
+
+        cleaned_query = condense_spelling(user_query)
+        q_lower = cleaned_query.lower().strip()
+
+        # -------------------------------------------------------------
+        # 1. DIRECT MEMORY FAST-TRACK ("Remember that...")
+        # -------------------------------------------------------------
+        mem_match = re.search(r"(?:remember\s+(?:that\s+)?|save\s+(?:that\s+)?|note\s+(?:that\s+)?)(.+)", q_lower)
+        if mem_match and any(trigger in q_lower for trigger in ["remember", "note that", "save that"]):
+            raw_fact = mem_match.group(1).strip()
+            # Clean leading polite prefixes
+            raw_fact = re.sub(r"^(?:please\s+|can\s+you\s+)", "", raw_fact)
+            # Normalize first-person phrasing (e.g. "my favorite" stays or "I am")
+            clean_fact = raw_fact.rstrip(".?!")
+            self.memory.add_fact(clean_fact)
+            ack_msg = f"Got it. I've committed that to memory: {clean_fact}."
+            decision = {"action": "remember_fact", "fact": clean_fact, "voice_response": ack_msg}
+            self._record_turn(user_query, ack_msg)
+            return decision
+
+        # -------------------------------------------------------------
+        # 2. PRONOUN RESOLUTION VIA SESSION STATE (App Termination)
+        # -------------------------------------------------------------
+        if any(w in q_lower for w in ["close it", "shut it down", "exit it", "kill it"]):
+            if self.session_state["last_target"]:
+                target = self.session_state["last_target"]
+                print(f"[State Engine] Pronoun 'it' -> '{target}'")
+                success, msg = close_any_application(target)
+                if target in self.session_state["active_apps"]:
+                    self.session_state["active_apps"].remove(target)
+                decision = {"action": "close_app", "target_app": target, "voice_response": msg}
+                self._record_turn(user_query, msg)
+                return decision
+
+        # -------------------------------------------------------------
+        # 3. COMPOUND ACTION: OPEN BROWSER + READ SUMMARY ALOUD
+        # -------------------------------------------------------------
+        # Matches: "open google and search for X and read one for me / tell me"
+        wants_read_aloud = any(p in q_lower for p in ["read one", "tell me one", "summarize", "read it", "tell me about it", "read for me"])
+        explicit_search = re.search(
+            r"(?:open\s+(?:google|chrome|browser)\s+and\s+search(?:\s+for)?|search\s+(?:on\s+)?(google|youtube)(?:\s+for)?)\s+(.+)",
+            q_lower
+        )
+
+        if explicit_search:
+            platform = "youtube" if "youtube" in q_lower else "google"
+            raw_search_query = explicit_search.group(2).strip()
+
+            # Separate search terms from the conversational read command
+            clean_search_query = re.sub(r"(?:and\s+)?(?:read|tell|summarize).*", "", raw_search_query).strip()
+            clean_search_query = re.sub(r"[?!.]+$", "", clean_search_query).strip()
+
+            # Launch browser
+            web_search(clean_search_query, platform=platform)
+
+            # If user also asked to read/summarize, pull live research and speak it!
+            if wants_read_aloud:
+                print(f"[Compound Action] Opened browser for '{clean_search_query}', now gathering verbal summary...")
+                snippets = search_live_web(f"{clean_search_query} top headlines latest")
+                synth_prompt = (
+                    f"You are Libra. Today is {today_str}.\n"
+                    f"The user opened Google for '{clean_search_query}' and asked you to read one key piece of news or result aloud.\n"
+                    f"Based on these live search results:\n{snippets}\n\n"
+                    f"State that you opened the browser, then read out ONE prominent story or finding concisely in 2 spoken sentences.\n"
+                    f"Do not use markdown formatting or asterisks."
+                )
+                spoken = self.call_ollama(self.models.get("web_research", "qwen3:8b"), synth_prompt, timeout=40)
+                spoken_response = spoken or f"I opened Google for {clean_search_query}."
+            else:
+                spoken_response = f"Opening {platform.capitalize()} search for {clean_search_query}."
+
+            decision = {
+                "action": "compound_web_search",
+                "platform": platform,
+                "search_query": clean_search_query,
+                "voice_response": spoken_response
+            }
+            self._record_turn(user_query, spoken_response)
+            return decision
+
+        # -------------------------------------------------------------
+        # 4. FAST-TRACK ENTITY MATCHER (Guarded against pronouns)
+        # -------------------------------------------------------------
+        pronoun_words = {"he", "his", "him", "she", "her", "hers", "it", "its", "they", "them", "their"}
+        entity_match = re.search(r"^(?:who is|tell me about)\s+([a-zA-Z0-9\s]+?)(?:\?|$)", q_lower)
+
+        if entity_match:
+            candidate_entity = entity_match.group(1).strip()
+            tokens = set(candidate_entity.split())
+
+            if not tokens.intersection(pronoun_words) and not any(w in candidate_entity for w in ["the weather", "running", "today", "tomorrow"]):
+                self.session_state["current_entity"] = candidate_entity
+                decision = self._execute_entity_lookup(candidate_entity, user_query, today_str)
+                self._record_turn(user_query, decision.get("voice_response", ""))
+                return decision
+
+        # -------------------------------------------------------------
+        # 5. ROUTER PASS WITH QUERY-AWARE CONTEXT & FEW-SHOT EXAMPLES
+        # -------------------------------------------------------------
+        router_model = self.models.get("router", "qwen3:8b")
+        memory_ctx = self.memory.get_context_summary(current_query=cleaned_query)
+        active_apps_str = ", ".join(self.session_state["active_apps"]) or "None"
+        current_subject = self.session_state.get("current_entity") or "None"
+
+        system_instructions = (
+            f"You are Libra, an elite autonomous cybernetic desktop assistant. Date: {today_str}. Location: {self.city}.\n"
+            f"Active Apps: [{active_apps_str}] | Active Conversation Subject: {current_subject}\n"
+            f"User Profile Memory:\n{memory_ctx}\n"
+            "Analyze intent and respond with ONLY a single raw JSON object matching the schemas below."
+        )
+
+        prompt = f"""Select the best matching action for the request.
+
+Schemas and Examples:
+- Launch app: {{"action": "open_app", "target_app": "name"}}
+- Close app: {{"action": "close_app", "target_app": "name"}}
+- Open file: {{"action": "open_file", "target_file": "filename"}}
+- Weather: {{"action": "get_daily_weather", "target_date": "YYYY-MM-DD"}} or {{"action": "get_weekly_weather"}}
+- Entity bio: {{"action": "lookup_entity", "target_entity": "person or topic"}}
+- Verbal live research: {{"action": "live_research", "search_query": "specific search terms"}}
+- Conversational chat / questions about stored memory / capabilities: {{"action": "chat", "voice_response": "spoken message"}}
+
+Request: "{cleaned_query}"
+JSON:"""
+
+        raw_json = self.call_ollama(
+            router_model,
+            prompt,
+            system_prompt=system_instructions,
+            as_json=True,
+            timeout=40,
+            include_history=False,
+        )
+
+        decision = extract_valid_json(raw_json)
+        if not decision or "action" not in decision or decision.get("action") == "":
+            # Fallback to conversational chat using memory context
+            chat_reply = self.call_ollama(
+                self.models.get("chat", "qwen3:8b"),
+                f"Respond conversationally in 1-2 spoken sentences to: '{cleaned_query}'. Use the provided User Profile Memory if relevant. Do not output JSON.",
+                system_prompt=system_instructions,
+                timeout=30,
+                include_history=True
+            )
+            clean_reply = re.sub(r"\{.*?\}", "", chat_reply, flags=re.DOTALL).strip() or chat_reply
+            decision = {"action": "chat", "voice_response": clean_reply or "Understood. How can I assist you?"}
+
+        action = decision.get("action")
+
+        # -------------------------------------------------------------
+        # 6. ACTION DISPATCH & EXECUTION
+        # -------------------------------------------------------------
+        if action == "lookup_entity":
+            target = decision.get("target_entity", cleaned_query)
+            if any(p in target.lower().split() for p in pronoun_words) and self.session_state.get("current_entity"):
+                target = self.session_state["current_entity"]
+            self.session_state["current_entity"] = target
+            decision = self._execute_entity_lookup(target, user_query, today_str)
+
+        elif action == "live_research":
+            query = decision.get("search_query", cleaned_query)
+            if self.session_state.get("current_entity") and any(p in query.lower().split() for p in pronoun_words):
+                query = f"{self.session_state['current_entity']} {query}"
+
+            snippets = search_live_web(query)
+            synth_model = self.models.get("web_research", "qwen3:8b")
+            synth_prompt = (
+                f"You are Libra. Today is {today_str}.\n"
+                f"Answer the user's question: '{cleaned_query}' in 2 spoken sentences based strictly on these search results:\n{snippets}\n"
+                f"Do not use markdown formatting or asterisks."
+            )
+            spoken = self.call_ollama(synth_model, synth_prompt, timeout=45)
+            decision["voice_response"] = spoken or "I reviewed the search results, but could not formulate a clear answer."
+
+        elif action == "open_app":
+            target = decision.get("target_app", "").strip()
+            success, msg = launch_any_application(target)
+            if success:
+                if target.lower() not in self.session_state["active_apps"]:
+                    self.session_state["active_apps"].append(target.lower())
+                self.session_state["last_target"] = target.lower()
+                self.session_state["last_action"] = "open_app"
+            decision["voice_response"] = msg
+
+        elif action == "close_app":
+            target = decision.get("target_app", "").strip().lower() or self.session_state["last_target"]
+            if target:
+                success, msg = close_any_application(target)
+                if target in self.session_state["active_apps"]:
+                    self.session_state["active_apps"].remove(target)
+                decision["voice_response"] = msg
+            else:
+                decision["voice_response"] = "No active application was targeted for termination."
+
+        elif action == "open_file":
+            target = decision.get("target_file", "")
+            success, msg = find_and_open_file(target)
+            decision["voice_response"] = msg
+
+        elif action == "get_daily_weather":
+            target_date = decision.get("target_date", datetime.today().strftime("%Y-%m-%d"))
+            decision["voice_response"] = get_forecast_for_iso_date(target_date)
+
+        elif action == "get_weekly_weather":
+            table = get_weekly_forecast()
+            if table:
+                decision["voice_response"] = (
+                    f"Here is the upcoming forecast for {self.city}: "
+                    f"{table[0]['date']} starts with {table[0]['condition']} at {table[0]['temp']}."
+                )
+            else:
+                decision["voice_response"] = "Atmospheric telemetry is currently unavailable."
+
+        elif action == "chat":
+            if not decision.get("voice_response"):
+                chat_model = self.models.get("chat", "qwen3:8b")
+                reply = self.call_ollama(
+                    chat_model,
+                    cleaned_query,
+                    system_prompt=system_instructions,
+                    timeout=30,
+                    include_history=True,
+                )
+                decision["voice_response"] = reply or "Acknowledged."
+
+        self._record_turn(user_query, decision.get("voice_response", ""))
+        return decision
+
+    def _execute_entity_lookup(self, entity: str, user_query: str, today_str: str) -> dict:
+        print(f"[Knowledge Engine] Querying entity: '{entity}' for query: '{user_query}'")
+
+        # Strip relational tokens to locate base Wikipedia article
+        clean_target = entity
+        for noise in [" wife", " husband", " net worth", " career", " salary", " age", " kids", " height"]:
+            clean_target = clean_target.replace(noise, "")
+        clean_target = clean_target.strip()
+
+        summary = get_entity_summary(clean_target) if clean_target else ""
+
+        # Check if query requests relational or fast-moving facts
+        search_intel = ""
+        needs_search = any(w in user_query.lower() for w in ["wife", "husband", "married", "net worth", "contract", "salary", "team currently", "currently"])
+
+        if not summary or needs_search:
+            print(f"[Knowledge Engine] Querying live web search for: '{entity}'")
+            search_query = f"{clean_target} {user_query}" if clean_target else entity
+            search_intel = search_live_web(search_query)
+
+        combined_facts = f"Wikipedia Context:\n{summary}\n\nLive Search Intel:\n{search_intel}".strip()
+
+        if not combined_facts or combined_facts == "Wikipedia Context:\n\nLive Search Intel:":
+            return {"action": "chat", "voice_response": f"I couldn't locate verified records for {entity}."}
+
+        synth_prompt = (
+            f"You are Libra. Today is {today_str}.\n"
+            f"User Question: '{user_query}'\n"
+            f"Available Intel:\n{combined_facts}\n\n"
+            f"Provide a direct, conversational 1 to 2 sentence answer addressing the user's specific question.\n"
+            f"Do not mention 'according to Wikipedia' or 'search results'. No asterisks or bullet points."
+        )
+        voice_text = self.call_ollama(self.models.get("chat", "qwen3:8b"), synth_prompt, timeout=35)
+        return {"action": "lookup_entity", "voice_response": voice_text or summary[:200]}
+
+    def _record_turn(self, user_text: str, assistant_text: str):
+        """Maintains the sliding window conversation history."""
+        if user_text:
+            self.conversation_history.append({"role": "user", "content": user_text})
+        if assistant_text:
+            self.conversation_history.append({"role": "assistant", "content": assistant_text})
+        if len(self.conversation_history) > 8:
+            self.conversation_history = self.conversation_history[-8:]
 </file>
 
 <file path="ui/gui.py">
@@ -1732,10 +2031,11 @@ import numpy as np
 import pyaudio
 import torch
 import keyboard
+import queue
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QTextEdit, QFrame, QGraphicsDropShadowEffect
+    QLabel, QTextEdit, QFrame
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QRectF, QUrl
 from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QLinearGradient
@@ -1804,6 +2104,7 @@ class CyberAudioVisualizer(QWidget):
 class VoiceAssistantWorker(QThread):
     status_changed = pyqtSignal(str)
     visualizer_state = pyqtSignal(bool)
+    mic_level = pyqtSignal(float)
     log_received = pyqtSignal(str, str)
     telemetry_update = pyqtSignal(str, str)
 
@@ -1811,6 +2112,7 @@ class VoiceAssistantWorker(QThread):
         super().__init__()
         self.running = True
         self.interrupted = threading.Event()
+        self.input_stream = None  # Holds the PyAudio input handle to clear Pylance closure warning
 
     def stop(self):
         self.running = False
@@ -1826,8 +2128,8 @@ class VoiceAssistantWorker(QThread):
         oww_model = Model(wakeword_models=active_models)
         self.telemetry_update.emit("WAKEWORD", "HEY LIBRA [ONLINE]")
 
-        tts = KokoroTTS(voice="af_heart")
-        self.telemetry_update.emit("TTS_ENGINE", "KOKORO-82M [24kHz]")
+        tts = KokoroTTS(voice="af_heart", device="cuda")
+        self.telemetry_update.emit("TTS_ENGINE", "KOKORO-82M [CUDA]")
 
         stt = SpeechToText()
         self.telemetry_update.emit("STT_ENGINE", f"WHISPER [{stt.device.upper()}]")
@@ -1838,8 +2140,17 @@ class VoiceAssistantWorker(QThread):
         vad_model = load_silero_vad()
         self.telemetry_update.emit("VAD_DETECTOR", "SILERO V4 [ACTIVE]")
 
+        # 1. Initialize persistent PyAudio input & output streams before defining helpers
         pa = pyaudio.PyAudio()
-        input_stream = pa.open(format=pyaudio.paInt16, channels=1, rate=16000, input=True, frames_per_buffer=1280)
+        self.input_stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=16000,
+            input=True,
+            frames_per_buffer=1280
+        )
+
+        pa_out_master = pyaudio.PyAudio()
         self.status_changed.emit("SYSTEM READY // AWAITING VOCAL PROMPT")
 
         def speak_interruptible(text: str):
@@ -1847,49 +2158,62 @@ class VoiceAssistantWorker(QThread):
                 return
 
             self.interrupted.clear()
-            self.status_changed.emit("SPEAKING... [SPACE TO STOP]")
+            self.status_changed.emit("SPEAKING... [CTRL+SPACE TO STOP]")
             self.visualizer_state.emit(True)
 
-            audio_buffer = []
-            try:
-                for chunk_bytes in tts.synthesize_stream(text):
-                    if chunk_bytes:
-                        audio_buffer.append(chunk_bytes)
-            except Exception as ex:
-                print(f"[Kokoro Synthesis Error]: {ex}")
-                self.visualizer_state.emit(False)
-                return
-
-            full_audio = b"".join(audio_buffer)
-            if not full_audio:
-                self.visualizer_state.emit(False)
-                return
-
-            playback_finished = threading.Event()
+            audio_queue = queue.Queue()
+            INTERRUPT_HOTKEY = "ctrl+space"
             out_stream_holder = [None]
+            synthesis_done = threading.Event()
+            playback_finished = threading.Event()
 
-            def on_space_pressed(e):
-                if e.name == "space":
-                    print("\n[Barge-In]: SPACEBAR pressed! Cutting audio.")
-                    self.interrupted.set()
-                    if out_stream_holder[0]:
-                        try:
-                            out_stream_holder[0].stop_stream()
-                        except Exception:
-                            pass
+            def trigger_barge_in():
+                print(f"\n[Barge-In]: '{INTERRUPT_HOTKEY}' triggered! Cutting speech.")
+                self.interrupted.set()
+                if out_stream_holder[0]:
+                    try:
+                        out_stream_holder[0].stop_stream()
+                    except Exception:
+                        pass
 
-            space_hook = keyboard.on_press(on_space_pressed)
+            hotkey_handle = None
+            try:
+                hotkey_handle = keyboard.add_hotkey(INTERRUPT_HOTKEY, trigger_barge_in)
+            except Exception:
+                pass
 
-            def play_audio():
+            # CONSUMER THREAD: Stays alive until synthesis completes AND queue drains
+            def playback_worker():
                 pa_out = pyaudio.PyAudio()
                 try:
-                    out_stream = pa_out.open(format=pyaudio.paInt16, channels=1, rate=24000, output=True, frames_per_buffer=2400)
+                    out_stream = pa_out.open(
+                        format=pyaudio.paInt16,
+                        channels=1,
+                        rate=24000,
+                        output=True,
+                        frames_per_buffer=2400
+                    )
                     out_stream_holder[0] = out_stream
-                    chunk_bytes = 2400 * 2
-                    for i in range(0, len(full_audio), chunk_bytes):
-                        if self.interrupted.is_set():
+
+                    while not self.interrupted.is_set():
+                        try:
+                            # Short block wait so thread remains responsive to barge-in
+                            chunk = audio_queue.get(timeout=0.1)
+                        except queue.Empty:
+                            # Only exit if the producer has explicitly finished synthesizing
+                            if synthesis_done.is_set():
+                                break
+                            continue
+
+                        if chunk is None or self.interrupted.is_set():
                             break
-                        out_stream.write(full_audio[i:i + chunk_bytes])
+
+                        chunk_size = 2400 * 2
+                        for i in range(0, len(chunk), chunk_size):
+                            if self.interrupted.is_set():
+                                break
+                            out_stream.write(chunk[i:i + chunk_size])
+
                     out_stream.stop_stream()
                     out_stream.close()
                 except Exception as ex:
@@ -1898,23 +2222,41 @@ class VoiceAssistantWorker(QThread):
                     pa_out.terminate()
                     playback_finished.set()
 
-            playback_thread = threading.Thread(target=play_audio, daemon=True)
-            playback_thread.start()
+            consumer_thread = threading.Thread(target=playback_worker, daemon=True)
+            consumer_thread.start()
 
+            # PRODUCER: Synthesizes via Kokoro and pushes into queue
+            try:
+                for chunk_bytes in tts.synthesize_stream(text):
+                    if self.interrupted.is_set():
+                        break
+                    if chunk_bytes:
+                        audio_queue.put(chunk_bytes)
+            except Exception as ex:
+                print(f"[Kokoro Synthesis Error]: {ex}")
+            finally:
+                # Mark producer finished and signal consumer
+                synthesis_done.set()
+                audio_queue.put(None)
+
+            # Wait until playback naturally ends or user interrupts
             while not playback_finished.is_set() and not self.interrupted.is_set():
                 time.sleep(0.01)
 
-            try:
-                keyboard.unhook(space_hook)
-            except Exception:
-                pass
+            if hotkey_handle:
+                try:
+                    keyboard.remove_hotkey(hotkey_handle)
+                except Exception:
+                    pass
 
-            playback_thread.join()
+            consumer_thread.join(timeout=1.0)
             self.visualizer_state.emit(False)
 
+            # Flush mic buffer to prevent echo pickup
             try:
-                while input_stream.get_read_available() > 0:
-                    input_stream.read(input_stream.get_read_available(), exception_on_overflow=False)
+                if self.input_stream:
+                    while self.input_stream.get_read_available() > 0:
+                        self.input_stream.read(self.input_stream.get_read_available(), exception_on_overflow=False)
             except Exception:
                 pass
 
@@ -1928,7 +2270,7 @@ class VoiceAssistantWorker(QThread):
                 oww_model.reset()
 
                 while self.running and not in_followup_mode:
-                    audio_data = input_stream.read(1280, exception_on_overflow=False)
+                    audio_data = self.input_stream.read(1280, exception_on_overflow=False)
                     pre_roll_buffer.append(audio_data)
                     if len(pre_roll_buffer) > 10:
                         pre_roll_buffer.pop(0)
@@ -1954,23 +2296,47 @@ class VoiceAssistantWorker(QThread):
 
             speech_started = False
             silence_start = None
-            followup_wait_timeout = 4.5 if in_followup_mode else 12.0
-            listen_start_time = time.time()
 
-            while self.running and (time.time() - listen_start_time) < followup_wait_timeout:
-                chunk = input_stream.read(1280, exception_on_overflow=False)
+            # Relaxed timing: 10s wait for next prompt, 25s maximum sentence length
+            followup_wait_timeout = 10.0 if in_followup_mode else 15.0
+            max_recording_time = 25.0
+            listen_start_time = time.time()
+            speech_start_time = None
+
+            while self.running:
+                now = time.time()
+
+                if not speech_started and (now - listen_start_time) > followup_wait_timeout:
+                    break
+
+                if speech_started and (now - speech_start_time) > max_recording_time:
+                    break
+
+                chunk = self.input_stream.read(1280, exception_on_overflow=False)
                 recorded_chunks.append(chunk)
 
                 audio_np = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
-                audio_tensor = torch.from_numpy(audio_np[:512])
 
-                if vad_model(audio_tensor, 16000).item() >= 0.50:
-                    speech_started = True
+                # Calculate live microphone RMS amplitude and emit for Three.js orb
+                rms = float(np.sqrt(np.mean(audio_np ** 2)))
+                self.mic_level.emit(min(1.0, rms * 8.0))
+
+                # Feed 512-sample slice to Silero VAD
+                chunk_512 = torch.from_numpy(audio_np[:512])
+                with torch.no_grad():
+                    speech_prob = vad_model(chunk_512, 16000).item()
+
+                if speech_prob >= 0.50:
+                    if not speech_started:
+                        speech_started = True
+                        speech_start_time = now
                     silence_start = None
                 elif speech_started:
                     if silence_start is None:
-                        silence_start = time.time()
-                    elif (time.time() - silence_start) >= 1.0:
+                        silence_start = now
+                    # 0.8 seconds of silence required to end turn
+                    elif (now - silence_start) >= 0.8:
+                        print(f"[VAD] End of speech detected (Silence: {now - silence_start:.2f}s).")
                         break
 
             if not speech_started or not recorded_chunks:
@@ -1994,29 +2360,26 @@ class VoiceAssistantWorker(QThread):
             print(f"[Captured Input]: {user_text}")
             self.log_received.emit("USER", user_text)
 
+            # STATE 4: REASON & EXECUTE VIA LLM CORE
             self.status_changed.emit("PROCESSING REASONING...")
             t_llm = time.time()
             response_data = llm.plan_and_respond(user_text)
             llm_latency = (time.time() - t_llm) * 1000
             self.telemetry_update.emit("LLM_LATENCY", f"{llm_latency:.0f} ms")
+            print(f"[Libra Core]: {response_data}")
 
-            voice_msg = ""
-            action = response_data.get("action", "chat")
-            if "voice_response" in response_data and response_data["voice_response"]:
-                voice_msg = response_data["voice_response"]
-            elif action in ["web_search", "lookup_entity"]:
-                query = response_data.get("search_query") or response_data.get("target_entity", "")
-                voice_msg = f"Searching archives for {query}."
-            else:
-                voice_msg = "Task processed."
+            # Grab final voice response formulated and executed by LocalLLM
+            voice_msg = response_data.get("voice_response", "Understood.")
 
             self.log_received.emit("LIBRA", voice_msg)
             speak_interruptible(voice_msg)
             in_followup_mode = True
 
-        input_stream.stop_stream()
-        input_stream.close()
+        if self.input_stream:
+            self.input_stream.stop_stream()
+            self.input_stream.close()
         pa.terminate()
+        pa_out_master.terminate()
 
 
 class FuturisticVoiceAssistantUI(QMainWindow):
@@ -2053,7 +2416,9 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
         self.stat_box = QLabel("INFERENCE: NOMINAL | VRAM: ACTIVE")
         self.stat_box.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
-        self.stat_box.setStyleSheet("color: #00e5ff; background: #0c1524; border: 1px solid #142845; border-radius: 4px; padding: 6px 12px;")
+        self.stat_box.setStyleSheet(
+            "color: #00e5ff; background: #0c1524; border: 1px solid #142845; border-radius: 4px; padding: 6px 12px;"
+        )
         header.addWidget(self.stat_box)
 
         self.clock_label = QLabel()
@@ -2077,7 +2442,6 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         workspace = QHBoxLayout()
         workspace.setSpacing(14)
 
-        # LEFT PANE: 3D Three.js Orb Canvas
         orb_container = QFrame()
         orb_container.setStyleSheet("background-color: #030708; border: 1px solid #142238; border-radius: 8px;")
         orb_layout = QVBoxLayout(orb_container)
@@ -2085,9 +2449,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
         self.orb_view = QWebEngineView()
         self.orb_view.setStyleSheet("background: transparent;")
-        
-        # Load local assets/index.html
-        # Target ui/orb/index.html directly
+
         orb_file_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "orb", "index.html"))
         print(f"[GUI] Loading WebGL Core from: {orb_file_path}")
         self.orb_view.setUrl(QUrl.fromLocalFile(orb_file_path))
@@ -2095,15 +2457,12 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
         workspace.addWidget(orb_container, stretch=5)
 
-        # RIGHT PANE: Chat Terminal + Visualizer + Telemetry
         right_container = QVBoxLayout()
         right_container.setSpacing(10)
 
-        # Audio visualizer
         self.visualizer = CyberAudioVisualizer(self)
         right_container.addWidget(self.visualizer)
 
-        # Bottom row: Terminal + Telemetry
         chat_telemetry_row = QHBoxLayout()
         chat_telemetry_row.setSpacing(10)
 
@@ -2117,7 +2476,6 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         """)
         chat_telemetry_row.addWidget(self.terminal, stretch=7)
 
-        # Telemetry list
         sidebar = QVBoxLayout()
         sidebar.setSpacing(6)
         sidebar_title = QLabel("SYSTEM TELEMETRY")
@@ -2138,10 +2496,12 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             self.telemetry_labels[key] = v_lbl
 
         sidebar.addStretch()
-        space_badge = QLabel("[SPACE] INTERRUPT")
+        space_badge = QLabel("[CTRL + SPACE] INTERRUPT")
         space_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         space_badge.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-        space_badge.setStyleSheet("background: #111d2e; color: #f59e0b; border: 1px dashed #d97706; border-radius: 4px; padding: 4px;")
+        space_badge.setStyleSheet(
+            "background: #111d2e; color: #f59e0b; border: 1px dashed #d97706; border-radius: 4px; padding: 4px;"
+        )
         sidebar.addWidget(space_badge)
 
         chat_telemetry_row.addLayout(sidebar, stretch=3)
@@ -2150,7 +2510,6 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         workspace.addLayout(right_container, stretch=7)
         main_layout.addLayout(workspace)
 
-        # Clock
         timer = QTimer(self)
         timer.timeout.connect(self.update_clock)
         timer.start(1000)
@@ -2167,20 +2526,32 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
     def set_vis_state(self, active: bool):
         self.visualizer.set_active(active)
-        # Accelerate Three.js orbital rotation when speaking
         js_cmd = f"if (window.setSpeechActive) {{ window.setSpeechActive({str(active).lower()}); }}"
+        self.orb_view.page().runJavaScript(js_cmd)
+
+    def on_mic_level(self, level: float):
+        js_cmd = f"if (window.setMicAmplitude) {{ window.setMicAmplitude({level:.3f}); }}"
         self.orb_view.page().runJavaScript(js_cmd)
 
     def update_status(self, text: str):
         self.status_banner.setText(text)
         if "SPEAKING" in text:
-            self.status_banner.setStyleSheet("background: #160f29; color: #c084fc; border: 1px solid #9333ea; border-radius: 6px; padding: 9px;")
+            self.status_banner.setStyleSheet(
+                "background: #160f29; color: #c084fc; border: 1px solid #9333ea; border-radius: 6px; padding: 9px;"
+            )
         elif "RECORDING" in text or "FOLLOW-UP" in text:
-            self.status_banner.setStyleSheet("background: #092019; color: #34d399; border: 1px solid #059669; border-radius: 6px; padding: 9px;")
+            self.status_banner.setStyleSheet(
+                "background: #092019; color: #34d399; border: 1px solid #059669; border-radius: 6px; padding: 9px;"
+            )
         elif "PROCESSING" in text or "TRANSCRIBING" in text:
-            self.status_banner.setStyleSheet("background: #231608; color: #fbbf24; border: 1px solid #d97706; border-radius: 6px; padding: 9px;")
+            self.status_banner.setStyleSheet(
+                "background: #231608; color: #fbbf24; border: 1px solid #d97706; border-radius: 6px; padding: 9px;"
+            )
         else:
-            self.status_banner.setStyleSheet("background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #091322, stop:0.5 #13243d, stop:1 #091322); color: #00ffcc; border: 1px solid #00e5ff; border-radius: 6px; padding: 9px;")
+            self.status_banner.setStyleSheet(
+                "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #091322, stop:0.5 #13243d, stop:1 #091322); "
+                "color: #00ffcc; border: 1px solid #00e5ff; border-radius: 6px; padding: 9px;"
+            )
 
     def append_log(self, sender: str, msg: str):
         color = "#00ffcc" if sender == "LIBRA" else "#fbbf24"
@@ -2197,6 +2568,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.worker = VoiceAssistantWorker()
         self.worker.status_changed.connect(self.update_status)
         self.worker.visualizer_state.connect(self.set_vis_state)
+        self.worker.mic_level.connect(self.on_mic_level)
         self.worker.telemetry_update.connect(self.update_telemetry)
         self.worker.log_received.connect(self.append_log)
         self.worker.start()
@@ -2212,17 +2584,6 @@ if __name__ == "__main__":
     window = FuturisticVoiceAssistantUI()
     window.show()
     sys.exit(app.exec())
-</file>
-
-<file path="requirements.txt">
-ollama>=0.5.1
-requests>=2.31.0silero-vad
-nvidia-cublas-cu12
-nvidia-cudnn-cu12
-kokoro>=0.9.4
-soundfile
-
-keyboard
 </file>
 
 </files>

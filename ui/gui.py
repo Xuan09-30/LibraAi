@@ -312,8 +312,8 @@ class VoiceAssistantWorker(QThread):
                 elif speech_started:
                     if silence_start is None:
                         silence_start = now
-                    # 2.2 seconds of silence required to end turn
-                    elif (now - silence_start) >= 2.2:
+                    # 0.8 seconds of silence required to end turn
+                    elif (now - silence_start) >= 0.8:
                         print(f"[VAD] End of speech detected (Silence: {now - silence_start:.2f}s).")
                         break
 
