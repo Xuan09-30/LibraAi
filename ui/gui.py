@@ -20,10 +20,12 @@ from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QLinearGradient
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from openwakeword.model import Model
-from silero_vad import load_silero_vad
+from core.vad import SileroVADDetector
 from core.kokoro_tts import KokoroTTS
 from core.stt import SpeechToText
 from core.llm import LocalLLM
+from core.telemetry import profiler
+from core.text_cleaner import normalize_for_tts
 
 warnings.filterwarnings("ignore")
 
@@ -115,24 +117,24 @@ class VoiceAssistantWorker(QThread):
         llm = LocalLLM()
         self.telemetry_update.emit("LLM_CORE", "QWEN3-INSTRUCT [LOCAL]")
 
-        vad_model = load_silero_vad()
-        self.telemetry_update.emit("VAD_DETECTOR", "SILERO V4 [ACTIVE]")
+        vad_detector = SileroVADDetector(sample_rate=16000, silence_cutoff_sec=0.8)
+        self.telemetry_update.emit("VAD_DETECTOR", "SILERO ONNX [0.8s CUTOFF]")
 
-        # 1. Initialize persistent PyAudio input & output streams before defining helpers
+        # 1. Initialize persistent PyAudio input stream with 512 samples / 32ms frame size
         pa = pyaudio.PyAudio()
         self.input_stream = pa.open(
             format=pyaudio.paInt16,
             channels=1,
             rate=16000,
             input=True,
-            frames_per_buffer=1280
+            frames_per_buffer=512
         )
 
-        pa_out_master = pyaudio.PyAudio()
         self.status_changed.emit("SYSTEM READY // AWAITING VOCAL PROMPT")
 
         def speak_interruptible(text: str):
-            if not text or not text.strip():
+            clean_text = normalize_for_tts(text)
+            if not clean_text or not clean_text.strip():
                 return
 
             self.interrupted.clear()
@@ -148,6 +150,12 @@ class VoiceAssistantWorker(QThread):
             def trigger_barge_in():
                 print(f"\n[Barge-In]: '{INTERRUPT_HOTKEY}' triggered! Cutting speech.")
                 self.interrupted.set()
+                # Flush pending audio queue
+                while not audio_queue.empty():
+                    try:
+                        audio_queue.get_nowait()
+                    except queue.Empty:
+                        break
                 if out_stream_holder[0]:
                     try:
                         out_stream_holder[0].stop_stream()
@@ -169,16 +177,15 @@ class VoiceAssistantWorker(QThread):
                         channels=1,
                         rate=24000,
                         output=True,
-                        frames_per_buffer=2400
+                        frames_per_buffer=1200
                     )
                     out_stream_holder[0] = out_stream
 
                     while not self.interrupted.is_set():
                         try:
                             # Short block wait so thread remains responsive to barge-in
-                            chunk = audio_queue.get(timeout=0.1)
+                            chunk = audio_queue.get(timeout=0.05)
                         except queue.Empty:
-                            # Only exit if the producer has explicitly finished synthesizing
                             if synthesis_done.is_set():
                                 break
                             continue
@@ -186,7 +193,7 @@ class VoiceAssistantWorker(QThread):
                         if chunk is None or self.interrupted.is_set():
                             break
 
-                        chunk_size = 2400 * 2
+                        chunk_size = 1200 * 2
                         for i in range(0, len(chunk), chunk_size):
                             if self.interrupted.is_set():
                                 break
@@ -205,7 +212,7 @@ class VoiceAssistantWorker(QThread):
 
             # PRODUCER: Synthesizes via Kokoro and pushes into queue
             try:
-                for chunk_bytes in tts.synthesize_stream(text):
+                for chunk_bytes in tts.synthesize_stream(clean_text):
                     if self.interrupted.is_set():
                         break
                     if chunk_bytes:
@@ -213,7 +220,6 @@ class VoiceAssistantWorker(QThread):
             except Exception as ex:
                 print(f"[Kokoro Synthesis Error]: {ex}")
             finally:
-                # Mark producer finished and signal consumer
                 synthesis_done.set()
                 audio_queue.put(None)
 
@@ -227,7 +233,7 @@ class VoiceAssistantWorker(QThread):
                 except Exception:
                     pass
 
-            consumer_thread.join(timeout=1.0)
+            consumer_thread.join(timeout=0.5)
             self.visualizer_state.emit(False)
 
             # Flush mic buffer to prevent echo pickup
@@ -237,6 +243,23 @@ class VoiceAssistantWorker(QThread):
                         self.input_stream.read(self.input_stream.get_read_available(), exception_on_overflow=False)
             except Exception:
                 pass
+
+        # Start ReminderEngine background watchdog to announce due reminders
+        def on_reminder_due(reminder):
+            task = reminder.get("task", "Reminder")
+            announcement = f"Reminder: It is time to {task}."
+            print(f"\n[Watchdog] Due reminder: {announcement}")
+            self.log_received.emit("LIBRA", announcement)
+            speak_interruptible(announcement)
+
+        if hasattr(llm, "scheduler") and llm.scheduler:
+            llm.scheduler.start_watchdog(on_reminder_due, check_interval_sec=5.0)
+
+        if hasattr(llm, "missed_reminders") and llm.missed_reminders:
+            count = len(llm.missed_reminders)
+            missed_summary = f"Notice: You have {count} missed reminder{'s' if count > 1 else ''} from while offline."
+            self.log_received.emit("LIBRA", missed_summary)
+            speak_interruptible(missed_summary)
 
         in_followup_mode = False
         pre_roll_buffer = []
@@ -248,10 +271,15 @@ class VoiceAssistantWorker(QThread):
                 oww_model.reset()
 
                 while self.running and not in_followup_mode:
-                    audio_data = self.input_stream.read(1280, exception_on_overflow=False)
+                    audio_data = self.input_stream.read(512, exception_on_overflow=False)
                     pre_roll_buffer.append(audio_data)
-                    if len(pre_roll_buffer) > 10:
+                    if len(pre_roll_buffer) > 20:
                         pre_roll_buffer.pop(0)
+
+                    # Calculate live microphone RMS amplitude and emit for Three.js WebGL orb
+                    audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+                    rms = float(np.sqrt(np.mean(audio_np ** 2)))
+                    self.mic_level.emit(min(1.0, rms * 10.0))
 
                     audio_frame = np.frombuffer(audio_data, dtype=np.int16)
                     prediction = oww_model.predict(audio_frame)
@@ -264,70 +292,68 @@ class VoiceAssistantWorker(QThread):
                         continue
                     break
 
+            if not self.running:
+                break
+
             if in_followup_mode:
                 self.status_changed.emit("CONVERSATIONAL FOLLOW-UP ACTIVE...")
             else:
                 self.status_changed.emit("RECORDING USER INPUT...")
 
-            recorded_chunks = list(pre_roll_buffer) if not in_followup_mode else []
-            pre_roll_buffer.clear()
+            vad_detector.reset()
 
-            speech_started = False
-            silence_start = None
+            # Pre-populate with pre-roll buffer if wakeword triggered
+            if pre_roll_buffer:
+                for prev_chunk in pre_roll_buffer[-6:]:
+                    vad_detector.audio_buffer.append(
+                        np.frombuffer(prev_chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                    )
+                pre_roll_buffer.clear()
 
-            # Relaxed timing: 10s wait for next prompt, 25s maximum sentence length
             followup_wait_timeout = 10.0 if in_followup_mode else 15.0
             max_recording_time = 25.0
             listen_start_time = time.time()
             speech_start_time = None
+            full_audio = None
 
             while self.running:
                 now = time.time()
 
-                if not speech_started and (now - listen_start_time) > followup_wait_timeout:
+                if not vad_detector.has_spoken and (now - listen_start_time) > followup_wait_timeout:
+                    print("[VAD] Timeout waiting for speech.")
                     break
 
-                if speech_started and (now - speech_start_time) > max_recording_time:
+                if vad_detector.has_spoken and speech_start_time and (now - speech_start_time) > max_recording_time:
+                    print("[VAD] Max recording duration reached.")
+                    if vad_detector.audio_buffer:
+                        full_audio = np.concatenate(vad_detector.audio_buffer, axis=0)
                     break
 
-                chunk = self.input_stream.read(1280, exception_on_overflow=False)
-                recorded_chunks.append(chunk)
+                chunk = self.input_stream.read(512, exception_on_overflow=False)
+                chunk_np = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
 
-                audio_np = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                # Live microphone RMS amplitude for Three.js WebGL orb
+                rms = float(np.sqrt(np.mean(chunk_np ** 2)))
+                self.mic_level.emit(min(1.0, rms * 10.0))
 
-                # Calculate live microphone RMS amplitude and emit for Three.js orb
-                rms = float(np.sqrt(np.mean(audio_np ** 2)))
-                self.mic_level.emit(min(1.0, rms * 8.0))
+                is_complete, audio_out = vad_detector.process_chunk(chunk)
+                if vad_detector.has_spoken and speech_start_time is None:
+                    speech_start_time = now
 
-                # Feed 512-sample slice to Silero VAD
-                chunk_512 = torch.from_numpy(audio_np[:512])
-                with torch.no_grad():
-                    speech_prob = vad_model(chunk_512, 16000).item()
+                if is_complete and audio_out is not None:
+                    full_audio = audio_out
+                    print(f"[VAD] Speech boundary triggered (duration: {len(full_audio)/16000:.2f}s).")
+                    break
 
-                if speech_prob >= 0.50:
-                    if not speech_started:
-                        speech_started = True
-                        speech_start_time = now
-                    silence_start = None
-                elif speech_started:
-                    if silence_start is None:
-                        silence_start = now
-                    # 0.8 seconds of silence required to end turn
-                    elif (now - silence_start) >= 0.8:
-                        print(f"[VAD] End of speech detected (Silence: {now - silence_start:.2f}s).")
-                        break
-
-            if not speech_started or not recorded_chunks:
+            if full_audio is None or len(full_audio) < 16000 * 0.3:
                 in_followup_mode = False
                 self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
                 continue
 
             self.status_changed.emit("NEURAL TRANSCRIBING...")
-            t0 = time.time()
-            raw_audio = b"".join(recorded_chunks)
-            audio_array = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
-            user_text = stt.transcribe(audio_array)
-            stt_latency = (time.time() - t0) * 1000
+            with profiler.measure("STT_LATENCY"):
+                user_text = stt.transcribe(full_audio)
+            stt_latency = profiler.current_turn.get("STT_LATENCY", 0.0)
             self.telemetry_update.emit("STT_LATENCY", f"{stt_latency:.0f} ms")
 
             if not user_text.strip():
@@ -340,10 +366,11 @@ class VoiceAssistantWorker(QThread):
 
             # STATE 4: REASON & EXECUTE VIA LLM CORE
             self.status_changed.emit("PROCESSING REASONING...")
-            t_llm = time.time()
-            response_data = llm.plan_and_respond(user_text)
-            llm_latency = (time.time() - t_llm) * 1000
+            with profiler.measure("LLM_LATENCY"):
+                response_data = llm.plan_and_respond(user_text)
+            llm_latency = profiler.current_turn.get("LLM_LATENCY", 0.0)
             self.telemetry_update.emit("LLM_LATENCY", f"{llm_latency:.0f} ms")
+            profiler.flush(transcript=user_text, route=response_data.get("action", "chat"))
             print(f"[Libra Core]: {response_data}")
 
             # Grab final voice response formulated and executed by LocalLLM
@@ -357,7 +384,6 @@ class VoiceAssistantWorker(QThread):
             self.input_stream.stop_stream()
             self.input_stream.close()
         pa.terminate()
-        pa_out_master.terminate()
 
 
 class FuturisticVoiceAssistantUI(QMainWindow):
