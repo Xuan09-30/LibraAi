@@ -1,0 +1,2 @@
+{"timestamp": "2026-10-15T01:03:21.562534", "transcript": "[Audio Test Phrase]", "route": "vad_test", "metrics": {"vad_silence_wait_ms": 800.0, "total_capture_ms": 3170.49}}
+{"timestamp": "2026-10-15T01:04:01.865470", "transcript": "[Audio Test Phrase]", "route": "vad_test", "metrics": {"vad_silence_wait_ms": 800.0, "total_capture_ms": 14210.39}}
