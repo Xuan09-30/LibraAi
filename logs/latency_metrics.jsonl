@@ -7,3 +7,4 @@
 {"timestamp": "2026-10-15T01:46:38.322189", "transcript": "Hello Libra, open Steam and launch Valorant.", "route": "stt_benchmark", "metrics": {"STT_LATENCY": 191.91}}
 {"timestamp": "2026-10-15T01:48:01.148966", "transcript": "Hello Libra, open Steam and launch Valorant.", "route": "stt_benchmark", "metrics": {"STT_LATENCY": 193.23}}
 {"timestamp": "2026-10-15T01:48:20.040517", "transcript": "Hello Libra, open Steam and launch Valorant.", "route": "stt_benchmark", "metrics": {"STT_LATENCY": 188.92}}
+{"timestamp": "2026-10-15T02:40:32.219093", "transcript": "Hello Libra, open Steam and launch Valorant.", "route": "stt_benchmark", "metrics": {"STT_LATENCY": 187.72}}
