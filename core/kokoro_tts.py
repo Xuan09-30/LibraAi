@@ -15,6 +15,8 @@ logging.getLogger("phonemizer").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
+from core.text_cleaner import normalize_for_tts
+
 try:
     from kokoro import KPipeline
     KOKORO_AVAILABLE = True
@@ -55,10 +57,11 @@ class KokoroTTS:
 
     def synthesize_stream(self, text: str):
         """Yields raw int16 PCM bytes per sentence for low-latency streaming playback."""
-        if not self.pipeline or not text.strip():
+        clean_text = normalize_for_tts(text)
+        if not self.pipeline or not clean_text.strip():
             return
 
-        generator = self.pipeline(text, voice=self.voice, speed=1.0)
+        generator = self.pipeline(clean_text, voice=self.voice, speed=1.0)
         for _, _, audio in generator:
             if audio is None or len(audio) == 0:
                 continue
