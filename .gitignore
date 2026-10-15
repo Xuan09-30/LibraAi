@@ -3,3 +3,17 @@ venv/
 __pycache__/
 *.py[cod]
 .env
+
+# Personal configuration & spatial anchors
+assets/user_profile.json
+!assets/user_profile.json.example
+
+# Local SQLite databases
+assets/*.db
+assets/*.db-shm
+assets/*.db-wal
+*.db
+
+# Logs & telemetry
+logs/
+*.log

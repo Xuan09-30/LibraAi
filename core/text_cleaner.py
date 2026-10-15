@@ -38,9 +38,12 @@ def normalize_for_tts(text: str) -> str:
     t = t.replace("#", " number ")
     t = t.replace("°", " degrees ")
 
-    # 7. Markdown stripping
+    # 7. Markdown and citation bracket stripping
     # Remove code blocks
     t = re.sub(r"```.*?```", " ", t, flags=re.DOTALL)
+    # Strip citation brackets e.g. [TechPowerUp] -> TechPowerUp, [Source] -> web sources
+    t = re.sub(r"\[\s*Source\s*\]", "web sources", t, flags=re.IGNORECASE)
+    t = re.sub(r"\[\s*([^\]]+?)\s*\]", r"\1", t)
     # Remove inline backticks, asterisks, hashes, blockquotes, bullets
     t = re.sub(r"[`*#_>]", " ", t)
     t = re.sub(r"^\s*[-+]\s+", " ", t, flags=re.MULTILINE)

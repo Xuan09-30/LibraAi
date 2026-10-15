@@ -1,5 +1,10 @@
 import os
 import sys
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 import time
 import math
 import random
@@ -21,9 +26,11 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from openwakeword.model import Model
 from core.vad import SileroVADDetector
+from core.wakeword_booster import WakeWordBooster
 from core.kokoro_tts import KokoroTTS
 from core.stt import SpeechToText
 from core.llm import LocalLLM
+from core.orchestrator import SupervisorHub
 from core.telemetry import profiler
 from core.text_cleaner import normalize_for_tts
 
@@ -115,7 +122,8 @@ class VoiceAssistantWorker(QThread):
         self.telemetry_update.emit("STT_ENGINE", f"WHISPER [{stt.device.upper()}]")
 
         llm = LocalLLM()
-        self.telemetry_update.emit("LLM_CORE", "QWEN3-INSTRUCT [LOCAL]")
+        supervisor = SupervisorHub(llm=llm)
+        self.telemetry_update.emit("LLM_CORE", "QWEN3-INSTRUCT [SUPERVISOR]")
 
         vad_detector = SileroVADDetector(sample_rate=16000, silence_cutoff_sec=0.8)
         self.telemetry_update.emit("VAD_DETECTOR", "SILERO ONNX [0.8s CUTOFF]")
@@ -132,10 +140,11 @@ class VoiceAssistantWorker(QThread):
 
         self.status_changed.emit("SYSTEM READY // AWAITING VOCAL PROMPT")
 
-        def speak_interruptible(text: str):
-            clean_text = normalize_for_tts(text)
-            if not clean_text or not clean_text.strip():
-                return
+        def speak_interruptible(text_or_stream):
+            if isinstance(text_or_stream, str):
+                sentences = [text_or_stream]
+            else:
+                sentences = text_or_stream
 
             self.interrupted.clear()
             self.status_changed.emit("SPEAKING... [CTRL+SPACE TO STOP]")
@@ -210,13 +219,19 @@ class VoiceAssistantWorker(QThread):
             consumer_thread = threading.Thread(target=playback_worker, daemon=True)
             consumer_thread.start()
 
-            # PRODUCER: Synthesizes via Kokoro and pushes into queue
+            # PRODUCER: Synthesizes via Kokoro sentence-by-sentence and pushes into queue
             try:
-                for chunk_bytes in tts.synthesize_stream(clean_text):
+                for sentence in sentences:
                     if self.interrupted.is_set():
                         break
-                    if chunk_bytes:
-                        audio_queue.put(chunk_bytes)
+                    clean_s = normalize_for_tts(sentence)
+                    if not clean_s or not clean_s.strip():
+                        continue
+                    for chunk_bytes in tts.synthesize_stream(clean_s):
+                        if self.interrupted.is_set():
+                            break
+                        if chunk_bytes:
+                            audio_queue.put(chunk_bytes)
             except Exception as ex:
                 print(f"[Kokoro Synthesis Error]: {ex}")
             finally:
@@ -261,36 +276,47 @@ class VoiceAssistantWorker(QThread):
             self.log_received.emit("LIBRA", missed_summary)
             speak_interruptible(missed_summary)
 
+        ww_booster = WakeWordBooster(default_threshold=0.50, vad_assisted_threshold=0.32)
         in_followup_mode = False
-        pre_roll_buffer = []
 
         while self.running:
+            if ww_booster.is_in_followup_window():
+                in_followup_mode = True
+
             if not in_followup_mode:
                 self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
                 self.visualizer_state.emit(False)
                 oww_model.reset()
+                ww_booster.reset()
 
                 while self.running and not in_followup_mode:
                     audio_data = self.input_stream.read(512, exception_on_overflow=False)
-                    pre_roll_buffer.append(audio_data)
-                    if len(pre_roll_buffer) > 20:
-                        pre_roll_buffer.pop(0)
 
                     # Calculate live microphone RMS amplitude and emit for Three.js WebGL orb
                     audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
                     rms = float(np.sqrt(np.mean(audio_np ** 2)))
                     self.mic_level.emit(min(1.0, rms * 10.0))
 
-                    audio_frame = np.frombuffer(audio_data, dtype=np.int16)
-                    prediction = oww_model.predict(audio_frame)
+                    # 1280-sample frame alignment & AGC via WakeWordBooster
+                    frames_1280 = ww_booster.process_chunk(audio_data, apply_agc=True)
 
-                    for model_name, score in prediction.items():
-                        if "libra" in str(model_name).lower() and score >= 0.50:
-                            print(f"\n[Worker] Wake word triggered! Score: {score:.3f}")
+                    triggered = False
+                    for frame in frames_1280:
+                        prediction = oww_model.predict(frame)
+                        vad_prob = getattr(vad_detector, "last_prob", 0.0)
+
+                        for model_name, score in prediction.items():
+                            if "libra" in str(model_name).lower():
+                                if ww_booster.is_wakeword_triggered(score, vad_prob=vad_prob):
+                                    thresh = ww_booster.get_threshold(vad_prob=vad_prob)
+                                    print(f"\n[Worker] Wake word triggered! Score: {score:.3f} (thresh: {thresh:.2f}, vad: {vad_prob:.2f})")
+                                    triggered = True
+                                    break
+                        if triggered:
                             break
-                    else:
-                        continue
-                    break
+
+                    if triggered:
+                        break
 
             if not self.running:
                 break
@@ -302,13 +328,11 @@ class VoiceAssistantWorker(QThread):
 
             vad_detector.reset()
 
-            # Pre-populate with pre-roll buffer if wakeword triggered
-            if pre_roll_buffer:
-                for prev_chunk in pre_roll_buffer[-6:]:
-                    vad_detector.audio_buffer.append(
-                        np.frombuffer(prev_chunk, dtype=np.int16).astype(np.float32) / 32768.0
-                    )
-                pre_roll_buffer.clear()
+            # Pre-populate with pre-roll buffer (1.0s preserved from WakeWordBooster ring buffer)
+            preroll_audio = ww_booster.get_preroll_audio()
+            if len(preroll_audio) > 0:
+                vad_detector.audio_buffer.append(preroll_audio)
+                ww_booster.clear_preroll()
 
             followup_wait_timeout = 10.0 if in_followup_mode else 15.0
             max_recording_time = 25.0
@@ -321,6 +345,8 @@ class VoiceAssistantWorker(QThread):
 
                 if not vad_detector.has_spoken and (now - listen_start_time) > followup_wait_timeout:
                     print("[VAD] Timeout waiting for speech.")
+                    ww_booster.clear_followup_window()
+                    in_followup_mode = False
                     break
 
                 if vad_detector.has_spoken and speech_start_time and (now - speech_start_time) > max_recording_time:
@@ -357,6 +383,7 @@ class VoiceAssistantWorker(QThread):
             self.telemetry_update.emit("STT_LATENCY", f"{stt_latency:.0f} ms")
 
             if not user_text.strip():
+                ww_booster.clear_followup_window()
                 in_followup_mode = False
                 self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
                 continue
@@ -367,10 +394,11 @@ class VoiceAssistantWorker(QThread):
             # STATE 4: REASON & EXECUTE VIA LLM CORE
             self.status_changed.emit("PROCESSING REASONING...")
             with profiler.measure("LLM_LATENCY"):
-                response_data = llm.plan_and_respond(user_text)
+                response_data = supervisor.execute(user_text)
             llm_latency = profiler.current_turn.get("LLM_LATENCY", 0.0)
             self.telemetry_update.emit("LLM_LATENCY", f"{llm_latency:.0f} ms")
-            profiler.flush(transcript=user_text, route=response_data.get("action", "chat"))
+            route_label = response_data.get("action") or ("compound" if response_data.get("compound") else "chat")
+            profiler.flush(transcript=user_text, route=route_label)
             print(f"[Libra Core]: {response_data}")
 
             # Grab final voice response formulated and executed by LocalLLM
@@ -378,6 +406,7 @@ class VoiceAssistantWorker(QThread):
 
             self.log_received.emit("LIBRA", voice_msg)
             speak_interruptible(voice_msg)
+            ww_booster.set_followup_window(6.0)
             in_followup_mode = True
 
         if self.input_stream:

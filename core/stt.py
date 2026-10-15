@@ -46,7 +46,7 @@ class SpeechToText:
         model_size: str = "large-v3-turbo",
         device: str = "cuda",
         compute_type: str = "float16",
-        initial_prompt: str = "Libra, Valorant, Riot, Steam, Fernando Alonso, Kepong, Kuala Lumpur, Qwen."
+        initial_prompt: str = "Libra, Valorant, Riot, Steam, Fernando Alonso, Kepong, Kuala Lumpur, Qwen, benchmarks, benchmark, RTX 5070, RTX 5080, GPU, CPU, RAM, VRAM, Nvidia, DLSS, framerate, specs, hardware."
     ):
         """Initializes Faster-Whisper on CUDA float16 with fallback."""
         self.model_size = model_size
@@ -163,5 +163,9 @@ class SpeechToText:
         repetitions = re.findall(r'(\b[\w\s\']+\b)(?:\s*,\s*\1){2,}', text, re.IGNORECASE)
         if repetitions:
             return ""
+
+        # Phonetic sanitation for common Whisper acoustic confusions
+        text = re.sub(r"\bbatch\s*marks\b", "benchmarks", text, flags=re.IGNORECASE)
+        text = re.sub(r"\bbatch\s*mark\b", "benchmark", text, flags=re.IGNORECASE)
 
         return text

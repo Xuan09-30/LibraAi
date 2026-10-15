@@ -1,0 +1,353 @@
+import os
+import sys
+import re
+import shutil
+import subprocess
+from typing import Optional, Dict, Any, List
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+
+class FileManager:
+    """
+    Local filesystem and folder manager.
+    Integrates with Voidtools Everything CLI (es.exe) for sub-second NTFS searches,
+    with bounded multi-level fallbacks across user and system directories.
+    """
+
+    @staticmethod
+    def _resolve_shell_dir(csidl: int, folder_name: str) -> str:
+        """Resolves the real visible Windows directory accounting for OneDrive redirection."""
+        user_home = os.path.expanduser("~")
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+                buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+                if ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buf) == 0:
+                    val = buf.value
+                    if val and os.path.isdir(val):
+                        return os.path.normpath(val)
+            except Exception:
+                pass
+
+        onedrive_path = os.path.join(user_home, "OneDrive", folder_name)
+        if os.path.isdir(onedrive_path):
+            return os.path.normpath(onedrive_path)
+
+        return os.path.normpath(os.path.join(user_home, folder_name))
+
+    @classmethod
+    def get_real_desktop_path(cls) -> str:
+        """Returns the true visible Windows 11 Desktop path (0x0010 = CSIDL_DESKTOPDIRECTORY)."""
+        return cls._resolve_shell_dir(0x0010, "Desktop")
+
+    def __init__(self, es_path: Optional[str] = None):
+        self.es_bin = self._find_everything_cli(es_path)
+        self.everything_bin = self._find_everything_app()
+        user_home = os.path.expanduser("~")
+
+        self.last_folder_path: Optional[str] = None
+        self.last_folder_name: Optional[str] = None
+
+        desktop_path = self.get_real_desktop_path()
+        documents_path = self._resolve_shell_dir(0x0005, "Documents")
+        pictures_path = self._resolve_shell_dir(0x0027, "Pictures")
+
+        self.known_dirs: Dict[str, str] = {
+            "desktop": desktop_path,
+            "documents": documents_path,
+            "downloads": os.path.join(user_home, "Downloads"),
+            "pictures": pictures_path,
+            "music": os.path.join(user_home, "Music"),
+            "videos": os.path.join(user_home, "Videos"),
+            "program files": os.environ.get("ProgramFiles", "C:\\Program Files"),
+            "program file": os.environ.get("ProgramFiles", "C:\\Program Files"),
+            "programs file": os.environ.get("ProgramFiles", "C:\\Program Files"),
+            "programs files": os.environ.get("ProgramFiles", "C:\\Program Files"),
+            "program files (x86)": os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+            "program file (x86)": os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+            "programs file (x86)": os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+            "programs files (x86)": os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+            "windows": os.environ.get("SystemRoot", "C:\\Windows"),
+            "home": user_home,
+            "user": user_home,
+            "workspace": PROJECT_ROOT,
+            "project": PROJECT_ROOT
+        }
+
+    def _find_everything_cli(self, custom_path: Optional[str] = None) -> Optional[str]:
+        """Locates es.exe from custom path, PATH, or standard Program Files locations."""
+        if custom_path and os.path.isfile(custom_path):
+            return custom_path
+
+        which_es = shutil.which("es.exe") or shutil.which("es")
+        if which_es:
+            return which_es
+
+        candidates = [
+            os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Everything", "es.exe"),
+            os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Everything", "es.exe"),
+            "C:\\Program Files (x86)\\Everything\\es.exe",
+            "C:\\Program Files\\Everything\\es.exe"
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return c
+        return None
+
+    def _find_everything_app(self) -> Optional[str]:
+        """Locates Everything.exe from standard Program Files locations or PATH."""
+        which_app = shutil.which("Everything.exe") or shutil.which("Everything")
+        if which_app:
+            return which_app
+
+        candidates = [
+            os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Everything", "Everything.exe"),
+            os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Everything", "Everything.exe"),
+            "C:\\Program Files (x86)\\Everything\\Everything.exe",
+            "C:\\Program Files\\Everything\\Everything.exe"
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return c
+        return None
+
+    def search_path(self, query: str, folders_only: bool = True) -> Optional[str]:
+        """
+        Searches for a folder or file matching query.
+        1. Strips conversational filler words and normalizes system folders.
+        2. Checks known system/user directories.
+        3. Executes Voidtools Everything CLI (es.exe) if present.
+        4. Falls back to a fast bounded 2-level directory scan with fuzzy/condensed matching.
+        """
+        clean_q = query.strip()
+        if not clean_q:
+            return None
+
+        # Strip conversational filler words: 'that', 'the', 'folder', 'folders', 'on here', 'in explorer', 'in file explorer', 'here'
+        fillers = [
+            r"\b(?:in\s+file\s+explorer|in\s+explorer)\b",
+            r"\bon\s+here\b",
+            r"\b(?:folder|folders|directory|dir)\b",
+            r"\b(?:that|the|a|an)\b",
+            r"\bhere\b",
+        ]
+        term = clean_q
+        for f_pat in fillers:
+            term = re.sub(f_pat, "", term, flags=re.IGNORECASE).strip()
+
+        term = term.strip(" '\"`.,?!")
+        term_lower = (term or clean_q).lower()
+
+        # Plural/fuzzy normalization for system folders
+        if term_lower in ["programs file", "program file", "program files", "programs files", "program files folder", "programs folder"]:
+            return self.known_dirs["program files"]
+        if term_lower in ["programs file (x86)", "program file (x86)", "program files (x86)", "programs files (x86)"]:
+            return self.known_dirs["program files (x86)"]
+
+        # 1. Check known directories
+        for key, dir_path in self.known_dirs.items():
+            if term_lower == key or term_lower.replace(" ", "") == key.replace(" ", ""):
+                if os.path.isdir(dir_path):
+                    return dir_path
+
+        # 2. Check if query or cleaned term is an explicit existing path
+        if os.path.exists(clean_q):
+            if not folders_only or os.path.isdir(clean_q):
+                return os.path.abspath(clean_q)
+        if term and os.path.exists(term):
+            if not folders_only or os.path.isdir(term):
+                return os.path.abspath(term)
+
+        # 3. Everything CLI (es.exe) if available
+        if self.es_bin:
+            try:
+                cmd = [self.es_bin]
+                if folders_only:
+                    cmd.append("-ad")
+                cmd.extend(["-n", "5", term_lower])
+                res = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=2.0,
+                    shell=False
+                )
+                if res.returncode == 0 and res.stdout:
+                    for line in res.stdout.strip().splitlines():
+                        candidate = line.strip()
+                        if os.path.exists(candidate):
+                            if not folders_only or os.path.isdir(candidate):
+                                return candidate
+            except Exception as e:
+                print(f"[FileManager Everything Warning]: {e}")
+
+        # 4. Bounded 2-level directory scan fallback
+        search_roots = [
+            self.known_dirs.get("desktop"),
+            self.known_dirs.get("documents"),
+            self.known_dirs.get("downloads"),
+            self.known_dirs.get("program files"),
+            PROJECT_ROOT
+        ]
+
+        target_token = term_lower
+        target_condensed = term_lower.replace(" ", "").replace("_", "").replace("-", "")
+
+        for root in search_roots:
+            if not root or not os.path.isdir(root):
+                continue
+
+            # Check root itself
+            base_name = os.path.basename(root).lower()
+            base_condensed = base_name.replace(" ", "").replace("_", "").replace("-", "")
+            if target_token == base_name or (target_condensed and target_condensed == base_condensed):
+                return root
+
+            # Level 1 and 2 search
+            try:
+                with os.scandir(root) as it1:
+                    for entry1 in it1:
+                        try:
+                            if folders_only and not entry1.is_dir():
+                                continue
+                            e1_lower = entry1.name.lower()
+                            e1_condensed = e1_lower.replace(" ", "").replace("_", "").replace("-", "")
+                            if (
+                                e1_lower == target_token
+                                or (target_condensed and e1_condensed == target_condensed)
+                                or (target_token and target_token in e1_lower)
+                            ):
+                                return os.path.abspath(entry1.path)
+
+                            # Level 2 scan
+                            if entry1.is_dir():
+                                try:
+                                    with os.scandir(entry1.path) as it2:
+                                        for entry2 in it2:
+                                            if folders_only and not entry2.is_dir():
+                                                continue
+                                            e2_lower = entry2.name.lower()
+                                            e2_condensed = e2_lower.replace(" ", "").replace("_", "").replace("-", "")
+                                            if (
+                                                e2_lower == target_token
+                                                or (target_condensed and e2_condensed == target_condensed)
+                                                or (target_token and target_token in e2_lower)
+                                            ):
+                                                return os.path.abspath(entry2.path)
+                                except (PermissionError, OSError):
+                                    pass
+                        except (PermissionError, OSError):
+                            continue
+            except (PermissionError, OSError):
+                continue
+
+        return None
+
+    def open_in_explorer(self, query: str, dry_run: bool = False) -> Dict[str, Any]:
+        """
+        Resolves query to a filesystem path and reveals it in Windows File Explorer.
+        Handles pronoun references ("that folder", "the folder", "it", "this folder") using last_folder_path.
+        """
+        PRONOUN_REFERENCES = {
+            "that folder", "the folder", "it", "this folder", "that", "folder",
+            "last folder", "the created folder", "that created folder", "the new folder"
+        }
+        clean_norm = query.lower().strip().rstrip(".?!")
+        clean_norm = re.sub(r"^(?:please\s+)?(?:open|reveal|show)\s+", "", clean_norm).strip()
+        clean_norm = re.sub(r"\s+for\s+me$", "", clean_norm).strip()
+
+        resolved_path = None
+        if clean_norm in PRONOUN_REFERENCES or query.lower().strip() in PRONOUN_REFERENCES:
+            if self.last_folder_path and (dry_run or os.path.exists(self.last_folder_path)):
+                resolved_path = self.last_folder_path
+
+        if not resolved_path:
+            resolved_path = self.search_path(query, folders_only=True)
+            if not resolved_path:
+                resolved_path = self.search_path(query, folders_only=False)
+
+        if not resolved_path:
+            return {
+                "status": "not_found",
+                "path": None,
+                "voice_response": f"I couldn't find the folder {query} on your system."
+            }
+
+        self.last_folder_path = resolved_path
+        self.last_folder_name = os.path.basename(resolved_path) or resolved_path
+
+        if not dry_run:
+            try:
+                subprocess.Popen(["explorer.exe", resolved_path], shell=False)
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "path": resolved_path,
+                    "voice_response": f"Failed to open {os.path.basename(resolved_path)} in File Explorer: {e}"
+                }
+
+        folder_name = os.path.basename(resolved_path) or resolved_path
+        return {
+            "status": "opened",
+            "path": resolved_path,
+            "voice_response": f"Opening {folder_name} in File Explorer."
+        }
+
+    def sanitize_folder_name(self, raw_name: str) -> str:
+        """
+        Strips path traversal elements (..) and illegal Windows characters (<>:"/\\|?*).
+        """
+        cleaned = raw_name.replace("..", "").replace("/", "").replace("\\", "")
+        cleaned = re.sub(r'[<>:"/\\|?*]', "", cleaned).strip(" .")
+        return cleaned or "New Folder"
+
+    def create_folder(
+        self,
+        folder_name: str,
+        parent_location: str = "desktop",
+        dry_run: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Creates a new folder at the specified parent location with traversal protection.
+        """
+        clean_name = self.sanitize_folder_name(folder_name)
+
+        # Resolve parent directory
+        parent_dir = None
+        if os.path.isdir(parent_location):
+            parent_dir = os.path.abspath(parent_location)
+        else:
+            loc_lower = parent_location.lower().strip()
+            if loc_lower in self.known_dirs:
+                parent_dir = self.known_dirs[loc_lower]
+            else:
+                found = self.search_path(parent_location, folders_only=True)
+                parent_dir = found or self.known_dirs.get("desktop", os.path.expanduser("~"))
+
+        target_dir = os.path.abspath(os.path.join(parent_dir, clean_name))
+
+        # Enforce that target_dir is strictly inside parent_dir (traversal defense)
+        if not target_dir.startswith(parent_dir):
+            target_dir = os.path.join(parent_dir, "Safe_Folder")
+
+        self.last_folder_path = target_dir
+        self.last_folder_name = clean_name
+
+        if not dry_run:
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except Exception as e:
+                return {
+                    "status": "error",
+                    "path": target_dir,
+                    "voice_response": f"Failed to create folder {clean_name}: {e}"
+                }
+
+        parent_display = os.path.basename(parent_dir) or parent_location
+        return {
+            "status": "created",
+            "path": target_dir,
+            "voice_response": f"Created folder {clean_name} in {parent_display}."
+        }

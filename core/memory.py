@@ -92,6 +92,25 @@ class SemanticMemory:
             )
         """)
 
+        # 4. Episodic conversation logs table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS episodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_text TEXT NOT NULL,
+                assistant_text TEXT NOT NULL,
+                route TEXT DEFAULT 'chat',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 5. Episodic vector index table using vec0
+        cursor.execute(f"""
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
+                episode_id INTEGER PRIMARY KEY,
+                embedding float[{self.dim}] distance_metric=cosine
+            )
+        """)
+
         conn.commit()
         if self.db_path != ":memory:":
             conn.close()
@@ -132,7 +151,11 @@ class SemanticMemory:
         try:
             resp = requests.post(
                 f"{self.ollama_base_url}/api/embeddings",
-                json={"model": self.embed_model, "prompt": clean_text},
+                json={
+                    "model": self.embed_model,
+                    "prompt": clean_text,
+                    "keep_alive": "60m"
+                },
                 timeout=25
             )
             if resp.status_code == 200:
@@ -272,6 +295,86 @@ class SemanticMemory:
         except Exception as e:
             print(f"[SemanticMemory Profile Error]: {e}")
             return []
+
+    def log_episode(self, user_text: str, assistant_text: str, route: str = "chat") -> int:
+        """
+        Logs a full conversational turn into the episodic memory database
+        and indexes its embedding for semantic conversational recall.
+        """
+        clean_user = (user_text or "").strip()
+        clean_asst = (assistant_text or "").strip()
+        if not clean_user and not clean_asst:
+            return -1
+
+        summary_text = f"User: {clean_user} | Assistant: {clean_asst}"
+        emb = self.embed_text(summary_text)
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO episodes (user_text, assistant_text, route) VALUES (?, ?, ?)",
+                (clean_user, clean_asst, route)
+            )
+            episode_id = cursor.lastrowid
+            if emb and any(emb):
+                cursor.execute(
+                    "INSERT INTO vec_episodes (episode_id, embedding) VALUES (?, ?)",
+                    (episode_id, sqlite_vec.serialize_float32(emb))
+                )
+            conn.commit()
+            return episode_id
+        except Exception as e:
+            print(f"[SemanticMemory Log Episode Error]: {e}")
+            return -1
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def recall_episodes(self, query: str, limit: int = 2, distance_threshold: float = 0.65) -> list[dict]:
+        """
+        Retrieves the most semantically relevant past conversational episodes.
+        """
+        clean_q = (query or "").strip()
+        if not clean_q:
+            return []
+
+        emb = self.embed_text(clean_q)
+        if not emb or not any(emb):
+            return []
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(f"""
+                SELECT e.id, e.user_text, e.assistant_text, e.route, v.distance, e.created_at
+                FROM vec_episodes v
+                JOIN episodes e ON e.id = v.episode_id
+                WHERE v.embedding MATCH ? AND k = ?
+            """, (sqlite_vec.serialize_float32(emb), limit * 2))
+            rows = cursor.fetchall()
+
+            episodes = []
+            for r in rows:
+                dist = float(r[4])
+                if dist <= distance_threshold:
+                    episodes.append({
+                        "id": r[0],
+                        "user_text": r[1],
+                        "assistant_text": r[2],
+                        "route": r[3],
+                        "distance": dist,
+                        "created_at": r[5]
+                    })
+                if len(episodes) >= limit:
+                    break
+            return episodes
+        except Exception as e:
+            print(f"[SemanticMemory Recall Episodes Error]: {e}")
+            return []
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
 
     # Backwards compatibility methods
     def add_fact(self, fact: str, category: str = "general") -> bool:

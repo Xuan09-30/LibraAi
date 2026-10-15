@@ -1,37 +1,41 @@
 import os
 import re
-import urllib.parse
+import logging
 import warnings
+from urllib.parse import urlparse
 import trafilatura
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
+logging.getLogger("trafilatura").setLevel(logging.CRITICAL)
 
 try:
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS
 except ImportError:
     try:
-        from ddgs import DDGS
+        from duckduckgo_search import DDGS
     except ImportError:
         DDGS = None
 
 
 def extract_citation_label(url: str, title: str = "") -> str:
     """Extracts a clean verbal citation label from URL domain or page title."""
-    if title:
-        for delim in [" - ", " | ", " — ", " :: "]:
-            if delim in title:
-                candidate = title.split(delim)[-1].strip()
-                if 2 <= len(candidate) <= 30 and not any(p in candidate.lower() for p in ["http", ".html", "page", ".com", ".org"]):
-                    return candidate
-
     domain_map = {
+        "userbenchmark.com": "UserBenchmark",
+        "videocardbenchmark.net": "PassMark",
+        "passmark.com": "PassMark",
+        "notebookcheck.net": "NotebookCheck",
+        "gamersnexus.net": "Gamers Nexus",
+        "pcbench.net": "PCBench",
+        "checkfps.io": "CheckFPS",
+        "nanoreview.net": "NanoReview",
+        "anandtech.com": "AnandTech",
+        "techpowerup.com": "TechPowerUp",
+        "tomshardware.com": "Tom's Hardware",
         "wikipedia.org": "Wikipedia",
         "thestar.com.my": "The Star",
-        "techpowerup.com": "TechPowerUp",
         "bbc.com": "BBC",
         "bbc.co.uk": "BBC",
         "reuters.com": "Reuters",
-        "tomshardware.com": "Tom's Hardware",
         "malaymail.com": "Malay Mail",
         "nst.com.my": "New Straits Times",
         "theverge.com": "The Verge",
@@ -46,7 +50,7 @@ def extract_citation_label(url: str, title: str = "") -> str:
     }
 
     try:
-        parsed = urllib.parse.urlparse(url)
+        parsed = urlparse(url)
         netloc = parsed.netloc.lower()
         if netloc.startswith("www."):
             netloc = netloc[4:]
@@ -54,77 +58,124 @@ def extract_citation_label(url: str, title: str = "") -> str:
             if netloc == known_domain or netloc.endswith("." + known_domain):
                 return label
 
-        # Fallback: capitalize base domain
+        # Fallback to domain name
         parts = netloc.split(".")
         if len(parts) >= 2:
-            base = parts[0] if parts[0] not in ["news", "m", "en"] else parts[1]
+            base = parts[-2] if parts[-2] not in ["co", "com", "org", "net", "gov", "edu", "my"] else parts[-3]
             return base.capitalize()
     except Exception:
         pass
+
+    if title:
+        for prefix_delim in [": ", " - ", " | "]:
+            if prefix_delim in title:
+                cand = title.split(prefix_delim)[0].strip()
+                if cand.lower() in [d.lower() for d in domain_map.values()]:
+                    return cand
 
     return "Web Source"
 
 
 class HardenedResearchEngine:
-    def __init__(self, char_limit_per_source: int = 1200):
+    def __init__(self, char_limit_per_source: int = 800):
         self.char_limit_per_source = char_limit_per_source
 
     def search_and_extract(self, query: str, max_sources: int = 2) -> dict:
-        """
-        Uses duckduckgo-search to retrieve top URLs, extracts clean main-body text
-        via trafilatura, truncates to ~1200 chars, and extracts clean citation labels.
-        """
         clean_query = query.strip()
+        sources = []
         if not clean_query or DDGS is None:
-            return {"query": clean_query, "sources": []}
+            return {"query": clean_query, "sources": sources}
 
-        ddgs_results = []
+        # Extract core query tokens for relevance validation
+        stopwords = {
+            "what", "where", "who", "when", "why", "how", "the", "and", "for", "about",
+            "with", "tell", "search", "online", "latest", "from", "show", "open", "read",
+            "find", "can", "you", "please", "me", "is", "are", "was", "were", "of", "in",
+            "help", "does", "have", "any"
+        }
+        query_tokens = [
+            w.lower() for w in re.findall(r"\b[a-zA-Z0-9]+\b", clean_query)
+            if len(w) >= 3 and w.lower() not in stopwords
+        ]
+
         try:
             with DDGS() as ddgs:
-                ddgs_results = list(ddgs.text(clean_query, max_results=max_sources * 2))
+                results = list(ddgs.text(clean_query, max_results=max_sources * 4))
+
+            for r in results:
+                url = r.get("href") or r.get("link") or ""
+                if not url:
+                    continue
+
+                parsed = urlparse(url)
+                path = parsed.path.strip("/")
+                path_segments = [p for p in path.split("/") if p]
+
+                # 1. Skip homepages and root domains (e.g., https://thestar.com.my/, https://thestar.com.my)
+                if not path_segments:
+                    continue
+
+                # 2. Skip single-segment generic landing / index / section pages
+                first_seg = path_segments[0].lower()
+                if len(path_segments) == 1 and first_seg in {
+                    "index.html", "index.php", "index.htm", "home", "news", "tech",
+                    "default.aspx", "en", "tag", "category", "topics", "search"
+                }:
+                    continue
+
+                title = r.get("title") or parsed.netloc
+                snippet = r.get("body") or ""
+
+                # 3. Check relevance in snippet or title first
+                title_has_keywords = any(tok in title.lower() for tok in query_tokens) if query_tokens else True
+                snippet_has_keywords = any(tok in snippet.lower() for tok in query_tokens) if query_tokens else True
+
+                # 4. Attempt Trafilatura extraction on deep article links
+                article_text = ""
+                try:
+                    downloaded = trafilatura.fetch_url(url)
+                    if downloaded:
+                        article_text = trafilatura.extract(
+                            downloaded,
+                            include_comments=False,
+                            include_tables=False,
+                            favor_precision=True
+                        ) or ""
+                except Exception:
+                    article_text = ""
+
+                # 5. Strict relevance validation:
+                article_has_keywords = any(tok in article_text.lower() for tok in query_tokens) if query_tokens else True
+
+                # Discard completely unrelated pages that lack all query tokens
+                if query_tokens and not (title_has_keywords or snippet_has_keywords or article_has_keywords):
+                    continue
+
+                if article_text and article_has_keywords and len(article_text.strip()) >= 120:
+                    final_text = article_text.strip()
+                elif snippet:
+                    final_text = snippet.strip()
+                elif article_text and len(article_text.strip()) >= 120:
+                    final_text = article_text.strip()
+                else:
+                    final_text = snippet.strip()
+
+                if not final_text:
+                    continue
+
+                name = extract_citation_label(url, title)
+                sources.append({
+                    "name": name,
+                    "title": title,
+                    "url": url,
+                    "text": final_text[:self.char_limit_per_source].strip()
+                })
+
+                if len(sources) >= max_sources:
+                    break
+
         except Exception as e:
-            print(f"[Research Engine Warning] Search failed: {e}")
-
-        sources = []
-        for r in ddgs_results:
-            if len(sources) >= max_sources:
-                break
-
-            url = r.get("href") or r.get("link") or ""
-            title = r.get("title") or ""
-            body = r.get("body") or ""
-
-            if not url:
-                continue
-
-            name = extract_citation_label(url, title)
-            extracted_text = ""
-
-            try:
-                downloaded = trafilatura.fetch_url(url)
-                if downloaded:
-                    extracted_text = trafilatura.extract(
-                        downloaded,
-                        include_comments=False,
-                        include_tables=False,
-                        no_fallback=False
-                    ) or ""
-            except Exception as ex:
-                print(f"[Research Engine Scrape Error] {url}: {ex}")
-
-            # Fallback to snippet body if trafilatura extraction is empty
-            text_to_use = extracted_text.strip() if len(extracted_text.strip()) > 80 else body.strip()
-            if not text_to_use:
-                continue
-
-            truncated_text = text_to_use[:self.char_limit_per_source].strip()
-
-            sources.append({
-                "name": name,
-                "title": title,
-                "url": url,
-                "text": truncated_text
-            })
+            print(f"[Research Engine Error]: {e}")
 
         return {
             "query": clean_query,
@@ -150,7 +201,8 @@ class HardenedResearchEngine:
         for src in sources_list:
             name = src.get("name") or src.get("title") or "Web"
             text = src.get("text", "")
-            source_blocks.append(f'  <source name="{name}">\n{text}\n  </source>')
+            # Bound each source snippet to 800 chars
+            source_blocks.append(f'  <source name="{name}">\n{text[:800]}\n  </source>')
 
         xml_isolation = "<untrusted_web_search_results>\n" + "\n".join(source_blocks) + "\n</untrusted_web_search_results>"
 
