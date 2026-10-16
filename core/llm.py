@@ -19,6 +19,7 @@ from tools.file_manager import FileManager
 from core.model_manager import ModelManager
 from tools.clipboard_agent import ClipboardAgent
 from tools.document_rag import DocumentRAGEngine
+from tools.security_scanner import SecurityScanner
 from core.workspaces import WorkspaceManager
 from tools.spotify_agent import SpotifyAgent
 from tools.media_controller import MediaController
@@ -75,6 +76,8 @@ class LocalLLM:
         self.model_mgr = ModelManager(ollama_host=self.host)
         self.clipboard_agent = ClipboardAgent()
         self.document_rag = DocumentRAGEngine(file_mgr=self.file_mgr, ollama_base_url=self.host)
+        self.security_scanner = SecurityScanner(file_mgr=self.file_mgr)
+        self.attached_file_path: Optional[str] = None
         self.workspaces = WorkspaceManager(
             dispatcher=self.dispatcher,
             scheduler=self.scheduler,
@@ -252,6 +255,75 @@ class LocalLLM:
             fallback = self.call_ollama(target_model, prompt, system_prompt=system_prompt)
             if fallback:
                 yield fallback
+
+    def stream_chat_sentences(
+        self,
+        messages: List[Dict[str, str]],
+        model_spec: Optional[Dict[str, Any]] = None,
+        model: Optional[str] = None,
+        timeout: int = 40
+    ):
+        """
+        Streams token chunks from Ollama /api/chat with think=False and yields
+        synthesizable clauses/sentences as soon as [.!?:\n] is reached (>= 25 chars),
+        allowing KokoroTTS to synthesize within <400ms time-to-first-audio.
+        """
+        url = f"{self.host}/api/chat"
+        target_model = model or (model_spec.get("active_model") or model_spec.get("requested_model") if model_spec else None) or self.models.get("chat", "qwen3:8b")
+        keep_alive = model_spec.get("keep_alive", "30m") if model_spec else "30m"
+
+        payload = {
+            "model": target_model,
+            "messages": messages,
+            "stream": True,
+            "keep_alive": keep_alive,
+            "think": False,
+            "options": {
+                "temperature": 0.3,
+                "num_predict": 256
+            }
+        }
+
+        try:
+            response = requests.post(url, json=payload, stream=True, timeout=timeout)
+            if response.status_code != 200:
+                return
+
+            buffer = ""
+            clause_split = re.compile(r"(.*?[\.\?\!](?:\s+|$)|.*?(?::\n|\n\n|\n))", re.DOTALL)
+
+            for line in response.iter_lines(decode_unicode=True):
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                    token = chunk.get("message", {}).get("content", "")
+                    buffer += token
+
+                    while len(buffer) >= 25:
+                        match = clause_split.match(buffer)
+                        if match:
+                            clause = match.group(1).strip()
+                            buffer = buffer[len(match.group(1)):].lstrip()
+                            if clause and len(clause) >= 15:
+                                clean_clause = re.sub(r"<think>.*?</think>", "", clause, flags=re.DOTALL).strip()
+                                if clean_clause:
+                                    yield clean_clause
+                        else:
+                            break
+
+                    if chunk.get("done", False):
+                        break
+                except Exception:
+                    continue
+
+            leftover = buffer.strip()
+            if leftover:
+                clean_leftover = re.sub(r"<think>.*?</think>", "", leftover, flags=re.DOTALL).strip()
+                if clean_leftover:
+                    yield clean_leftover
+        except Exception as e:
+            print(f"[Sentence Streaming Exception]: {e}")
 
     def _extract_and_cache_entity(self, prompt: str):
         """Extracts and tracks entity in session state for relational follow-ups."""
@@ -998,6 +1070,22 @@ class LocalLLM:
                     self._record_turn(prompt, plan_res["voice_response"])
                 return plan_res
 
+            # Guard: If query mentions "on spotify" or is simply "spotify", route to spotify_play
+            if raw_app.lower() == "spotify" or re.search(r"\bon\s+spotify\b", raw_app.lower()):
+                query_target = "" if raw_app.lower() == "spotify" else re.sub(r"\bon\s+spotify\b", "", raw_app, flags=re.IGNORECASE).strip()
+                sp_res = self.spotify_agent.play_query(query_target, dry_run=dry_run)
+                plan_res = {
+                    "action": "spotify_play",
+                    "args": {"query": query_target},
+                    "query": query_target,
+                    "status": sp_res.get("status"),
+                    "voice_response": sp_res.get("voice_response")
+                }
+                if not dry_run:
+                    self.session_state["last_action"] = "spotify_play"
+                    self._record_turn(prompt, plan_res["voice_response"])
+                return plan_res
+
             # Guard: workspace mode or game mode commands are delegated to their dedicated sections
             if not (re.search(r"\b(?:coding|study|gaming)\s+(?:mode|workspace)\b", raw_app) or raw_app in ["game mode", "mode"]):
                 app_id = raw_app
@@ -1184,16 +1272,78 @@ class LocalLLM:
             return plan_res
 
         # -------------------------------------------------------------
+        # 8.10 MULTI-LAYER VIRUS & SECURITY SCANNER
+        # -------------------------------------------------------------
+        virus_scan_match = (
+            re.search(r"\b(?:scan|check)\s+(?:my\s+)?([a-zA-Z0-9_\-\\\/\.\s]+?)\s+(?:for\s+viruses|for\s+malware|for\s+threats)[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:virus\s+scan|malware\s+scan|security\s+scan)\s+(?:on\s+|for\s+)?(?:my\s+)?([a-zA-Z0-9_\-\\\/\.\s]+)[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:check\s+if|is)\s+(?:my\s+)?([a-zA-Z0-9_\-\\\/\.\s]+?)\s+(?:is\s+)?(?:safe|clean|malware|a\s+virus)[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:scan\s+my\s+downloads\s+folder|scan\s+downloads\s+folder|scan\s+my\s+downloads|scan\s+downloads)\b", q_lower)
+        )
+        if virus_scan_match:
+            raw_target = None
+            if virus_scan_match.groups() and virus_scan_match.group(1):
+                raw_target = virus_scan_match.group(1).strip()
+            if not raw_target or "download" in q_lower:
+                raw_target = "Downloads"
+            clean_scan_target = re.sub(r"^(?:my\s+)?(?:folder\s+called\s+|folder\s+named\s+|folder\s+)?", "", raw_target).strip().rstrip(".?!")
+
+            scan_res = self.security_scanner.scan_path(clean_scan_target, dry_run=dry_run)
+            plan_res = {
+                "action": "virus_scan",
+                "args": {"target": clean_scan_target},
+                "target": clean_scan_target,
+                "status": scan_res.get("status"),
+                "file_name": scan_res.get("file_name"),
+                "sha256": scan_res.get("sha256"),
+                "defender_status": scan_res.get("defender_status"),
+                "issues": scan_res.get("issues", []),
+                "voice_response": scan_res.get("voice_response")
+            }
+            if not dry_run:
+                self.session_state["last_action"] = "virus_scan"
+                self._record_turn(prompt, plan_res["voice_response"])
+            return plan_res
+
+        # -------------------------------------------------------------
         # 8.11 LOCAL DOCUMENT RAG ("Chat with Your Files")
         # -------------------------------------------------------------
         doc_rag_match = (
-            re.search(r"^(?:please\s+)?(?:read|analyze|inspect|examine)\s+(?:my\s+)?([a-zA-Z0-9_\-\s]+?\.(?:pdf|docx|txt|py|md|json|log))(?:(?:\s+and\s+answer|\s+and\s+tell\s+me|\s+and\s+summarize)?(?:\s+(.+))?)?[\.\?!]*$", q_lower)
-            or re.search(r"\b(?:search\s+in|ask)\s+(?:my\s+)?([a-zA-Z0-9_\-\s]+?\.(?:pdf|docx|txt|py|md|json|log))\s+(?:for|about)?\s*(.+)[\.\?!]*$", q_lower)
-            or re.search(r"^(?:please\s+)?(?:read|analyze)\s+my\s+([a-zA-Z0-9_\-\s]+?)(?:\s+(?:pdf|proposal|document|resume|paper))(?:\s+(?:and\s+answer|about|for)\s+(.+))?[\.\?!]*$", q_lower)
+            re.search(r"^(?:please\s+)?(?:read|analyze|inspect|examine|summarize)\s+(?:my\s+)?(?:the\s+)?(?:file\s+|document\s+|pdf\s+)?([a-zA-Z0-9_\-\s]+?\.(?:pdf|docx|txt|py|md|json|log|csv))(?:(?:\s+and\s+answer|\s+and\s+tell\s+me|\s+and\s+summarize)?(?:\s+(.+))?)?[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:search\s+in|ask)\s+(?:my\s+)?([a-zA-Z0-9_\-\s]+?\.(?:pdf|docx|txt|py|md|json|log|csv))\s+(?:for|about)?\s*(.+)[\.\?!]*$", q_lower)
+            or re.search(r"^(?:please\s+)?(?:read|analyze|summarize)\s+my\s+([a-zA-Z0-9_\-\s]+?)(?:\s+(?:pdf|proposal|document|resume|paper))(?:\s+(?:and\s+answer|about|for)\s+(.+))?[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:summarize|explain)\s+(?:the\s+)?(?:file|document|pdf)\s+([a-zA-Z0-9_\-\s\.]+?)[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:read|explain|summarize|what\s+is\s+inside)\s+(?:the\s+|my\s+)?readme(?:\.md|\s+file)?\b", q_lower)
         )
+        doc_file = None
+        rag_question = None
+
+        # 1. Attached file in session or GUI takes highest priority
+        if self.attached_file_path:
+            attached_keywords = [
+                "file", "document", "doc", "pdf", "readme", "inside", "content", "contents",
+                "explain", "summarize", "summary", "read", "say", "says", "about this",
+                "what is this", "what does this", "what is it", "tell me", "what's in", "what is in",
+                "this", "here", "it", "meaning"
+            ]
+            if any(k in q_lower for k in attached_keywords) or doc_rag_match:
+                doc_file = self.attached_file_path
+                rag_question = cleaned_query
+                doc_rag_match = True
+
+        # 2. Named file pattern without an attached file
+        if doc_rag_match and not doc_file:
+            if hasattr(doc_rag_match, "group") and doc_rag_match.groups() and doc_rag_match.group(1):
+                doc_file = doc_rag_match.group(1).strip()
+                rag_question = (doc_rag_match.group(2) if len(doc_rag_match.groups()) >= 2 and doc_rag_match.group(2) else "Summarize the key points of this document.").strip()
+            elif "readme" in q_lower:
+                doc_file = "README.md"
+                rag_question = cleaned_query
+            else:
+                doc_file = self.attached_file_path if self.attached_file_path else "document"
+                rag_question = cleaned_query
+
         if doc_rag_match:
-            doc_file = doc_rag_match.group(1).strip()
-            rag_question = (doc_rag_match.group(2) or "Summarize the key points of this document.").strip()
             plan_res = {
                 "action": "document_rag",
                 "args": {"file": doc_file, "question": rag_question},
@@ -1210,6 +1360,7 @@ class LocalLLM:
             else:
                 rag_res = self.document_rag.query_document(doc_file, rag_question, dry_run=True)
                 plan_res["voice_response"] = rag_res.get("voice_response", f"Ready to query {doc_file}.")
+                plan_res["chunks"] = rag_res.get("chunks", [])
             return plan_res
 
         # -------------------------------------------------------------
@@ -1231,6 +1382,34 @@ class LocalLLM:
             plan_res["voice_response"] = res.get("voice_response", f"Workspace {mode_name} activated.")
             if not dry_run:
                 self.session_state["last_action"] = "launch_workspace"
+                self._record_turn(prompt, plan_res["voice_response"])
+            return plan_res
+
+        # -------------------------------------------------------------
+        # 8.12.5 FULL SPOTIFY SEARCH & PLAYBACK
+        # -------------------------------------------------------------
+        spotify_play_match = (
+            re.search(r"\b(?:play|listen\s+to)\s+(.+?)\s+on\s+spotify[\.\?!]*$", q_lower)
+            or re.search(r"\bon\s+spotify\s+(?:play|listen\s+to)\s+(.+)[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:play|listen\s+to)(?:\s+some)?\s+music\s+on\s+spotify[\.\?!]*$", q_lower)
+            or re.search(r"^(?:play|listen)\s+on\s+spotify[\.\?!]*$", q_lower)
+            or re.search(r"^(?:open|launch)\s+spotify[\.\?!]*$", q_lower)
+        )
+        if spotify_play_match:
+            raw_match_query = ""
+            if spotify_play_match.groups() and spotify_play_match.group(1):
+                raw_match_query = spotify_play_match.group(1).strip()
+            spotify_query = raw_match_query.rstrip(".?!")
+            sp_res = self.spotify_agent.play_query(spotify_query, dry_run=dry_run)
+            plan_res = {
+                "action": "spotify_play",
+                "args": {"query": spotify_query},
+                "query": spotify_query,
+                "status": sp_res.get("status"),
+                "voice_response": sp_res.get("voice_response")
+            }
+            if not dry_run:
+                self.session_state["last_action"] = "spotify_play"
                 self._record_turn(prompt, plan_res["voice_response"])
             return plan_res
 

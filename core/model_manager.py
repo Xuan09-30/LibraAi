@@ -173,27 +173,60 @@ class ModelManager:
                 "voice_response": "Game mode deactivated. Full assistant capabilities restored."
             }
 
-    def analyze_screen(self, prompt: str = "", dry_run: bool = False) -> Dict[str, Any]:
+    @staticmethod
+    def _get_active_window_bbox() -> Optional[tuple]:
+        """Captures the bounding box of the active foreground window on Windows."""
+        import sys
+        import ctypes
+        if sys.platform != "win32" or not hasattr(ctypes, "windll"):
+            return None
+        try:
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", ctypes.c_long),
+                    ("top", ctypes.c_long),
+                    ("right", ctypes.c_long),
+                    ("bottom", ctypes.c_long)
+                ]
+
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetForegroundWindow()
+            if not hwnd:
+                return None
+            rect = RECT()
+            if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                width = rect.right - rect.left
+                height = rect.bottom - rect.top
+                if width > 60 and height > 60:
+                    return (rect.left, rect.top, rect.right, rect.bottom)
+        except Exception as e:
+            print(f"[ActiveWindow BBox Warning]: {e}")
+        return None
+
+    def analyze_screen(self, prompt: str = "", active_window_only: bool = True, dry_run: bool = False) -> Dict[str, Any]:
         """
-        Captures the primary display and analyzes it using the local vision model profile.
+        Captures the active foreground window (or primary display) and analyzes it using the vision model profile.
         """
         clean_prompt = prompt or "Describe what you see on the screen concisely in 1-2 spoken sentences."
+        target_scope = "active window" if active_window_only else "full screen"
 
         if dry_run:
             return {
                 "status": "analyzed",
-                "vision_response": f"[Dry Run] Screen analyzed for: {clean_prompt}",
+                "scope": target_scope,
+                "vision_response": f"[Dry Run] Screen ({target_scope}) analyzed for: {clean_prompt}",
                 "voice_response": "I see your screen. Everything appears operational."
             }
 
         vision_spec = self.acquire_model("vision", dry_run=False)
         active_vision_model = vision_spec["active_model"]
 
-        # Capture primary monitor screenshot
+        # Capture cropped active window or full primary monitor screenshot
         b64_image = None
         try:
             from PIL import ImageGrab
-            screenshot = ImageGrab.grab()
+            bbox = self._get_active_window_bbox() if active_window_only else None
+            screenshot = ImageGrab.grab(bbox=bbox)
             # Downscale if wider than 1280px to preserve inference latency
             if screenshot.width > 1280:
                 scale = 1280.0 / screenshot.width

@@ -26,6 +26,12 @@ ACTION_CLAUSE_PATTERNS = [
     r"\b(?:read|analyze|search\s+in)\s+my\s+[a-zA-Z0-9_\-\s]+(?:\.pdf|\.docx|\.txt|\.py|\.md)?\b",
     r"\b(?:switch\s+to|set\s+up|activate|prepare\s+for|start|launch)\s+(?:coding|study|gaming)\s+(?:mode|workspace)\b",
     r"\b(?:pause|resume|skip|next\s+song|previous\s+song|volume\s+up|volume\s+down|lower\s+(?:the\s+)?volume|mute)\b",
+    r"\b(?:virus\s+scan|malware\s+scan|security\s+scan|scan\s+.*?\s+for\s+viruses|check\s+if\s+.*?\s+is\s+safe)\b",
+    r"\b(?:play|listen\s+to)\s+.*?\s*on\s+spotify\b",
+    r"\b(?:what\s+is\s+inside|what(?:'s|\s+is)\s+in)\s+(?:this\s+|the\s+)?(?:file|document|readme)\b",
+    r"\b(?:explain|summarize|read|tell\s+me\s+about)\s+(?:to\s+\w+\s+)?(?:what\s+is\s+inside|this\s+file|the\s+file|the\s+document|this\s+document|readme|the\s+readme)\b",
+    r"\b(?:summarize|explain)\s+(?:the\s+|this\s+)?(?:file|document|pdf|readme)\b",
+    r"\b(?:explain\s+to\s+\w+|what\s+is\s+inside\s+this\s+file)\b",
     r"\b(?:morning|daily|boot)\s+briefing\b",
     r"\bgood\s+morning\b",
     r"\bstatus\s+report\b"
@@ -43,6 +49,15 @@ class SupervisorHub:
 
     def __init__(self, llm: Optional[LocalLLM] = None):
         self.llm = llm if llm is not None else LocalLLM()
+
+    @property
+    def attached_file_path(self) -> Optional[str]:
+        return getattr(self.llm, "attached_file_path", None)
+
+    @attached_file_path.setter
+    def attached_file_path(self, path: Optional[str]):
+        if self.llm:
+            self.llm.attached_file_path = path
 
     def is_action_clause(self, text: str) -> bool:
         """Determines if a clause contains a known actionable intent keyword."""
