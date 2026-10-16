@@ -12,6 +12,12 @@ except ImportError:
     SQLITE_VEC_AVAILABLE = False
 
 try:
+    import pypdf
+    PYPDF_AVAILABLE = True
+except ImportError:
+    PYPDF_AVAILABLE = False
+
+try:
     import pymupdf
     PYMUPDF_AVAILABLE = True
 except ImportError:
@@ -29,6 +35,7 @@ except ImportError:
 
 import requests
 from tools.file_manager import FileManager
+from tools.security_scanner import SecurityScanner
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -36,9 +43,10 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 class DocumentRAGEngine:
     """
     Local Document RAG ("Chat with Your Files").
-    Combines Voidtools Everything file location, multi-format text extractors
-    (PDF via PyMuPDF, DOCX via python-docx, code/markdown via text reader),
-    sliding window chunking, and sqlite-vec vector search for grounded Q&A.
+    Combines Voidtools Everything file location, multi-layer security pre-scanning,
+    multi-format text extractors (PDF via pypdf/PyMuPDF, DOCX via python-docx,
+    code/markdown via text reader), sliding window chunking, and sqlite-vec
+    vector search for grounded Q&A.
     """
 
     def __init__(
@@ -50,6 +58,7 @@ class DocumentRAGEngine:
         dim: int = 768
     ):
         self.file_mgr = file_mgr if file_mgr is not None else FileManager()
+        self.security_scanner = SecurityScanner(file_mgr=self.file_mgr)
         self.ollama_base_url = ollama_base_url.rstrip("/")
         self.embed_model = embed_model
         self.dim = dim
@@ -138,19 +147,33 @@ class DocumentRAGEngine:
 
         # 1. PDF extraction
         if ext == ".pdf":
-            if not PYMUPDF_AVAILABLE:
-                return "Error: PyMuPDF is not installed for PDF reading."
-            try:
-                doc = pymupdf.open(file_path)
-                pages = []
-                for page in doc:
-                    txt = page.get_text()
-                    if txt:
-                        pages.append(txt)
-                doc.close()
-                return "\n\n".join(pages)
-            except Exception as e:
-                return f"Error extracting PDF: {e}"
+            if PYPDF_AVAILABLE:
+                try:
+                    reader = pypdf.PdfReader(file_path)
+                    pages = []
+                    for page in reader.pages:
+                        txt = page.extract_text()
+                        if txt:
+                            pages.append(txt)
+                    if pages:
+                        return "\n\n".join(pages)
+                except Exception as e:
+                    pass
+
+            if PYMUPDF_AVAILABLE:
+                try:
+                    doc = pymupdf.open(file_path)
+                    pages = []
+                    for page in doc:
+                        txt = page.get_text()
+                        if txt:
+                            pages.append(txt)
+                    doc.close()
+                    return "\n\n".join(pages)
+                except Exception as e:
+                    return f"Error extracting PDF: {e}"
+
+            return "Error: Neither pypdf nor PyMuPDF is available for PDF reading."
 
         # 2. DOCX extraction
         if ext in [".docx", ".doc"]:
@@ -335,19 +358,30 @@ class DocumentRAGEngine:
             all_chunks = [r[0] for r in rows]
 
             # Fast lexical relevance match
-            query_terms = set(re.findall(r"\w+", query.lower()))
+            query_lower = query.lower()
+            is_overview = any(w in query_lower for w in ["inside", "summary", "summarize", "explain", "overview", "what is this", "what's this", "what is in", "about", "content"])
+            query_terms = set(re.findall(r"\w+", query_lower)) - {"what", "is", "in", "the", "this", "file", "document", "to", "me", "mw", "and", "a", "an", "for"}
             scored = []
             for ch in all_chunks:
                 ch_terms = set(re.findall(r"\w+", ch.lower()))
                 overlap = len(query_terms.intersection(ch_terms))
                 scored.append((overlap, ch))
             scored.sort(key=lambda x: x[0], reverse=True)
-            return [item[1] for item in scored[:top_k]]
+
+            results = []
+            if is_overview and all_chunks:
+                results.append(all_chunks[0])
+            for item in scored:
+                if item[1] not in results:
+                    results.append(item[1])
+                if len(results) >= top_k:
+                    break
+            return results[:top_k]
 
         # Vector semantic KNN search via vec_chunks
         query_emb = self.embed_text(query)
         if not any(query_emb):
-            cursor.execute("SELECT content FROM chunks WHERE doc_id = ? LIMIT ?", (doc_id, top_k))
+            cursor.execute("SELECT content FROM chunks WHERE doc_id = ? ORDER BY chunk_idx ASC LIMIT ?", (doc_id, top_k))
             rows = cursor.fetchall()
             if self.db_path != ":memory:":
                 conn.close()
@@ -365,12 +399,25 @@ class DocumentRAGEngine:
             if self.db_path != ":memory:":
                 conn.close()
             if rows:
-                return [r[0] for r in rows]
+                results = [r[0] for r in rows]
+                # If overview question, ensure first chunk is present
+                query_lower = query.lower()
+                is_overview = any(w in query_lower for w in ["inside", "summary", "summarize", "explain", "overview", "what is this", "what's this", "what is in", "about", "content"])
+                if is_overview:
+                    conn2 = self._get_connection()
+                    c2 = conn2.cursor()
+                    c2.execute("SELECT content FROM chunks WHERE doc_id = ? ORDER BY chunk_idx ASC LIMIT 1", (doc_id,))
+                    first_row = c2.fetchone()
+                    if self.db_path != ":memory:":
+                        conn2.close()
+                    if first_row and first_row[0] not in results:
+                        results = [first_row[0]] + results[:top_k - 1]
+                return results[:top_k]
         except Exception as e:
             print(f"[DocumentRAG KNN Error]: {e}")
 
         # Fallback to initial chunks if vector query fails
-        cursor.execute("SELECT content FROM chunks WHERE doc_id = ? LIMIT ?", (doc_id, top_k))
+        cursor.execute("SELECT content FROM chunks WHERE doc_id = ? ORDER BY chunk_idx ASC LIMIT ?", (doc_id, top_k))
         rows = cursor.fetchall()
         if self.db_path != ":memory:":
             conn.close()
@@ -380,12 +427,13 @@ class DocumentRAGEngine:
         self,
         file_query: str,
         question: str,
+        llm_callback: Optional[Any] = None,
         dry_run: bool = False,
         llm: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
-        Locates the file using Voidtools Everything, indexes if needed,
-        retrieves matching context chunks, and synthesizes an answer.
+        Locates the file using Voidtools Everything, runs auto-security pre-scan,
+        indexes if needed, retrieves matching context chunks, and synthesizes an answer.
         """
         clean_file_q = (file_query or "").strip()
         clean_question = (question or "").strip()
@@ -410,11 +458,22 @@ class DocumentRAGEngine:
 
         file_name = os.path.basename(target_path)
 
-        # 2. Index file
+        # 2. Auto-Security Pre-Check Gate
+        sec_report = self.security_scanner.static_inspect(target_path)
+        if sec_report.get("status") in ["threat_detected", "suspicious"] or sec_report.get("is_threat") or sec_report.get("is_suspicious"):
+            return {
+                "status": sec_report.get("status", "threat_detected"),
+                "file_path": target_path,
+                "file_name": file_name,
+                "issues": sec_report.get("issues", []),
+                "voice_response": f"Security alert: Document ingestion refused for {file_name}. A high-risk security threat was detected."
+            }
+
+        # 3. Index file
         idx_res = self.index_file(target_path, dry_run=dry_run)
         doc_id = idx_res.get("doc_id", 1)
 
-        # 3. Retrieve relevant chunks
+        # 4. Retrieve relevant chunks
         chunks = self.search_relevant_chunks(
             doc_id=doc_id,
             query=clean_question or "summary",
@@ -431,8 +490,9 @@ class DocumentRAGEngine:
                 "voice_response": msg
             }
 
-        # 4. Dry-run synthesis
-        if dry_run or llm is None:
+        # 5. Dry-run synthesis
+        active_llm = llm or llm_callback
+        if dry_run or active_llm is None:
             snippet = chunks[0].replace("\n", " ").strip()
             if len(snippet) > 140:
                 snippet = snippet[:140] + "..."
@@ -446,7 +506,7 @@ class DocumentRAGEngine:
                 "voice_response": voice_resp
             }
 
-        # 5. Live LLM synthesis
+        # 6. Live LLM synthesis
         context_block = "\n---\n".join(chunks)
         system_instruction = (
             "You are an expert document assistant. Answer the user's question concisely in 1-2 spoken sentences "
@@ -455,13 +515,19 @@ class DocumentRAGEngine:
         )
         user_prompt = f"Document context:\n{context_block}\n\nQuestion: {clean_question}"
 
-        answer = llm.call_ollama(
-            model="qwen3:8b",
-            prompt=user_prompt,
-            system_prompt=system_instruction,
-            as_json=False,
-            timeout=30
-        )
+        if callable(llm_callback):
+            answer = llm_callback(user_prompt)
+        elif hasattr(active_llm, "call_ollama"):
+            answer = active_llm.call_ollama(
+                model="qwen3:8b",
+                prompt=user_prompt,
+                system_prompt=system_instruction,
+                as_json=False,
+                timeout=30
+            )
+        else:
+            answer = str(active_llm)
+
         clean_answer = (answer or "").strip()
         if not clean_answer:
             clean_answer = f"Found relevant information in {file_name} regarding your question."

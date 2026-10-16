@@ -18,7 +18,7 @@ import queue
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QTextEdit, QFrame
+    QLabel, QTextEdit, QFrame, QLineEdit, QPushButton, QFileDialog
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QRectF, QUrl
 from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QLinearGradient
@@ -33,6 +33,7 @@ from core.llm import LocalLLM
 from core.orchestrator import SupervisorHub
 from core.telemetry import profiler
 from core.text_cleaner import normalize_for_tts
+from tools.security_scanner import SecurityScanner
 
 warnings.filterwarnings("ignore")
 
@@ -100,9 +101,18 @@ class VoiceAssistantWorker(QThread):
         self.running = True
         self.interrupted = threading.Event()
         self.input_stream = None  # Holds the PyAudio input handle to clear Pylance closure warning
+        self.text_input_queue = queue.Queue()
+        self.mute_tts = False
+        self.llm = None
+        self.attached_file_path: Optional[str] = None
 
     def stop(self):
         self.running = False
+        self.interrupted.set()
+
+    def submit_text(self, text: str):
+        """Allows instant asynchronous submission of typed text commands."""
+        self.text_input_queue.put(text)
         self.interrupted.set()
 
     def run(self):
@@ -110,10 +120,16 @@ class VoiceAssistantWorker(QThread):
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         wakewords_dir = os.path.join(project_root, "assets", "wakewords")
         libra_model = os.path.join(wakewords_dir, "Hey_Libra.onnx")
+        stop_model = os.path.join(wakewords_dir, "stop.onnx")
 
-        active_models = [libra_model] if os.path.exists(libra_model) else []
+        active_models = []
+        if os.path.exists(libra_model):
+            active_models.append(libra_model)
+        if os.path.exists(stop_model):
+            active_models.append(stop_model)
+
         oww_model = Model(wakeword_models=active_models)
-        self.telemetry_update.emit("WAKEWORD", "HEY LIBRA [ONLINE]")
+        self.telemetry_update.emit("WAKEWORD", "HEY LIBRA + STOP [BARGE-IN ONLINE]")
 
         tts = KokoroTTS(voice="af_heart", device="cuda")
         self.telemetry_update.emit("TTS_ENGINE", "KOKORO-82M [CUDA]")
@@ -122,6 +138,9 @@ class VoiceAssistantWorker(QThread):
         self.telemetry_update.emit("STT_ENGINE", f"WHISPER [{stt.device.upper()}]")
 
         llm = LocalLLM()
+        if self.attached_file_path:
+            llm.attached_file_path = self.attached_file_path
+        self.llm = llm
         supervisor = SupervisorHub(llm=llm)
         self.telemetry_update.emit("LLM_CORE", "QWEN3-INSTRUCT [SUPERVISOR]")
 
@@ -141,6 +160,8 @@ class VoiceAssistantWorker(QThread):
         self.status_changed.emit("SYSTEM READY // AWAITING VOCAL PROMPT")
 
         def speak_interruptible(text_or_stream):
+            if self.mute_tts:
+                return
             if isinstance(text_or_stream, str):
                 sentences = [text_or_stream]
             else:
@@ -240,6 +261,31 @@ class VoiceAssistantWorker(QThread):
 
             # Wait until playback naturally ends or user interrupts
             while not playback_finished.is_set() and not self.interrupted.is_set():
+                if not self.text_input_queue.empty():
+                    trigger_barge_in()
+                    break
+
+                try:
+                    if self.input_stream and self.input_stream.get_read_available() >= 512:
+                        chunk_barge = self.input_stream.read(512, exception_on_overflow=False)
+                        frames_barge = ww_booster.process_chunk(chunk_barge, apply_agc=True)
+                        for f_barge in frames_barge:
+                            preds_barge = oww_model.predict(f_barge)
+                            stop_score = 0.0
+                            libra_score = 0.0
+                            for m_name, score in preds_barge.items():
+                                m_lower = str(m_name).lower()
+                                if "stop" in m_lower:
+                                    stop_score = max(stop_score, score)
+                                elif "libra" in m_lower:
+                                    libra_score = max(libra_score, score)
+
+                            if stop_score >= 0.55 or libra_score >= 0.60:
+                                print(f"\n[Voice Barge-In]: Detected wakeword during playback! (stop={stop_score:.2f}, libra={libra_score:.2f}). Cutting speech.")
+                                trigger_barge_in()
+                                break
+                except Exception:
+                    pass
                 time.sleep(0.01)
 
             if hotkey_handle:
@@ -280,109 +326,135 @@ class VoiceAssistantWorker(QThread):
         in_followup_mode = False
 
         while self.running:
-            if ww_booster.is_in_followup_window():
-                in_followup_mode = True
+            user_text = None
+            if not self.text_input_queue.empty():
+                try:
+                    user_text = self.text_input_queue.get_nowait()
+                except queue.Empty:
+                    user_text = None
 
-            if not in_followup_mode:
-                self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
-                self.visualizer_state.emit(False)
-                oww_model.reset()
-                ww_booster.reset()
+            if user_text is None:
+                if ww_booster.is_in_followup_window():
+                    in_followup_mode = True
 
-                while self.running and not in_followup_mode:
-                    audio_data = self.input_stream.read(512, exception_on_overflow=False)
+                if not in_followup_mode:
+                    self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
+                    self.visualizer_state.emit(False)
+                    oww_model.reset()
+                    ww_booster.reset()
 
-                    # Calculate live microphone RMS amplitude and emit for Three.js WebGL orb
-                    audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-                    rms = float(np.sqrt(np.mean(audio_np ** 2)))
-                    self.mic_level.emit(min(1.0, rms * 10.0))
+                    while self.running and not in_followup_mode:
+                        if not self.text_input_queue.empty():
+                            try:
+                                user_text = self.text_input_queue.get_nowait()
+                            except queue.Empty:
+                                user_text = None
+                            if user_text:
+                                break
 
-                    # 1280-sample frame alignment & AGC via WakeWordBooster
-                    frames_1280 = ww_booster.process_chunk(audio_data, apply_agc=True)
+                        audio_data = self.input_stream.read(512, exception_on_overflow=False)
 
-                    triggered = False
-                    for frame in frames_1280:
-                        prediction = oww_model.predict(frame)
-                        vad_prob = getattr(vad_detector, "last_prob", 0.0)
+                        # Calculate live microphone RMS amplitude and emit for Three.js WebGL orb
+                        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+                        rms = float(np.sqrt(np.mean(audio_np ** 2)))
+                        self.mic_level.emit(min(1.0, rms * 10.0))
 
-                        for model_name, score in prediction.items():
-                            if "libra" in str(model_name).lower():
-                                if ww_booster.is_wakeword_triggered(score, vad_prob=vad_prob):
-                                    thresh = ww_booster.get_threshold(vad_prob=vad_prob)
-                                    print(f"\n[Worker] Wake word triggered! Score: {score:.3f} (thresh: {thresh:.2f}, vad: {vad_prob:.2f})")
-                                    triggered = True
-                                    break
+                        # 1280-sample frame alignment & AGC via WakeWordBooster
+                        frames_1280 = ww_booster.process_chunk(audio_data, apply_agc=True)
+
+                        triggered = False
+                        for frame in frames_1280:
+                            prediction = oww_model.predict(frame)
+                            vad_prob = getattr(vad_detector, "last_prob", 0.0)
+
+                            for model_name, score in prediction.items():
+                                if "libra" in str(model_name).lower():
+                                    if ww_booster.is_wakeword_triggered(score, vad_prob=vad_prob):
+                                        thresh = ww_booster.get_threshold(vad_prob=vad_prob)
+                                        print(f"\n[Worker] Wake word triggered! Score: {score:.3f} (thresh: {thresh:.2f}, vad: {vad_prob:.2f})")
+                                        triggered = True
+                                        break
+                            if triggered:
+                                break
+
                         if triggered:
                             break
 
-                    if triggered:
-                        break
-
-            if not self.running:
-                break
-
-            if in_followup_mode:
-                self.status_changed.emit("CONVERSATIONAL FOLLOW-UP ACTIVE...")
-            else:
-                self.status_changed.emit("RECORDING USER INPUT...")
-
-            vad_detector.reset()
-
-            # Pre-populate with pre-roll buffer (1.0s preserved from WakeWordBooster ring buffer)
-            preroll_audio = ww_booster.get_preroll_audio()
-            if len(preroll_audio) > 0:
-                vad_detector.audio_buffer.append(preroll_audio)
-                ww_booster.clear_preroll()
-
-            followup_wait_timeout = 10.0 if in_followup_mode else 15.0
-            max_recording_time = 25.0
-            listen_start_time = time.time()
-            speech_start_time = None
-            full_audio = None
-
-            while self.running:
-                now = time.time()
-
-                if not vad_detector.has_spoken and (now - listen_start_time) > followup_wait_timeout:
-                    print("[VAD] Timeout waiting for speech.")
-                    ww_booster.clear_followup_window()
-                    in_followup_mode = False
+                if not self.running:
                     break
 
-                if vad_detector.has_spoken and speech_start_time and (now - speech_start_time) > max_recording_time:
-                    print("[VAD] Max recording duration reached.")
-                    if vad_detector.audio_buffer:
-                        full_audio = np.concatenate(vad_detector.audio_buffer, axis=0)
-                    break
+                if user_text is None:
+                    if in_followup_mode:
+                        self.status_changed.emit("CONVERSATIONAL FOLLOW-UP ACTIVE...")
+                    else:
+                        self.status_changed.emit("RECORDING USER INPUT...")
 
-                chunk = self.input_stream.read(512, exception_on_overflow=False)
-                chunk_np = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+                    vad_detector.reset()
 
-                # Live microphone RMS amplitude for Three.js WebGL orb
-                rms = float(np.sqrt(np.mean(chunk_np ** 2)))
-                self.mic_level.emit(min(1.0, rms * 10.0))
+                    # Pre-populate with pre-roll buffer (1.0s preserved from WakeWordBooster ring buffer)
+                    preroll_audio = ww_booster.get_preroll_audio()
+                    if len(preroll_audio) > 0:
+                        vad_detector.audio_buffer.append(preroll_audio)
+                        ww_booster.clear_preroll()
 
-                is_complete, audio_out = vad_detector.process_chunk(chunk)
-                if vad_detector.has_spoken and speech_start_time is None:
-                    speech_start_time = now
+                    followup_wait_timeout = 10.0 if in_followup_mode else 15.0
+                    max_recording_time = 25.0
+                    listen_start_time = time.time()
+                    speech_start_time = None
+                    full_audio = None
 
-                if is_complete and audio_out is not None:
-                    full_audio = audio_out
-                    print(f"[VAD] Speech boundary triggered (duration: {len(full_audio)/16000:.2f}s).")
-                    break
+                    while self.running:
+                        if not self.text_input_queue.empty():
+                            try:
+                                user_text = self.text_input_queue.get_nowait()
+                            except queue.Empty:
+                                user_text = None
+                            if user_text:
+                                break
 
-            if full_audio is None or len(full_audio) < 16000 * 0.3:
-                in_followup_mode = False
-                self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
-                continue
+                        now = time.time()
 
-            self.status_changed.emit("NEURAL TRANSCRIBING...")
-            with profiler.measure("STT_LATENCY"):
-                user_text = stt.transcribe(full_audio)
-            stt_latency = profiler.current_turn.get("STT_LATENCY", 0.0)
-            self.telemetry_update.emit("STT_LATENCY", f"{stt_latency:.0f} ms")
+                        if not vad_detector.has_spoken and (now - listen_start_time) > followup_wait_timeout:
+                            print("[VAD] Timeout waiting for speech.")
+                            ww_booster.clear_followup_window()
+                            in_followup_mode = False
+                            break
 
-            if not user_text.strip():
+                        if vad_detector.has_spoken and speech_start_time and (now - speech_start_time) > max_recording_time:
+                            print("[VAD] Max recording duration reached.")
+                            if vad_detector.audio_buffer:
+                                full_audio = np.concatenate(vad_detector.audio_buffer, axis=0)
+                            break
+
+                        chunk = self.input_stream.read(512, exception_on_overflow=False)
+                        chunk_np = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+
+                        # Live microphone RMS amplitude for Three.js WebGL orb
+                        rms = float(np.sqrt(np.mean(chunk_np ** 2)))
+                        self.mic_level.emit(min(1.0, rms * 10.0))
+
+                        is_complete, audio_out = vad_detector.process_chunk(chunk)
+                        if vad_detector.has_spoken and speech_start_time is None:
+                            speech_start_time = now
+
+                        if is_complete and audio_out is not None:
+                            full_audio = audio_out
+                            print(f"[VAD] Speech boundary triggered (duration: {len(full_audio)/16000:.2f}s).")
+                            break
+
+                    if user_text is None:
+                        if full_audio is None or len(full_audio) < 16000 * 0.3:
+                            in_followup_mode = False
+                            self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
+                            continue
+
+                        self.status_changed.emit("NEURAL TRANSCRIBING...")
+                        with profiler.measure("STT_LATENCY"):
+                            user_text = stt.transcribe(full_audio)
+                        stt_latency = profiler.current_turn.get("STT_LATENCY", 0.0)
+                        self.telemetry_update.emit("STT_LATENCY", f"{stt_latency:.0f} ms")
+
+            if not user_text or not user_text.strip():
                 ww_booster.clear_followup_window()
                 in_followup_mode = False
                 self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
@@ -405,7 +477,8 @@ class VoiceAssistantWorker(QThread):
             voice_msg = response_data.get("voice_response", "Understood.")
 
             self.log_received.emit("LIBRA", voice_msg)
-            speak_interruptible(voice_msg)
+            if not self.mute_tts:
+                speak_interruptible(voice_msg)
             ww_booster.set_followup_window(6.0)
             in_followup_mode = True
 
@@ -416,21 +489,26 @@ class VoiceAssistantWorker(QThread):
 
 
 class FuturisticVoiceAssistantUI(QMainWindow):
-    def __init__(self):
+    def __init__(self, start_worker: bool = True):
         super().__init__()
+        self.security_scanner = SecurityScanner()
+        self.attached_file_path: Optional[str] = None
+        self.worker = None
+        self.setAcceptDrops(True)
         self.init_ui()
-        self.init_worker()
+        if start_worker:
+            self.init_worker()
 
     def init_ui(self):
         self.setWindowTitle("LIBRA // CYBERNETIC NEURAL INTERFACE")
-        self.resize(1180, 720)
+        self.resize(1180, 780)
         self.setStyleSheet("background-color: #04070f;")
 
         central = QWidget(self)
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(20, 18, 20, 18)
-        main_layout.setSpacing(12)
+        main_layout.setSpacing(10)
 
         # 1. Header
         header = QHBoxLayout()
@@ -438,7 +516,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         title_label = QLabel("LIBRA AI // NEURAL TERMINAL")
         title_label.setFont(QFont("Consolas", 14, QFont.Weight.Bold))
         title_label.setStyleSheet("color: #00ffcc; letter-spacing: 3px;")
-        sub_label = QLabel("QUANTUM REASONING CORE // ARCHITECTURE V3.2")
+        sub_label = QLabel("QUANTUM REASONING CORE // ARCHITECTURE V4.0")
         sub_label.setFont(QFont("Consolas", 8))
         sub_label.setStyleSheet("color: #0088aa; letter-spacing: 1.5px;")
         title_box.addWidget(title_label)
@@ -543,10 +621,138 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         workspace.addLayout(right_container, stretch=7)
         main_layout.addLayout(workspace)
 
+        # 4. Status/Transcript Subtitle Label
+        self.subtitle_label = QLabel("LIBRA // SYSTEM READY — AWAITING VOCAL PROMPT, COMMAND INPUT, OR FILE DROP")
+        self.subtitle_label.setFont(QFont("Consolas", 9))
+        self.subtitle_label.setStyleSheet("""
+            background-color: #070c18; color: #38bdf8;
+            border: 1px solid #142845; border-radius: 4px;
+            padding: 6px 12px;
+        """)
+        main_layout.addWidget(self.subtitle_label)
+
+        # 5. Bottom Cyberpunk Command Bar: [📎 FILE] [ QLineEdit ] [🔊 AUDIO]
+        bottom_bar = QHBoxLayout()
+        bottom_bar.setSpacing(8)
+
+        self.attach_btn = QPushButton("📎 FILE")
+        self.attach_btn.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        self.attach_btn.setToolTip("Attach a local file (.pdf, .docx, .txt, .py) for auto-security scanning and Q&A")
+        self.attach_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0c1829; color: #00ffcc;
+                border: 1px solid #142a47; border-radius: 5px;
+                padding: 8px 14px;
+            }
+            QPushButton:hover {
+                background-color: #12253f; border-color: #00ffcc;
+            }
+        """)
+        self.attach_btn.clicked.connect(self.open_file_dialog)
+        bottom_bar.addWidget(self.attach_btn)
+
+        self.input_box = QLineEdit()
+        self.input_box.setPlaceholderText("Type a command, ask a question, or drop a file here...")
+        self.input_box.setFont(QFont("Consolas", 10))
+        self.input_box.setStyleSheet("""
+            QLineEdit {
+                background-color: #050a14; color: #f1f5f9;
+                border: 1px solid #15263f; border-radius: 5px;
+                padding: 8px 12px; selection-background-color: #00ffcc;
+                selection-color: #050a14;
+            }
+            QLineEdit:focus {
+                border: 1px solid #00ffcc;
+            }
+        """)
+        self.input_box.returnPressed.connect(self.submit_typed_text)
+        bottom_bar.addWidget(self.input_box, stretch=8)
+
+        self.mute_btn = QPushButton("🔊 AUDIO")
+        self.mute_btn.setCheckable(True)
+        self.mute_btn.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        self.mute_btn.setToolTip("Toggle silent text-only replies (Mute Kokoro TTS)")
+        self.mute_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0c1829; color: #38bdf8;
+                border: 1px solid #142a47; border-radius: 5px;
+                padding: 8px 14px;
+            }
+            QPushButton:checked {
+                background-color: #2a111b; color: #f43f5e;
+                border: 1px solid #e11d48;
+            }
+        """)
+        self.mute_btn.toggled.connect(self.toggle_mute)
+        bottom_bar.addWidget(self.mute_btn)
+
+        main_layout.addLayout(bottom_bar)
+
         timer = QTimer(self)
         timer.timeout.connect(self.update_clock)
         timer.start(1000)
         self.update_clock()
+
+    def submit_typed_text(self):
+        text = self.input_box.text().strip()
+        if not text:
+            return
+        self.input_box.clear()
+        self.subtitle_label.setText(f"USER: {text}")
+        if hasattr(self, "worker") and self.worker is not None:
+            self.worker.submit_text(text)
+        else:
+            self.append_log("USER", text)
+
+    def open_file_dialog(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Attach Document for Security Scan & Q&A",
+            "",
+            "Documents & Code (*.pdf *.docx *.txt *.py *.md *.json *.csv *.log);;All Files (*.*)"
+        )
+        if file_path:
+            self.handle_file_ingestion(file_path)
+
+    def toggle_mute(self, checked: bool):
+        if hasattr(self, "worker") and self.worker is not None:
+            self.worker.mute_tts = checked
+        self.mute_btn.setText("🔇 MUTED" if checked else "🔊 AUDIO")
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        urls = event.mimeData().urls()
+        if urls:
+            file_path = urls[0].toLocalFile()
+            if file_path and os.path.exists(file_path):
+                self.handle_file_ingestion(file_path)
+
+    def handle_file_ingestion(self, file_path: str):
+        filename = os.path.basename(file_path)
+        self.append_log("SYSTEM", f"Security scanning dropped file: {filename}...")
+
+        scan_res = self.security_scanner.scan_path(file_path, dry_run=False)
+        status = scan_res.get("status")
+
+        if status == "clean":
+            self.attached_file_path = file_path
+            if hasattr(self, "worker") and self.worker is not None:
+                self.worker.attached_file_path = file_path
+                if hasattr(self.worker, "llm") and self.worker.llm is not None:
+                    self.worker.llm.attached_file_path = file_path
+            sha = scan_res.get("sha256")
+            sha_disp = f" (SHA-256: {sha[:10]}...)" if sha else ""
+            msg = f"Scanned {filename}{sha_disp} — no threats found. Ready for questions about this file."
+            self.append_log("SECURITY", msg)
+            self.subtitle_label.setText(f"FILE ATTACHED: {filename}")
+        else:
+            primary_issue = scan_res.get("issues", ["Threat detected"])[0] if scan_res.get("issues") else "Threat detected"
+            warn_msg = f"Security Alert: Ingestion blocked for {filename} ({primary_issue})."
+            self.append_log("SECURITY", warn_msg)
+            self.subtitle_label.setText(f"SECURITY BLOCKED: {filename}")
 
     def update_clock(self):
         self.clock_label.setText(time.strftime("%H:%M:%S // %Y-%m-%d"))
@@ -587,7 +793,12 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             )
 
     def append_log(self, sender: str, msg: str):
-        color = "#00ffcc" if sender == "LIBRA" else "#fbbf24"
+        color = "#00ffcc" if sender == "LIBRA" else ("#f43f5e" if sender == "SECURITY" else "#fbbf24")
+        if sender == "LIBRA":
+            self.subtitle_label.setText(f"LIBRA: {msg[:120]}...")
+        elif sender == "USER":
+            self.subtitle_label.setText(f"USER: {msg}")
+
         html = f"""
         <div style='margin-bottom: 8px; padding: 5px 8px; background: #080d19; border-left: 3px solid {color}; border-radius: 3px;'>
             <span style='color: {color}; font-weight: bold;'>[{sender}]:</span> 
@@ -607,8 +818,9 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.worker.start()
 
     def closeEvent(self, event):
-        self.worker.stop()
-        self.worker.wait()
+        if self.worker is not None:
+            self.worker.stop()
+            self.worker.wait()
         event.accept()
 
 

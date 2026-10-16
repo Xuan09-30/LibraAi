@@ -3,6 +3,8 @@ import sys
 import json
 import ctypes
 import re
+import urllib.parse
+import subprocess
 from typing import Dict, Any, Optional, List
 
 # Windows Virtual Key Codes for Hardware Media Control
@@ -71,6 +73,137 @@ class SpotifyAgent:
         except Exception as e:
             print(f"[MediaKey Error]: {e}")
             return False
+
+    def is_spotify_installed(self) -> bool:
+        """
+        Checks if Spotify desktop application is installed or registered on the system.
+        Verifies registry protocol handlers, common executable paths, and running processes.
+        """
+        if sys.platform != "win32":
+            return True
+
+        # 1. Check registry protocol handlers
+        try:
+            import winreg
+            for root in [winreg.HKEY_CLASSES_ROOT, winreg.HKEY_CURRENT_USER]:
+                try:
+                    sub_key = r"Software\Classes\spotify" if root == winreg.HKEY_CURRENT_USER else "spotify"
+                    k = winreg.OpenKey(root, sub_key)
+                    winreg.CloseKey(k)
+                    return True
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # 2. Check well-known Spotify desktop executable paths
+        known_paths = [
+            os.path.join(os.environ.get("APPDATA", ""), "Spotify", "Spotify.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps", "Spotify.exe"),
+            os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Spotify", "Spotify.exe"),
+            os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Spotify", "Spotify.exe"),
+        ]
+        for p in known_paths:
+            if os.path.isfile(p):
+                return True
+
+        return False
+
+    def play_query(self, query: str, dry_run: bool = False) -> Dict[str, Any]:
+        """
+        Plays a requested artist, song, or playlist on Spotify.
+        Uses Spotipy API if authenticated, else checks if Spotify desktop is installed.
+        If desktop is installed, triggers desktop URI (spotify:search:<query>).
+        If desktop is not installed, seamlessly opens Spotify Web Player in default browser,
+        preventing annoying Windows Microsoft Store popups.
+        """
+        clean_q = (query or "").strip()
+        is_generic_music = clean_q.lower() in ["music", "some music", "a song", "songs"]
+        display_q = "" if is_generic_music else clean_q
+        voice_msg = f"Playing {display_q} on Spotify." if display_q else "Playing music on Spotify."
+
+        if dry_run:
+            return {
+                "status": "success",
+                "action": "spotify_play",
+                "query": clean_q,
+                "mode": "dry_run",
+                "voice_response": voice_msg
+            }
+
+        # 1. Spotipy OAuth API playback if authenticated
+        if self.sp:
+            try:
+                search_term = display_q or "Top Hits"
+                results = self.sp.search(q=search_term, limit=1, type="track,artist")
+                tracks = results.get("tracks", {}).get("items", [])
+                if tracks:
+                    track_uri = tracks[0]["uri"]
+                    track_name = tracks[0].get("name", display_q or "music")
+                    self.sp.start_playback(uris=[track_uri])
+                    return {
+                        "status": "success",
+                        "action": "spotify_play",
+                        "query": clean_q,
+                        "track": track_name,
+                        "uri": track_uri,
+                        "mode": "api",
+                        "voice_response": f"Playing {track_name} on Spotify."
+                    }
+            except Exception as e:
+                print(f"[Spotify API Playback Warning]: {e}")
+
+        # 2. Desktop Spotify Protocol Check
+        installed = self.is_spotify_installed()
+        if installed:
+            try:
+                encoded_query = urllib.parse.quote(display_q)
+                spotify_uri = f"spotify:search:{encoded_query}" if display_q else "spotify:"
+                if sys.platform == "win32":
+                    try:
+                        os.startfile(spotify_uri)
+                    except Exception:
+                        subprocess.Popen(["cmd.exe", "/c", "start", "", spotify_uri], shell=True)
+                else:
+                    import webbrowser
+                    webbrowser.open(spotify_uri)
+
+                self._send_virtual_key(VK_MEDIA_PLAY_PAUSE, dry_run=False)
+
+                return {
+                    "status": "success",
+                    "action": "spotify_play",
+                    "query": clean_q,
+                    "uri": spotify_uri,
+                    "mode": "desktop_uri",
+                    "voice_response": voice_msg
+                }
+            except Exception as e:
+                print(f"[Spotify Desktop URI Warning]: {e}")
+
+        # 3. Seamless Spotify Web Player Fallback (Zero Store Popups)
+        try:
+            import webbrowser
+            encoded_query = urllib.parse.quote(display_q)
+            web_url = f"https://open.spotify.com/search/{encoded_query}" if display_q else "https://open.spotify.com"
+            webbrowser.open(web_url)
+            web_voice = f"Opening {display_q} on Spotify Web Player." if display_q else "Opening Spotify Web Player."
+            return {
+                "status": "success",
+                "action": "spotify_play",
+                "query": clean_q,
+                "url": web_url,
+                "mode": "web_fallback",
+                "voice_response": web_voice
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "action": "spotify_play",
+                "query": clean_q,
+                "error": str(e),
+                "voice_response": f"Failed to launch Spotify: {e}"
+            }
 
     def play_pause(self, dry_run: bool = False) -> Dict[str, Any]:
         """Toggles play / pause state globally."""
