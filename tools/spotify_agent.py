@@ -293,6 +293,103 @@ class SpotifyAgent:
 
         return self.play_pause(dry_run=dry_run)
 
+    def get_now_playing(self, dry_run: bool = False) -> Dict[str, Any]:
+        """
+        Detects the currently playing track on Spotify Desktop via Win32 window title inspection
+        ('Artist - Song Title' on Spotify.exe) or Spotipy API, requiring zero paid API keys.
+        """
+        if dry_run:
+            return {
+                "status": "playing",
+                "action": "spotify_now_playing",
+                "track": "Starboy",
+                "artist": "The Weeknd",
+                "voice_response": "Currently playing Starboy by The Weeknd on Spotify."
+            }
+
+        # 1. Check Spotipy API if authenticated
+        if self.sp:
+            try:
+                playback = self.sp.current_playback()
+                if playback and playback.get("item"):
+                    item = playback["item"]
+                    track = item.get("name", "")
+                    artists = ", ".join([a["name"] for a in item.get("artists", [])])
+                    is_playing = playback.get("is_playing", False)
+                    if track:
+                        state_word = "Currently playing" if is_playing else "Paused on"
+                        return {
+                            "status": "playing" if is_playing else "paused",
+                            "action": "spotify_now_playing",
+                            "track": track,
+                            "artist": artists,
+                            "voice_response": f"{state_word} {track} by {artists} on Spotify."
+                        }
+            except Exception:
+                pass
+
+        # 2. Zero-Credential Win32 Window Title Inspection for Spotify.exe
+        if sys.platform == "win32" and hasattr(ctypes, "windll"):
+            try:
+                from ctypes import wintypes
+                import psutil
+
+                spotify_titles: List[str] = []
+                user32 = ctypes.windll.user32
+
+                def enum_proc(hwnd, lParam):
+                    if user32.IsWindowVisible(hwnd):
+                        length = user32.GetWindowTextLengthW(hwnd)
+                        if length > 0:
+                            buff = ctypes.create_unicode_buffer(length + 1)
+                            user32.GetWindowTextW(hwnd, buff, length + 1)
+                            title = buff.value.strip()
+                            if title:
+                                pid = wintypes.DWORD()
+                                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                                if pid.value > 0:
+                                    try:
+                                        proc = psutil.Process(pid.value)
+                                        if proc.name().lower() == "spotify.exe":
+                                            spotify_titles.append(title)
+                                    except Exception:
+                                        pass
+                    return True
+
+                EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+                user32.EnumWindows(EnumWindowsProc(enum_proc), 0)
+
+                for title in spotify_titles:
+                    if " - " in title and title.lower() not in ["spotify", "spotify free", "spotify premium"]:
+                        parts = title.split(" - ", 1)
+                        artist = parts[0].strip()
+                        track = parts[1].strip()
+                        return {
+                            "status": "playing",
+                            "action": "spotify_now_playing",
+                            "track": track,
+                            "artist": artist,
+                            "voice_response": f"You're listening to {track} by {artist} on Spotify."
+                        }
+                if spotify_titles:
+                    return {
+                        "status": "paused",
+                        "action": "spotify_now_playing",
+                        "track": None,
+                        "artist": None,
+                        "voice_response": "Spotify is open, but playback is currently paused."
+                    }
+            except Exception as e:
+                print(f"[Spotify NowPlaying Inspection Warning]: {e}")
+
+        return {
+            "status": "idle",
+            "action": "spotify_now_playing",
+            "track": None,
+            "artist": None,
+            "voice_response": "Spotify doesn't appear to be playing anything right now."
+        }
+
     def get_favorite_artists(self) -> List[str]:
         """Fetches top artists from active Spotify profile if Spotipy is connected."""
         if not self.sp:

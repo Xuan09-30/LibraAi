@@ -3,7 +3,7 @@ import sys
 import subprocess
 import webbrowser
 import ctypes
-
+import psutil
 
 from core.game_discovery import GameDiscoveryEngine
 
@@ -24,20 +24,22 @@ class SafeOSDispatcher:
         "roblox",
     }
 
-    CLOSABLE_ALLOWLIST = {
-        "valorant",
-        "steam",
-        "browser",
-        "chrome",
-        "spotify",
-        "discord",
-        "roblox",
-        "active",
-        "window",
-        "close_active",
-        "current window",
-        "active window",
-        "it",
+    PROTECTED_SYSTEM_PROCESSES = {
+        "explorer.exe",
+        "svchost.exe",
+        "csrss.exe",
+        "wininit.exe",
+        "winlogon.exe",
+        "lsass.exe",
+        "system",
+        "python.exe",
+        "pythonw.exe",
+        "smss.exe",
+        "services.exe",
+        "dwm.exe",
+        "fontdrvhost.exe",
+        "registry",
+        "idle",
     }
 
     BLOCKED_BINARIES = {
@@ -61,10 +63,8 @@ class SafeOSDispatcher:
         return "RiotClientServices.exe"
 
     def get_launch_spec(self, app_id: str) -> dict | None:
-        """Returns the allowlisted execution specification without running the application."""
+        """Returns the allowlisted or discovered execution specification without running the application."""
         norm = app_id.lower().strip()
-        if norm not in self.ALLOWLIST:
-            return None
 
         if norm == "valorant":
             return {
@@ -91,12 +91,56 @@ class SafeOSDispatcher:
                 "keystrokes_injected": False,
                 "passwords_stored": False,
             }
-        elif norm in ["spotify", "discord", "roblox"]:
-            uri = "roblox-player:" if norm == "roblox" else f"{norm}:"
+        elif norm == "roblox":
+            discovered_roblox = self.discovery.resolve_app("roblox") if self.discovery else None
+            if discovered_roblox:
+                return {
+                    "app_id": "roblox",
+                    "name": discovered_roblox.get("name", "Roblox"),
+                    "target": discovered_roblox.get("target", "RobloxPlayerBeta.exe"),
+                    "launch_type": discovered_roblox.get("launch_type", "executable"),
+                    "type": discovered_roblox.get("launch_type", "executable"),
+                    "installed": True,
+                    "keystrokes_injected": False,
+                    "passwords_stored": False,
+                }
+            return {
+                "app_id": "roblox",
+                "name": "Roblox",
+                "executable": r"AppData\Local\Roblox\Versions\RobloxPlayerBeta.exe",
+                "target": r"AppData\Local\Roblox\Versions\RobloxPlayerBeta.exe",
+                "launch_type": "executable",
+                "type": "executable",
+                "installed": False,
+                "keystrokes_injected": False,
+                "passwords_stored": False,
+            }
+        elif norm in ["spotify", "discord"]:
+            discovered_app = self.discovery.resolve_app(norm) if self.discovery else None
+            if discovered_app:
+                return {
+                    "app_id": norm,
+                    "name": discovered_app.get("name", norm.title()),
+                    "target": discovered_app.get("target"),
+                    "args": discovered_app.get("args", []),
+                    "launch_type": discovered_app.get("launch_type", "executable"),
+                    "type": discovered_app.get("launch_type", "executable"),
+                    "installed": True,
+                    "keystrokes_injected": False,
+                    "passwords_stored": False,
+                }
             return {
                 "app_id": norm,
-                "uri": uri,
+                "uri": f"{norm}:",
                 "type": "protocol",
+                "keystrokes_injected": False,
+                "passwords_stored": False,
+            }
+
+        if norm in self.ALLOWLIST:
+            return {
+                "app_id": norm,
+                "type": "executable",
                 "keystrokes_injected": False,
                 "passwords_stored": False,
             }
@@ -143,7 +187,35 @@ class SafeOSDispatcher:
             elif norm == "browser":
                 webbrowser.open(spec["target"])
                 return True, "Opening default browser."
-            elif norm in ["spotify", "discord", "roblox"]:
+            elif norm == "roblox":
+                if not spec.get("installed", False):
+                    return (
+                        False,
+                        "I searched your Start Menu, Steam, and AppData folders, but Roblox doesn't appear to be installed on this PC.",
+                    )
+                target = spec.get("target")
+                l_type = spec.get("launch_type", "executable")
+                if l_type == "uwp" or (target and target.startswith("shell:AppsFolder")):
+                    subprocess.Popen(["explorer.exe", target], close_fds=True)
+                elif l_type == "lnk" or (target and target.endswith(".lnk")):
+                    subprocess.Popen(["explorer.exe", target], close_fds=True)
+                else:
+                    cwd = os.path.dirname(target) if target and os.path.exists(target) else None
+                    subprocess.Popen([target], cwd=cwd, env=clean_env, creationflags=creationflags, close_fds=True)
+                return True, "Launching Roblox."
+            elif norm in ["spotify", "discord"]:
+                if spec.get("target"):
+                    target = spec["target"]
+                    l_type = spec.get("launch_type", "executable")
+                    args = spec.get("args", [])
+                    if l_type == "uwp" or target.startswith("shell:AppsFolder"):
+                        subprocess.Popen(["explorer.exe", target], close_fds=True)
+                    elif l_type == "lnk" or target.endswith(".lnk"):
+                        subprocess.Popen(["explorer.exe", target], close_fds=True)
+                    else:
+                        cwd = os.path.dirname(target) if os.path.exists(target) else None
+                        subprocess.Popen([target] + args, cwd=cwd, env=clean_env, creationflags=creationflags, close_fds=True)
+                    return True, f"Launching {norm.title()}."
                 uri = spec["uri"]
                 if sys.platform == "win32":
                     subprocess.Popen(["explorer.exe", uri], close_fds=True)
@@ -199,8 +271,15 @@ class SafeOSDispatcher:
                 if sys.platform == "win32":
                     creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
 
+                # 0. Windows UWP / shell:AppsFolder targets
+                if launch_type == "uwp" or (target and target.startswith("shell:AppsFolder")):
+                    if sys.platform == "win32":
+                        subprocess.Popen(["explorer.exe", target], close_fds=True)
+                        return True, f"Launching {app_name}."
+                    return False, f"UWP launch is only supported on Windows."
+
                 # 1. Steam URI or URI protocols (Detached via explorer.exe)
-                if launch_type == "uri" or (target and target.startswith("steam://")) or (target and target.endswith(".url")):
+                elif launch_type == "uri" or (target and target.startswith("steam://")) or (target and target.endswith(".url")):
                     uri_target = target
                     if target.endswith(".url") and os.path.isfile(target):
                         try:
@@ -211,6 +290,13 @@ class SafeOSDispatcher:
                                         break
                         except Exception:
                             pass
+
+                    # Never launch broken ms-windows-store or bare roblox URIs
+                    if uri_target.lower().startswith(("ms-windows-store:", "roblox:", "roblox-player:")):
+                        return (
+                            False,
+                            f"I searched your Start Menu, Steam, and AppData folders, but {app_name} doesn't appear to be installed on this PC.",
+                        )
 
                     if sys.platform == "win32":
                         subprocess.Popen(["explorer.exe", uri_target], close_fds=True)
@@ -245,7 +331,10 @@ class SafeOSDispatcher:
             except Exception as e:
                 return False, f"Failed to launch {app_name}: {e}"
 
-        return False, f"Application '{app_id}' is not in the approved safety allowlist."
+        return (
+            False,
+            f"Application '{app_id}' is not in the approved safety allowlist or was not found in your Start Menu, Steam, or AppData folders.",
+        )
 
     def close_active_window(self, dry_run: bool = False) -> tuple[bool, str]:
         """Safely closes or minimizes the foreground window using Win32 API."""
@@ -266,35 +355,58 @@ class SafeOSDispatcher:
             return False, f"Error closing active window: {e}"
 
     def close_app(self, target: str, dry_run: bool = False) -> tuple[bool, str]:
-        """Closes an allowlisted application or the active foreground window."""
-        norm = target.lower().strip().replace(".exe", "")
+        """
+        Closes any named user application via psutil process matching or closes the active foreground window,
+        while strictly protecting critical Windows and Python system processes.
+        """
+        raw_norm = target.lower().strip()
+        norm = raw_norm.replace(".exe", "").strip()
 
         if norm in ["active", "close_active", "window", "it", "current window", "active window"]:
             return self.close_active_window(dry_run=dry_run)
 
-        if norm not in self.CLOSABLE_ALLOWLIST:
-            return False, f"Application '{target}' is not in the approved safety allowlist for termination."
+        # Protect critical Windows & Python system processes
+        candidate_exe = f"{norm}.exe"
+        if raw_norm in self.PROTECTED_SYSTEM_PROCESSES or candidate_exe in self.PROTECTED_SYSTEM_PROCESSES or norm in self.PROTECTED_SYSTEM_PROCESSES:
+            return False, f"Process '{target}' is a protected critical system process and cannot be terminated."
 
         if dry_run:
-            return True, f"Allowlisted termination signal prepared for {norm}."
+            return True, f"Termination signal prepared for {norm}."
 
         aliases = {
-            "valorant": "VALORANT.exe",
-            "steam": "steam.exe",
-            "browser": "chrome.exe",
-            "chrome": "chrome.exe",
-            "spotify": "Spotify.exe",
-            "discord": "Discord.exe",
-            "roblox": "RobloxPlayerBeta.exe",
+            "valorant": ["valorant.exe", "valorant-win64-shipping.exe"],
+            "steam": ["steam.exe"],
+            "browser": ["chrome.exe", "msedge.exe", "firefox.exe", "brave.exe"],
+            "chrome": ["chrome.exe"],
+            "spotify": ["spotify.exe"],
+            "discord": ["discord.exe"],
+            "roblox": ["robloxplayerbeta.exe", "robloxplayerlauncher.exe", "windows10universal.exe"],
+            "notepad": ["notepad.exe"],
+            "vscode": ["code.exe"],
+            "vs code": ["code.exe"],
+            "calculator": ["calculatorapp.exe", "calc.exe"],
         }
-        proc_name = aliases.get(norm, f"{norm}.exe")
+        target_names = set(aliases.get(norm, [candidate_exe, norm]))
+
+        terminated_count = 0
         try:
-            res = subprocess.run(["taskkill", "/F", "/IM", proc_name, "/T"], capture_output=True, text=True)
-            if res.returncode == 0:
-                return True, f"Closed {target.title()}."
-            return False, f"No active process found for {target.title()}."
+            for proc in psutil.process_iter(["name", "pid"]):
+                try:
+                    pname = (proc.info.get("name") or "").lower().strip()
+                    if not pname or pname in self.PROTECTED_SYSTEM_PROCESSES:
+                        continue
+                    pname_stem = pname.replace(".exe", "")
+                    if pname in target_names or pname_stem == norm or (len(norm) >= 4 and norm in pname_stem):
+                        proc.terminate()
+                        terminated_count += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
         except Exception as e:
             return False, f"Failed to close {target}: {e}"
+
+        if terminated_count > 0:
+            return True, f"Closed {target.title()} ({terminated_count} process{'es' if terminated_count > 1 else ''} terminated)."
+        return False, f"No active running process found for {target.title()}."
 
     def request_shutdown(self, confirmed: bool = False, dry_run: bool = False) -> tuple[bool, str]:
         """
