@@ -1,0 +1,51 @@
+{
+  "mcpServers": {
+    "sqlite_memory": {
+      "command": "python",
+      "args": ["-m", "sqlite3", "assets/libra_memory.db"],
+      "enabled": false,
+      "description": "Local SQLite MCP connector",
+      "tools": [
+        {
+          "name": "list_tables",
+          "description": "List all tables in a SQLite database",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "db_path": { "type": "string", "description": "Database path" }
+            }
+          }
+        }
+      ]
+    },
+    "workspace_filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "enabled": false,
+      "description": "Local workspace filesystem MCP server",
+      "tools": [
+        {
+          "name": "read_project_file",
+          "description": "Read a text file relative to the project root",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "path": { "type": "string", "description": "Relative file path" }
+            },
+            "required": ["path"]
+          }
+        },
+        {
+          "name": "list_directory",
+          "description": "List contents of a project directory",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "path": { "type": "string", "description": "Relative directory path" }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

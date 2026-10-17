@@ -4,6 +4,17 @@ import subprocess
 import webbrowser
 import urllib.parse
 
+from core.dispatcher import SafeOSDispatcher
+
+_DISPATCHER_INSTANCE = None
+
+
+def _get_dispatcher() -> SafeOSDispatcher:
+    global _DISPATCHER_INSTANCE
+    if _DISPATCHER_INSTANCE is None:
+        _DISPATCHER_INSTANCE = SafeOSDispatcher()
+    return _DISPATCHER_INSTANCE
+
 
 def get_installed_shortcuts():
     """Scans Windows Start Menu directories for installed application shortcuts."""
@@ -23,106 +34,42 @@ def get_installed_shortcuts():
     return apps
 
 
-def launch_any_application(target_name: str) -> tuple[bool, str]:
-    """Dynamically finds and launches any installed Windows application or game."""
+def launch_any_application(target_name: str, dry_run: bool = False) -> tuple[bool, str]:
+    """
+    Dynamically finds and launches any installed Windows application or game
+    via SafeOSDispatcher and GameDiscoveryEngine (never emitting bare roblox-player:
+    or ms-windows-store: popups).
+    """
+    disp = _get_dispatcher()
+    ok, msg = disp.launch_app(target_name, dry_run=dry_run)
+    if ok:
+        return ok, msg
+
     target = target_name.lower().strip()
-
-    # 1. Direct Game/App Protocol URI Handlers (Bypasses shortcut scanning entirely)
-    protocol_map = {
-        "roblox": "roblox-player:",
-        "roblox player": "roblox-player:",
-        "spotify": "spotify:",
-        "steam": "steam:",
-        "discord": "discord:",
-    }
-
-    if target in protocol_map:
-        try:
-            subprocess.Popen(f'start "" "{protocol_map[target]}"', shell=True)
-            return True, f"Launching {target.title()}."
-        except Exception as e:
-            print(f"[Protocol Launch Failed]: {e}")
-
-    # 2. Check Start Menu Shortcuts (.lnk)
-    installed_apps = get_installed_shortcuts()
-    for app_name, path in installed_apps.items():
-        if target in app_name or app_name in target:
-            try:
-                subprocess.Popen(f'start "" "{path}"', shell=True)
-                return True, f"Launching {app_name.title()}."
-            except Exception as e:
-                print(f"[Shell Start Error]: {e}")
-                try:
-                    os.startfile(path)
-                    return True, f"Launching {app_name.title()}."
-                except Exception as ex:
-                    print(f"[Fallback startfile Error]: {ex}")
-
-    # 3. Known Common Launcher Folders and Executable Locations
-    common_roots = [
-        os.path.expandvars(r"%LOCALAPPDATA%\Programs"),
-        os.path.expandvars(r"%LOCALAPPDATA%"),
-        os.path.expandvars(r"%APPDATA%"),
-        os.path.expandvars(r"%PROGRAMFILES%"),
-        os.path.expandvars(r"%PROGRAMFILES(X86)%"),
-        r"C:\Riot Games",
-    ]
-    for root in common_roots:
-        if os.path.exists(root):
-            matches = glob.glob(f"{root}/**/{target}*.exe", recursive=True)
-            if matches:
-                try:
-                    subprocess.Popen(f'start "" "{matches[0]}"', shell=True)
-                    return True, f"Launching {target.title()}."
-                except Exception as e:
-                    print(f"[Executable Launch Error]: {e}")
-
-    # 4. Built-in Windows Utilities & Commands (calc, notepad, cmd)
-    built_in_tools = ["notepad", "calc", "calculator", "cmd", "explorer", "taskmgr", "regedit"]
+    built_in_tools = ["notepad", "calc", "calculator", "explorer", "taskmgr"]
     if target in built_in_tools:
+        if dry_run:
+            return True, f"Launching {target.title()}."
         try:
-            subprocess.Popen(f'start "" "{target}"', shell=True)
+            subprocess.Popen([target], close_fds=True)
             return True, f"Launching {target.title()}."
         except Exception as e:
-            print(f"[Built-in Launch Error]: {e}")
+            return False, f"Failed to launch {target}: {e}"
 
-    return False, f"I could not locate an application named {target_name.title()} on your system."
+    return ok, msg
 
 
-def close_any_application(target_name: str) -> tuple[bool, str]:
-    """Forcefully terminates an application process matching the target name."""
-    clean_target = target_name.lower().replace(".exe", "").strip()
-
-    aliases = {
-        "spotify": "Spotify.exe",
-        "valorant": "VALORANT.exe",
-        "roblox": "RobloxPlayerBeta.exe",
-        "roblox player": "RobloxPlayerBeta.exe",
-        "modrinth": "Modrinth App.exe",
-        "modrinth app": "Modrinth App.exe",
-        "riot client": "RiotClientServices.exe",
-        "discord": "Discord.exe",
-        "chrome": "chrome.exe",
-        "steam": "steam.exe",
-        "notepad": "notepad.exe",
-        "calculator": "CalculatorApp.exe",
-    }
-
-    proc_name = aliases.get(clean_target, f"{clean_target}.exe")
-
-    try:
-        res = subprocess.run(["taskkill", "/F", "/IM", proc_name, "/T"], capture_output=True, text=True)
-        if res.returncode == 0:
-            return True, f"Closed {target_name.title()}."
-        return False, f"I could not locate an active process for {target_name.title()}."
-    except Exception as e:
-        return False, f"Failed to close {target_name}: {e}"
+def close_any_application(target_name: str, dry_run: bool = False) -> tuple[bool, str]:
+    """Safely terminates a named user application via SafeOSDispatcher."""
+    disp = _get_dispatcher()
+    return disp.close_app(target_name, dry_run=dry_run)
 
 
 def find_and_open_file(target_file: str) -> tuple[bool, str]:
     """Searches common user directories and opens matching files."""
     search_dirs = [
         os.path.expanduser("~/Desktop"),
+        os.path.expanduser("~/OneDrive/Desktop"),
         os.path.expanduser("~/Documents"),
         os.path.expanduser("~/Downloads"),
     ]
@@ -135,7 +82,7 @@ def find_and_open_file(target_file: str) -> tuple[bool, str]:
                     if target_clean in file.lower():
                         full_path = os.path.join(root, file)
                         try:
-                            subprocess.Popen(f'start "" "{full_path}"', shell=True)
+                            subprocess.Popen(["explorer.exe", full_path], close_fds=True)
                             return True, f"Opening {file}."
                         except Exception as e:
                             return False, f"Error opening file: {e}"

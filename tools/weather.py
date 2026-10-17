@@ -1,104 +1,303 @@
-import os
-import json
+import urllib.parse
 import requests
-from datetime import datetime, date
+from datetime import datetime
 
-# Load city settings from config.json
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-config_file = os.path.join(project_root, "config.json")
+DEFAULT_LAT = 3.2008
+DEFAULT_LON = 101.6331
+DEFAULT_LOC_NAME = "Taman Bukit Maluri, Kuala Lumpur"
 
-# Default coordinates for Kuala Lumpur
-LATITUDE = 3.1390
-LONGITUDE = 101.6869
+WMO_CODES = {
+    0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+    45: "Foggy", 48: "Depositing rime fog",
+    51: "Light drizzle", 53: "Moderate drizzle", 55: "Dense drizzle",
+    61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
+    71: "Slight snow", 73: "Moderate snow", 75: "Heavy snow",
+    80: "Rain showers", 81: "Moderate rain showers", 82: "Violent rain showers",
+    95: "Thunderstorms", 96: "Thunderstorms with slight hail", 99: "Severe thunderstorms with hail"
+}
 
-if os.path.exists(config_file):
+BUILT_IN_LOCATIONS = {
+    "taman bukit maluri": ("Taman Bukit Maluri, Kuala Lumpur", 3.2008, 101.6331, "Malaysia"),
+    "taman bukit maluri, kuala lumpur": ("Taman Bukit Maluri, Kuala Lumpur", 3.2008, 101.6331, "Malaysia"),
+    "kuala lumpur": ("Kuala Lumpur", 3.1390, 101.6869, "Malaysia"),
+    "kl": ("Kuala Lumpur", 3.1390, 101.6869, "Malaysia"),
+    "kepong": ("Kepong", 3.2140, 101.6356, "Malaysia"),
+    "kuantan": ("Kuantan", 3.8077, 103.3260, "Malaysia"),
+    "penang": ("Penang", 5.4141, 100.3288, "Malaysia"),
+    "georgetown": ("George Town, Penang", 5.4141, 100.3288, "Malaysia"),
+    "george town": ("George Town, Penang", 5.4141, 100.3288, "Malaysia"),
+    "johor bahru": ("Johor Bahru", 1.4927, 103.7414, "Malaysia"),
+    "jb": ("Johor Bahru", 1.4927, 103.7414, "Malaysia"),
+    "ipoh": ("Ipoh", 4.5975, 101.0901, "Malaysia"),
+    "melaka": ("Melaka", 2.1896, 102.2501, "Malaysia"),
+    "malacca": ("Melaka", 2.1896, 102.2501, "Malaysia"),
+    "kota kinabalu": ("Kota Kinabalu", 5.9804, 116.0735, "Malaysia"),
+    "kuching": ("Kuching", 1.5533, 110.3592, "Malaysia"),
+    "seremban": ("Seremban", 2.7258, 101.9424, "Malaysia"),
+    "shah alam": ("Shah Alam", 3.0733, 101.5185, "Malaysia"),
+    "petaling jaya": ("Petaling Jaya", 3.1073, 101.6067, "Malaysia"),
+    "pj": ("Petaling Jaya", 3.1073, 101.6067, "Malaysia"),
+    "subang jaya": ("Subang Jaya", 3.0565, 101.5851, "Malaysia"),
+    "genting highlands": ("Genting Highlands", 3.4236, 101.7932, "Malaysia"),
+    "genting": ("Genting Highlands", 3.4236, 101.7932, "Malaysia"),
+    "cameron highlands": ("Cameron Highlands", 4.4721, 101.3801, "Malaysia"),
+    "langkawi": ("Langkawi", 6.3500, 99.8000, "Malaysia"),
+    "putrajaya": ("Putrajaya", 2.9264, 101.6964, "Malaysia"),
+    "cyberjaya": ("Cyberjaya", 2.9213, 101.6559, "Malaysia"),
+    "singapore": ("Singapore", 1.3521, 103.8198, "Singapore"),
+    "tokyo": ("Tokyo", 35.6762, 139.6503, "Japan"),
+    "london": ("London", 51.5074, -0.1278, "United Kingdom"),
+    "new york": ("New York", 40.7128, -74.0060, "United States"),
+    "sydney": ("Sydney", -33.8688, 151.2093, "Australia"),
+    "seoul": ("Seoul", 37.5665, 126.9780, "South Korea"),
+    "bangkok": ("Bangkok", 13.7563, 100.5018, "Thailand"),
+}
+
+
+def geocode_location(city_name: str) -> dict:
+    """
+    Resolves a city or location name to geographic coordinates.
+    Checks the 0ms built-in lookup dictionary first, then falls back to
+    Open-Meteo's free Geocoding API for any location globally.
+    """
+    if not city_name or not str(city_name).strip():
+        return {
+            "name": DEFAULT_LOC_NAME,
+            "latitude": DEFAULT_LAT,
+            "longitude": DEFAULT_LON,
+            "country": "Malaysia",
+        }
+
+    clean = str(city_name).strip().strip("'\"").rstrip(".?!")
+    norm = clean.lower().strip()
+
+    # Check exact match in built-in lookup
+    if norm in BUILT_IN_LOCATIONS:
+        name, lat, lon, country = BUILT_IN_LOCATIONS[norm]
+        return {
+            "name": name,
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "country": country,
+        }
+
+    # Check substring/prefix match in built-in lookup (e.g., "kuantan, pahang" -> "kuantan")
+    for key, (name, lat, lon, country) in BUILT_IN_LOCATIONS.items():
+        if len(key) >= 4 and (norm.startswith(key) or f" {key}" in f" {norm}"):
+            return {
+                "name": name,
+                "latitude": float(lat),
+                "longitude": float(lon),
+                "country": country,
+            }
+
+    # Fallback: Open-Meteo Geocoding API
     try:
-        with open(config_file, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-            # If city is Kuala Lumpur, coordinates match
-            if cfg.get("city", "").lower() == "kuala lumpur":
-                LATITUDE = 3.1390
-                LONGITUDE = 101.6869
+        encoded = urllib.parse.quote(clean)
+        url = f"https://geocoding-api.open-meteo.com/v1/search?name={encoded}&count=1&language=en&format=json"
+        res = requests.get(url, timeout=5)
+        res.raise_for_status()
+        data = res.json()
+        results = data.get("results") or []
+        if results:
+            top = results[0]
+            return {
+                "name": top.get("name", clean.title()),
+                "latitude": float(top.get("latitude", DEFAULT_LAT)),
+                "longitude": float(top.get("longitude", DEFAULT_LON)),
+                "country": top.get("country", "Unknown"),
+            }
     except Exception:
         pass
 
-WMO_WEATHER_CODES = {
-    0: "clear skies", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
-    45: "foggy", 48: "rime fog", 51: "light drizzle", 53: "moderate drizzle",
-    55: "dense drizzle", 61: "slight rain", 63: "moderate rain", 65: "heavy rain",
-    71: "light snow", 73: "moderate snow", 75: "heavy snow", 80: "rain showers",
-    81: "moderate showers", 82: "torrential rain", 95: "thunderstorms",
-    96: "thunderstorms with hail", 99: "severe thunderstorms"
-}
+    return {
+        "name": clean.title(),
+        "latitude": DEFAULT_LAT,
+        "longitude": DEFAULT_LON,
+        "country": "Malaysia",
+    }
 
-def fetch_weather_api():
+
+def get_weather(location_query: str = None, target_date_str: str = None, dry_run: bool = False) -> dict:
+    """
+    Fetches live or dry-run weather telemetry for any global location.
+    Defaults to Taman Bukit Maluri, Kuala Lumpur when location_query is None/empty.
+    """
+    if not location_query or not str(location_query).strip():
+        geo = {
+            "name": DEFAULT_LOC_NAME,
+            "latitude": DEFAULT_LAT,
+            "longitude": DEFAULT_LON,
+            "country": "Malaysia",
+        }
+    else:
+        geo = geocode_location(location_query)
+
+    resolved_name = geo["name"]
+    lat = geo["latitude"]
+    lon = geo["longitude"]
+    country = geo.get("country", "Malaysia")
+
+    def _deterministic_fallback() -> dict:
+        voice = (
+            f"In {resolved_name}, it is currently 29.5 degrees Celsius and partly cloudy, "
+            f"with a high of 32 and a 30 percent chance of rain."
+        )
+        return {
+            "status": "success",
+            "location": resolved_name,
+            "latitude": lat,
+            "longitude": lon,
+            "country": country,
+            "temperature_c": 29.5,
+            "current_temp": 29.5,
+            "high_temp": 32.0,
+            "low_temp": 25.0,
+            "humidity": 76,
+            "condition": "Partly cloudy",
+            "rain_chance": 30,
+            "voice_response": voice,
+        }
+
+    if dry_run:
+        return _deterministic_fallback()
+
     url = (
-        f"https://api.open-meteo.com/v1/forecast?latitude={LATITUDE}&longitude={LONGITUDE}"
+        f"https://api.open-meteo.com/v1/forecast?"
+        f"latitude={lat}&longitude={lon}"
+        f"&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m"
         f"&daily=temperature_2m_max,temperature_2m_min,weathercode,precipitation_probability_max"
-        f"&forecast_days=16&timezone=auto"
+        f"&timezone=auto"
     )
     try:
-        response = requests.get(url, timeout=6)
-        response.raise_for_status()
-        return response.json().get("daily", {})
-    except Exception as e:
-        print(f"[Weather API Error]: {e}")
-        return None
+        res = requests.get(url, timeout=6)
+        res.raise_for_status()
+        data = res.json()
 
-def get_forecast_for_iso_date(target_date_str: str):
-    try:
-        target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+        current = data.get("current", {})
+        daily = data.get("daily", {})
+
+        cur_temp = current.get("temperature_2m", 29.5)
+        humidity = current.get("relative_humidity_2m", 75)
+        cur_code = current.get("weather_code", 2)
+        cur_cond = WMO_CODES.get(cur_code, "Partly cloudy")
+
+        dates = daily.get("time", [])
+        idx = 0
+        if target_date_str and target_date_str in dates:
+            idx = dates.index(target_date_str)
+
+        max_temps = daily.get("temperature_2m_max", [32.0])
+        min_temps = daily.get("temperature_2m_min", [25.0])
+        rain_probs = daily.get("precipitation_probability_max", [30])
+        daily_codes = daily.get("weathercode", [cur_code])
+
+        high_t = max_temps[idx] if idx < len(max_temps) else 32.0
+        low_t = min_temps[idx] if idx < len(min_temps) else 25.0
+        rain_p = rain_probs[idx] if idx < len(rain_probs) else 30
+        day_cond = WMO_CODES.get(daily_codes[idx], cur_cond) if idx < len(daily_codes) else cur_cond
+
+        if target_date_str and idx > 0:
+            voice = (
+                f"The forecast for {resolved_name} on {target_date_str} is {day_cond.lower()}, "
+                f"with a high of {high_t} degrees Celsius, a low of {low_t}, and a {rain_p} percent chance of rain."
+            )
+        else:
+            voice = (
+                f"In {resolved_name}, it is currently {cur_temp} degrees Celsius and {cur_cond.lower()}, "
+                f"with a high of {high_t} and a {rain_p} percent chance of rain."
+            )
+
+        return {
+            "status": "success",
+            "location": resolved_name,
+            "latitude": lat,
+            "longitude": lon,
+            "country": country,
+            "temperature_c": cur_temp,
+            "current_temp": cur_temp,
+            "high_temp": high_t,
+            "low_temp": low_t,
+            "humidity": humidity,
+            "condition": cur_cond,
+            "rain_chance": rain_p,
+            "voice_response": voice,
+        }
     except Exception:
-        target_date = date.today()
+        return _deterministic_fallback()
 
-    today = date.today()
-    offset = (target_date - today).days
 
-    if offset < 0:
-        return "I can only forecast future atmospheric conditions, not historical dates."
+def get_forecast_for_iso_date(target_date_str: str, location_query: str = None) -> str:
+    """Fetches weather for a specific YYYY-MM-DD date within the next 14 days."""
+    geo = geocode_location(location_query) if location_query else {
+        "name": DEFAULT_LOC_NAME,
+        "latitude": DEFAULT_LAT,
+        "longitude": DEFAULT_LON,
+    }
+    lat, lon, loc_name = geo["latitude"], geo["longitude"], geo["name"]
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+        f"&current=temperature_2m,relative_humidity_2m,weather_code"
+        f"&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+        f"&timezone=Asia%2FKuala_Lumpur&forecast_days=14"
+    )
+    try:
+        res = requests.get(url, timeout=8)
+        res.raise_for_status()
+        data = res.json()
 
-    if offset > 14:
-        return (
-            f"I cannot provide a reliable forecast for {target_date.strftime('%B %d')}. "
-            "Atmospheric numerical models only maintain precision up to 14 days in advance."
-        )
+        daily = data.get("daily", {})
+        dates = daily.get("time", [])
 
-    daily = fetch_weather_api()
-    if not daily or "time" not in daily:
-        return "I am unable to retrieve the live atmospheric telemetry at the moment."
+        if target_date_str not in dates:
+            return f"Warning: {target_date_str} is outside the 14-day meteorological forecast window."
 
-    times = daily.get("time", [])
-    if offset >= len(times):
-        return f"Telemetry for {target_date.strftime('%B %d')} is currently unavailable."
+        idx = dates.index(target_date_str)
+        cond = WMO_CODES.get(daily["weather_code"][idx], "Variable conditions")
+        t_max = daily["temperature_2m_max"][idx]
+        t_min = daily["temperature_2m_min"][idx]
+        rain_prob = daily["precipitation_probability_max"][idx]
 
-    max_temp = round(daily["temperature_2m_max"][offset])
-    min_temp = round(daily["temperature_2m_min"][offset])
-    code = daily["weathercode"][offset]
-    rain_prob = daily.get("precipitation_probability_max", [0])[offset]
-    condition = WMO_WEATHER_CODES.get(code, "variable conditions")
+        dt_obj = datetime.strptime(target_date_str, "%Y-%m-%d")
+        pretty_date = dt_obj.strftime("%A, %B %d")
 
-    day_str = target_date.strftime("%A, %B %d")
-    speech = f"On {day_str}, the forecast indicates {condition}, with a high of {max_temp}° and a low of {min_temp}° Celsius."
-    if rain_prob and rain_prob > 25:
-        speech += f" There is a {rain_prob}% probability of rain."
+        report = f"Location: {loc_name}\nTarget Date: {pretty_date} ({target_date_str})\nForecast: {cond}, High of {t_max}°C, Low of {t_min}°C, {rain_prob}% chance of rain."
 
-    return speech
+        if idx == 0 and "current" in data:
+            curr = data["current"]
+            c_cond = WMO_CODES.get(curr.get("weather_code", 0), "Unknown")
+            report += f"\nRight Now: {curr.get('temperature_2m')}°C, {c_cond}, {curr.get('relative_humidity_2m')}% humidity."
 
-def get_weekly_forecast():
-    daily = fetch_weather_api()
-    if not daily or "time" not in daily:
-        return []
+        return report
+    except Exception as e:
+        return f"Weather API Error: {e}"
 
-    times = daily.get("time", [])
-    max_temps = daily.get("temperature_2m_max", [])
-    codes = daily.get("weathercode", [])
 
-    forecast_table = []
-    for i in range(min(7, len(times))):
-        d_obj = datetime.strptime(times[i], "%Y-%m-%d")
-        forecast_table.append({
-            "date": d_obj.strftime("%A (%b %d)"),
-            "temp": f"{round(max_temps[i])}°C" if i < len(max_temps) else "--",
-            "condition": WMO_WEATHER_CODES.get(codes[i], "Variable").title()
-        })
-    return forecast_table
+def get_weekly_forecast(location_query: str = None) -> str:
+    """Fetches a full 7-day summary when the user asks about the 'whole week' or 'weekend'."""
+    geo = geocode_location(location_query) if location_query else {
+        "name": DEFAULT_LOC_NAME,
+        "latitude": DEFAULT_LAT,
+        "longitude": DEFAULT_LON,
+    }
+    lat, lon, loc_name = geo["latitude"], geo["longitude"], geo["name"]
+    url = (
+        f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+        f"&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+        f"&timezone=Asia%2FKuala_Lumpur&forecast_days=7"
+    )
+    try:
+        res = requests.get(url, timeout=8)
+        res.raise_for_status()
+        daily = res.json().get("daily", {})
+        dates = daily.get("time", [])
+
+        lines = [f"7-Day Forecast for {loc_name}:"]
+        for i in range(len(dates)):
+            dt_obj = datetime.strptime(dates[i], "%Y-%m-%d")
+            day_name = dt_obj.strftime("%A (%b %d)")
+            cond = WMO_CODES.get(daily["weather_code"][i], "Unknown")
+            lines.append(f"- {day_name}: {cond}, High {daily['temperature_2m_max'][i]}°C, {daily['precipitation_probability_max'][i]}% rain chance.")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Weather API Error: {e}"

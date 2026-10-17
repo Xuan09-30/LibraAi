@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import sqlite3
 import sqlite_vec
@@ -107,6 +108,25 @@ class SemanticMemory:
         cursor.execute(f"""
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
                 episode_id INTEGER PRIMARY KEY,
+                embedding float[{self.dim}] distance_metric=cosine
+            )
+        """)
+
+        # 6. Counterfactual correction lessons table (v8.0)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS lessons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                context_trigger TEXT NOT NULL,
+                error_action TEXT NOT NULL,
+                corrected_action TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 7. Vector virtual table for lessons using vec0 (v8.0)
+        cursor.execute(f"""
+            CREATE VIRTUAL TABLE IF NOT EXISTS vec_lessons USING vec0(
+                lesson_id INTEGER PRIMARY KEY,
                 embedding float[{self.dim}] distance_metric=cosine
             )
         """)
@@ -411,6 +431,145 @@ class SemanticMemory:
         conn.commit()
         if self.db_path != ":memory:":
             conn.close()
+
+    def record_correction(self, trigger_query: str, mistake: str, correction: str) -> int:
+        """
+        Counterfactual Correction Memory (v8.0):
+        Records an explicit user operational correction in `lessons`, indexes its vector
+        in `vec_lessons`, and appends a structured rule entry to `assets/LESSONS.md`.
+        """
+        clean_trigger = (trigger_query or "").strip()
+        clean_mistake = (mistake or "").strip()
+        clean_correction = (correction or "").strip()
+        if not clean_trigger or not clean_correction:
+            return -1
+
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        lessons_md_path = os.path.join(project_root, "assets", "LESSONS.md")
+        os.makedirs(os.path.dirname(lessons_md_path), exist_ok=True)
+        if not os.path.isfile(lessons_md_path):
+            with open(lessons_md_path, "w", encoding="utf-8") as f:
+                f.write("# Project Libra — Counterfactual Correction & Operational Lesson Memory\n\n")
+
+        entry_line = (
+            f"- **Trigger**: `{clean_trigger}` | **Avoid**: `{clean_mistake}` "
+            f"| **Corrected Action**: `{clean_correction}` ({datetime.now().strftime('%Y-%m-%d %H:%M')})\n"
+        )
+        try:
+            with open(lessons_md_path, "a", encoding="utf-8") as f:
+                f.write(entry_line)
+        except Exception as e:
+            print(f"[SemanticMemory LESSONS.md Write Warning]: {e}")
+
+        emb = self.embed_text(clean_trigger)
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "INSERT INTO lessons (context_trigger, error_action, corrected_action, created_at) VALUES (?, ?, ?, ?)",
+                (clean_trigger, clean_mistake, clean_correction, datetime.now().isoformat())
+            )
+            lesson_id = cursor.lastrowid
+            if emb and any(emb):
+                cursor.execute(
+                    "INSERT INTO vec_lessons (lesson_id, embedding) VALUES (?, ?)",
+                    (lesson_id, sqlite_vec.serialize_float32(emb))
+                )
+            conn.commit()
+            return lesson_id
+        except Exception as e:
+            print(f"[SemanticMemory Record Correction Error]: {e}")
+            return -1
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def recall_lesson_objects(self, query: str, threshold: float = 0.70) -> list[dict]:
+        """Returns structured lesson dictionaries matching `query` via vector KNN or exact/substring match."""
+        clean_q = (query or "").strip()
+        if not clean_q:
+            return []
+
+        matched_lessons = []
+        seen_ids = set()
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            # 1. Exact or substring trigger match (deterministic & offline resilient)
+            cursor.execute(
+                "SELECT id, context_trigger, error_action, corrected_action FROM lessons ORDER BY id DESC"
+            )
+            all_rows = cursor.fetchall()
+            if not all_rows:
+                return []
+
+            q_lower = clean_q.lower()
+            q_tokens = set(re.findall(r"[a-z0-9]+", q_lower))
+            for lid, trig, err_act, corr_act in all_rows:
+                t_lower = (trig or "").lower()
+                t_tokens = set(re.findall(r"[a-z0-9]+", t_lower))
+                overlap = len(q_tokens & t_tokens) / max(len(t_tokens), 1) if t_tokens else 0.0
+                if t_lower and (t_lower == q_lower or t_lower in q_lower or q_lower in t_lower or overlap >= 0.6):
+                    matched_lessons.append({
+                        "id": lid,
+                        "context_trigger": trig,
+                        "error_action": err_act,
+                        "corrected_action": corr_act,
+                        "distance": 0.0,
+                        "rule": f"[Rule: In past runs, the user corrected this action with: {corr_act} (avoid: {err_act})]"
+                    })
+                    seen_ids.add(lid)
+
+            if matched_lessons:
+                return matched_lessons
+
+            # Only invoke vector KNN if query shares at least one content token with a stored lesson
+            all_lesson_tokens = set()
+            for _, trig, err_act, _ in all_rows:
+                all_lesson_tokens.update(re.findall(r"[a-z0-9]{3,}", f"{trig} {err_act}".lower()))
+            if not (q_tokens & all_lesson_tokens):
+                return []
+
+            # 2. Vector KNN search against vec_lessons
+            emb = self.embed_text(clean_q)
+            if emb and any(emb):
+                sql = """
+                    SELECT l.id, l.context_trigger, l.error_action, l.corrected_action, v.distance
+                    FROM vec_lessons v
+                    JOIN lessons l ON l.id = v.lesson_id
+                    WHERE v.embedding MATCH ? AND k = 3
+                    ORDER BY v.distance ASC
+                """
+                cursor.execute(sql, (sqlite_vec.serialize_float32(emb),))
+                for lid, trig, err_act, corr_act, dist in cursor.fetchall():
+                    if lid not in seen_ids and float(dist) <= threshold:
+                        matched_lessons.append({
+                            "id": lid,
+                            "context_trigger": trig,
+                            "error_action": err_act,
+                            "corrected_action": corr_act,
+                            "distance": float(dist),
+                            "rule": f"[Rule: In past runs, the user corrected this action with: {corr_act} (avoid: {err_act})]"
+                        })
+                        seen_ids.add(lid)
+
+            return matched_lessons
+        except Exception as e:
+            print(f"[SemanticMemory Recall Lessons Error]: {e}")
+            return matched_lessons
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def recall_applicable_lessons(self, query: str, threshold: float = 0.70) -> list[str]:
+        """
+        Scans `vec_lessons` (and exact triggers) during query planning.
+        Returns a list of override strings:
+        `[Rule: In past runs, the user corrected this action with: ...]`.
+        """
+        objs = self.recall_lesson_objects(query, threshold=threshold)
+        return [o["rule"] for o in objs]
 
 
 # Backward compatibility alias

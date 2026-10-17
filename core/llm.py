@@ -27,7 +27,21 @@ from core.briefing import BriefingAndWorkspaces, BriefingEngine
 from tools.knowledge_agent import get_entity_summary
 from tools.search_agent import search_live_web
 from tools.system_actions import launch_any_application, close_any_application, find_and_open_file, web_search
-from tools.weather import get_forecast_for_iso_date, get_weekly_forecast
+from tools.weather import get_forecast_for_iso_date, get_weekly_forecast, get_weather, geocode_location
+from core.persona import PersonaEngine
+from core.skill_forge import SkillForge
+from core.habit_learner import HabitLearner
+from core.scratchpad import AgentScratchpad
+from core.clarifier import AmbiguityDetector
+from core.self_refine import ExecutionRefiner
+from core.sentiment_detector import SentimentAdapter
+from core.context_distiller import ContextDistiller
+from core.artifact_manager import ArtifactManager
+from tools.data_scientist import DataScienceAgent
+from tools.free_utilities import FreeUtilityBelt
+from tools.window_context import ActiveWindowEngine
+from core.idle_daemon import IdleTaskDaemon
+from core.mcp_client import LibraMCPClient
 
 
 def condense_spelling(text: str) -> str:
@@ -35,6 +49,9 @@ def condense_spelling(text: str) -> str:
     text = re.sub(r"(?:\b[a-zA-Z]\b\s+){2,}\b[a-zA-Z]\b", lambda m: m.group(0).replace(" ", ""), text)
     text = re.sub(r"\bbatch\s*marks\b", "benchmarks", text, flags=re.IGNORECASE)
     text = re.sub(r"\bbatch\s*mark\b", "benchmark", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bwhat\s+(?:a\s+man|am\s+i)\s+walk(?:ing)?\s+on\b", "what am I working on", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bwhat\s+a\s+man\s+working\s+on\b", "what am I working on", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bwhat(?:'m|\s+i'm|\s+i\s+am)\s+(?:working|walking)\s+on\b", "what am I working on", text, flags=re.IGNORECASE)
     return text
 
 
@@ -96,8 +113,37 @@ class LocalLLM:
             llm=self
         )
         self.briefing_engine = self.briefing_and_workspaces
+        self.persona = PersonaEngine()
+        self.skill_forge = SkillForge()
+        self.habits = HabitLearner()
+        self.scratchpad = AgentScratchpad()
+        self.clarifier = AmbiguityDetector()
+        self.refiner = ExecutionRefiner(file_mgr=self.file_mgr)
+        self.sentiment = SentimentAdapter()
+        self.distiller = ContextDistiller(memory=self.memory)
+        self.artifacts = ArtifactManager(clipboard_agent=self.clipboard_agent)
+        self.data_scientist = DataScienceAgent(file_mgr=self.file_mgr)
+        self.repl = self.data_scientist.repl
+        self.utility_belt = FreeUtilityBelt()
+        self.window_engine = ActiveWindowEngine()
+        self.mcp_client = LibraMCPClient()
+        self.idle_daemon = IdleTaskDaemon(
+            memory=self.memory,
+            distiller=self.distiller,
+            monitor=self.monitor,
+            discovery=getattr(self.dispatcher, "discovery", None)
+        )
         self.pending_confirmation = None
+        self.pending_clarification: Optional[Dict[str, Any]] = None
         self.conversation_history = []
+        self.last_context: Dict[str, Any] = {
+            "city": None,
+            "app": None,
+            "folder": None,
+            "file": None,
+            "entity": None,
+            "dataframe": None,
+        }
         self.session_state = {
             "active_apps": [],
             "last_target": None,
@@ -124,6 +170,94 @@ class LocalLLM:
             )
         except Exception:
             pass
+
+    def _process_response(self, plan_res: dict, prompt: str, dry_run: bool = False) -> dict:
+        """
+        Applies v6.0 Frontier post-processing pipeline:
+          1. Sentiment & urgency analysis.
+          2. Artifact & code block extraction (copies code to clipboard).
+          3. Hermes habit tracking & proactive suggestions (suppressed if high urgency).
+          4. PersonaEngine humanization (<2ms dynamic pools, zero repetition).
+          5. High-urgency cadence compression (<12 words, zero banter).
+          6. Commits turn to conversation history with rolling distillation.
+        """
+        action = plan_res.get("action", "chat")
+        target = (
+            plan_res.get("target")
+            or plan_res.get("app_id")
+            or plan_res.get("folder")
+            or plan_res.get("query")
+            or plan_res.get("mode")
+            or plan_res.get("fact")
+            or plan_res.get("file")
+            or plan_res.get("slug")
+            or ""
+        )
+        raw_voice = plan_res.get("voice_response", "")
+
+        # 1. Sentiment & Urgency Detection
+        tone_info = self.sentiment.analyze_tone(prompt)
+        plan_res["sentiment"] = tone_info
+        plan_res["urgency"] = tone_info.get("urgency", "normal")
+
+        # 1.5 Counterfactual Lesson Recall (v8.0)
+        if hasattr(self.memory, "recall_lesson_objects") and "applied_lessons" not in plan_res:
+            lesson_objs = self.memory.recall_lesson_objects(prompt)
+            if lesson_objs:
+                plan_res["applied_lessons"] = [l["rule"] for l in lesson_objs]
+                plan_res["corrected_action"] = lesson_objs[0]["corrected_action"]
+                if "args" in plan_res and isinstance(plan_res["args"], dict):
+                    plan_res["args"]["corrected_action"] = lesson_objs[0]["corrected_action"]
+
+        # 2. Artifact & Code Block Separation
+        if raw_voice:
+            clean_voice, extracted_artifacts = self.artifacts.process_response(raw_voice)
+            if extracted_artifacts:
+                raw_voice = clean_voice
+                plan_res["artifacts"] = extracted_artifacts
+                plan_res["voice_response"] = clean_voice
+
+        if not dry_run:
+            if action != "chat":
+                self.habits.record_action(action, str(target))
+                proactive_sugg = (
+                    self.habits.get_proactive_suggestion(action, str(target))
+                    if tone_info.get("urgency") != "high"
+                    else None
+                )
+            else:
+                proactive_sugg = None
+
+            if tone_info.get("urgency") == "high":
+                human_voice = self.sentiment.modulate_response(
+                    raw_voice,
+                    tone_info=tone_info,
+                    action=action,
+                    target=str(target)
+                )
+            else:
+                human_voice = self.persona.humanize_response(
+                    raw_voice,
+                    action_type=action,
+                    context={"target": str(target), "query": str(target)},
+                    dry_run=False
+                )
+                if proactive_sugg:
+                    human_voice = f"{human_voice} {proactive_sugg}".strip()
+
+            plan_res["voice_response"] = human_voice
+            self.session_state["last_action"] = action
+            self._record_turn(prompt, human_voice)
+        else:
+            if tone_info.get("urgency") == "high":
+                plan_res["voice_response"] = self.sentiment.modulate_response(
+                    raw_voice,
+                    tone_info=tone_info,
+                    action=action,
+                    target=str(target)
+                )
+
+        return plan_res
 
     def call_ollama(
         self,
@@ -407,6 +541,14 @@ class LocalLLM:
         research_data = self.research_engine.search_and_extract(query, max_sources=2)
         sources = research_data.get("sources", []) if isinstance(research_data, dict) else (research_data or [])
         if not sources:
+            refined_q = self.refiner.reformulate_query(query)
+            if refined_q and refined_q.lower() != query.lower():
+                retry_data = self.research_engine.search_and_extract(refined_q, max_sources=2)
+                sources = retry_data.get("sources", []) if isinstance(retry_data, dict) else (retry_data or [])
+                if sources:
+                    query = refined_q
+
+        if not sources:
             msg = f"I searched online for {query}, but found no verified benchmark results."
             return {
                 "query": query,
@@ -573,6 +715,42 @@ class LocalLLM:
           - No databases are mutated
           - No outbound web search requests are made
         """
+        # 0. Active Clarification Follow-Up Resolution (within continuous window)
+        if self.pending_clarification is not None:
+            resolved_clar = self.clarifier.resolve_clarification(prompt, self.pending_clarification)
+            if resolved_clar and resolved_clar.get("resolved"):
+                self.pending_clarification = None
+                orig_intent = resolved_clar.get("intent", "open_folder")
+                selected_name = resolved_clar.get("selected_name", "")
+                res_args = resolved_clar.get("args", {})
+                if orig_intent == "open_folder":
+                    open_res = self.file_mgr.open_in_explorer(
+                        res_args.get("path") or selected_name,
+                        dry_run=dry_run
+                    )
+                    plan_res = {
+                        "action": "open_folder",
+                        "args": res_args,
+                        "folder": selected_name,
+                        "selected": selected_name,
+                        "clarification_resolved": True,
+                        "status": open_res.get("status", "opened"),
+                        "path": open_res.get("path") or res_args.get("path"),
+                        "voice_response": open_res.get("voice_response") or f"Opening {selected_name}."
+                    }
+                    return self._process_response(plan_res, prompt, dry_run=dry_run)
+                else:
+                    plan_res = {
+                        "action": orig_intent,
+                        "args": res_args,
+                        "target": selected_name,
+                        "selected": selected_name,
+                        "clarification_resolved": True,
+                        "status": "resolved",
+                        "voice_response": f"Selected {selected_name}."
+                    }
+                    return self._process_response(plan_res, prompt, dry_run=dry_run)
+
         # Resolve relational follow-up queries if last_entity is cached
         resolved_prompt = self.resolve_relational_query(prompt)
 
@@ -582,6 +760,17 @@ class LocalLLM:
 
         cleaned_query = condense_spelling(resolved_prompt).strip()
         q_lower = cleaned_query.lower()
+
+        # 0.5 Counterfactual Correction Override (v8.0)
+        if hasattr(self.memory, "recall_lesson_objects"):
+            matched_lessons = self.memory.recall_lesson_objects(cleaned_query)
+            if matched_lessons:
+                top_lesson = matched_lessons[0]
+                err_act = top_lesson.get("error_action", "").strip()
+                corr_act = top_lesson.get("corrected_action", "").strip()
+                if err_act and corr_act and err_act.lower() in q_lower:
+                    cleaned_query = re.sub(re.escape(err_act), corr_act, cleaned_query, flags=re.IGNORECASE)
+                    q_lower = cleaned_query.lower()
 
         # -------------------------------------------------------------
         # 1. PROMPT INJECTION & COMMAND ESCAPE DEFENSES
@@ -728,7 +917,7 @@ class LocalLLM:
                 msg = f"Got it. I've committed that to memory: {clean_fact}."
                 plan_res["voice_response"] = msg
                 self._record_turn(prompt, msg)
-            return plan_res
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
 
         # -------------------------------------------------------------
         # 4. MEMORY FAST-PATH: FORGET MEMORY ("Forget what I told you...")
@@ -748,9 +937,17 @@ class LocalLLM:
         # -------------------------------------------------------------
         # 5. MEMORY FAST-PATH: RECALL MEMORY ("Who is my favorite driver?")
         # -------------------------------------------------------------
-        recall_match = re.search(r"^(?:who|what|where|when|which)\s+(?:is|are|was|were)?\s*(?:my\s+)(.+?)[\.\?!]*$", q_lower)
-        if not recall_match:
-            recall_match = re.search(r"^(?:do\s+you\s+(?:remember|know)|recall|tell\s+me)\s+(?:what\s+is\s+my|about\s+my|my)\s+(.+?)[\.\?!]*$", q_lower)
+        is_non_memory_my = bool(
+            re.search(
+                r"\bmy\s+(?:reminders?|timers?|alarms?|ping|latency|connection|clipboard|downloads?|screen|window|cpu|ram|gpu|vram|system|skills?|briefing)\b",
+                q_lower,
+            )
+        )
+        recall_match = None
+        if not is_non_memory_my:
+            recall_match = re.search(r"^(?:who|what|where|when|which)\s+(?:is|are|was|were)?\s*(?:my\s+)(.+?)[\.\?!]*$", q_lower)
+            if not recall_match:
+                recall_match = re.search(r"^(?:do\s+you\s+(?:remember|know)|recall|tell\s+me)\s+(?:what\s+is\s+my|about\s+my|my)\s+(.+?)[\.\?!]*$", q_lower)
         if recall_match:
             query = recall_match.group(1).strip().rstrip(".?!")
             plan_res = {"action": "recall_memory", "args": {"query": query}, "query": query}
@@ -772,43 +969,78 @@ class LocalLLM:
             return plan_res
 
         # -------------------------------------------------------------
-        # 6. SCHEDULE REMINDER & TIMERS ("Set a timer...", "Remind me at...")
+        # 6. SCHEDULE REMINDER, TIMERS, ALARMS & TOAST NOTIFICATIONS (v10.0)
         # -------------------------------------------------------------
-        timer_match = re.search(r"^(?:please\s+)?(?:set\s+a\s+timer|timer)\s+(?:for\s+)?(.+)[\.\?!]*$", q_lower)
-        if timer_match:
-            duration = timer_match.group(1).strip().rstrip(".?!")
-            plan_res = {"action": "schedule_reminder", "args": {"time": duration}, "time": duration}
+        # 6.1 List Pending Reminders
+        list_rem_match = re.search(
+            r"\b(?:what\s+(?:reminders?|timers?|alarms?)\s+do\s+i\s+have|list\s+(?:my\s+)?(?:reminders?|timers?|alarms?)|show\s+(?:my\s+)?(?:reminders?|timers?|alarms?)|what\s+are\s+my\s+(?:reminders?|timers?))\b",
+            q_lower,
+        )
+        if list_rem_match:
+            pending = self.scheduler.list_pending_reminders()
+            if pending:
+                items_str = "; ".join([f"{r['task']} ({r['target_time_str']})" for r in pending[:4]])
+                msg = f"You have {len(pending)} active reminder{'s' if len(pending) > 1 else ''}: {items_str}."
+            else:
+                msg = "You don't have any active reminders or timers scheduled right now."
+            plan_res = {
+                "action": "list_reminders",
+                "args": {},
+                "reminders": pending,
+                "status": "success",
+                "voice_response": msg,
+            }
             if not dry_run:
-                sched_res = self.scheduler.add_reminder("Timer", duration)
-                msg = sched_res.get("message") or f"Timer set for {duration}."
-                plan_res["voice_response"] = msg
                 self._record_turn(prompt, msg)
             return plan_res
 
-        remind_at_match = re.search(r"^(?:please\s+)?remind\s+me\s+at\s+([0-9:apmAPM\s]+?)\s+to\s+(.+)[\.\?!]*$", q_lower)
-        if remind_at_match:
-            time_str = remind_at_match.group(1).strip()
-            task_str = remind_at_match.group(2).strip().rstrip(".?!")
-            plan_res = {"action": "schedule_reminder", "args": {"task": task_str, "time": time_str}, "task": task_str, "time": time_str}
+        # 6.2 Cancel / Clear Reminders
+        cancel_rem_match = re.search(
+            r"^(?:please\s+)?(?:cancel|clear|delete|remove)\s+(?:all\s+)?(?:my\s+)?(?:reminders?|timers?|alarms?)(?:\s+for\s+(.+))?[\.\?!]*$",
+            q_lower,
+        )
+        if cancel_rem_match:
+            target_kw = (cancel_rem_match.group(1) or "all").strip()
+            c_res = self.scheduler.cancel_reminders(target_kw) if not dry_run else {
+                "status": "success",
+                "cancelled_count": 1,
+                "voice_response": "Cleared your active reminders.",
+            }
+            plan_res = {
+                "action": "cancel_reminders",
+                "args": {"target": target_kw},
+                "status": c_res.get("status", "success"),
+                "voice_response": c_res.get("voice_response"),
+            }
             if not dry_run:
-                sched_res = self.scheduler.add_reminder(task_str, time_str)
-                msg = sched_res.get("message") or f"Reminder set for {time_str} to {task_str}."
-                plan_res["voice_response"] = msg
-                self._record_turn(prompt, msg)
+                self._record_turn(prompt, plan_res["voice_response"])
             return plan_res
 
-        remind_to_match = re.search(r"^(?:please\s+)?remind\s+me\s+to\s+(.+?)(?:\s+at\s+([0-9:apmAPM\s]+))?[\.\?!]*$", q_lower)
-        if remind_to_match and "remind me to" in q_lower:
-            task_str = remind_to_match.group(1).strip().rstrip(".?!")
-            time_str = (remind_to_match.group(2) or "").strip()
-            args = {"task": task_str}
-            if time_str:
-                args["time"] = time_str
-            plan_res = {"action": "schedule_reminder", "args": args, "task": task_str}
+        # 6.3 Schedule New Reminder / Timer / Alarm (with Windows 11 Toast Notification)
+        parsed_rem = self.scheduler.parse_reminder_request(cleaned_query)
+        if parsed_rem:
+            task_str = parsed_rem.get("task", "Reminder")
+            time_str = parsed_rem.get("time", "in 1 hour")
+            sched_res = self.scheduler.add_reminder(
+                task_str,
+                time_str,
+                show_toast=True,
+                dry_run=dry_run,
+            )
+            msg = sched_res.get("message") or f"Reminder set for {time_str} to {task_str}."
+            plan_res = {
+                "action": "schedule_reminder",
+                "args": {"task": task_str, "time": time_str},
+                "task": task_str,
+                "time": time_str,
+                "trigger_epoch": sched_res.get("trigger_epoch"),
+                "target_time_str": sched_res.get("target_time_str"),
+                "toast_dispatched": True,
+                "status": "scheduled" if sched_res.get("success") else "error",
+                "voice_response": msg,
+            }
             if not dry_run:
-                sched_res = self.scheduler.add_reminder(task_str, time_str or "in 1 hour")
-                msg = sched_res.get("message") or (f"Reminder set for {task_str}." if not time_str else f"Reminder set for {time_str} to {task_str}.")
-                plan_res["voice_response"] = msg
+                self.session_state["last_action"] = "schedule_reminder"
                 self._record_turn(prompt, msg)
             return plan_res
 
@@ -983,6 +1215,7 @@ class LocalLLM:
             self.session_state["last_action"] = "create_folder"
             self.session_state["last_folder_path"] = res.get("path")
             self.session_state["last_folder_name"] = clean_name
+            self.last_context["folder"] = res.get("path") or clean_name
 
             plan_res = {
                 "action": "create_folder",
@@ -1004,6 +1237,7 @@ class LocalLLM:
         )
         if is_pronoun_folder:
             res = self.file_mgr.open_in_explorer("that folder", dry_run=dry_run)
+            self.last_context["folder"] = res.get("path") or self.file_mgr.last_folder_name
             plan_res = {
                 "action": "open_folder",
                 "args": {"folder": self.file_mgr.last_folder_name or "that folder", "path": res.get("path")},
@@ -1014,7 +1248,7 @@ class LocalLLM:
             if not dry_run:
                 self.session_state["last_action"] = "open_folder"
                 self._record_turn(prompt, plan_res["voice_response"])
-            return plan_res
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
 
         # 8.1.3 Standard Named Folder Opening
         open_folder_match = (
@@ -1031,7 +1265,29 @@ class LocalLLM:
         )
         if open_folder_match and not re.search(r"\b(?:create|make|read)\s+folder\b", q_lower):
             folder_target = open_folder_match.group(1).strip().rstrip(".?!")
+            active_candidates = self.session_mgr.get_candidates() or self.session_state.get("candidates") or []
+            if len(active_candidates) >= 2:
+                ambig = self.clarifier.check_ambiguity(
+                    "open_folder",
+                    {"folder": folder_target},
+                    {"candidates": active_candidates}
+                )
+                if ambig and ambig.get("is_ambiguous") and ambig.get("options"):
+                    self.pending_clarification = ambig
+                    plan_res = {
+                        "action": "clarify_intent",
+                        "original_intent": "open_folder",
+                        "args": {"folder": folder_target},
+                        "is_ambiguous": True,
+                        "ambiguity_score": ambig.get("ambiguity_score", 0.85),
+                        "options": ambig.get("options", []),
+                        "option_names": ambig.get("option_names", []),
+                        "voice_response": ambig.get("question")
+                    }
+                    return self._process_response(plan_res, prompt, dry_run=dry_run)
+
             res = self.file_mgr.open_in_explorer(folder_target, dry_run=dry_run)
+            self.last_context["folder"] = res.get("path") or folder_target
             plan_res = {
                 "action": "open_folder",
                 "args": {"folder": folder_target, "path": res.get("path")},
@@ -1042,14 +1298,14 @@ class LocalLLM:
             if not dry_run:
                 self.session_state["last_action"] = "open_folder"
                 self._record_turn(prompt, plan_res["voice_response"])
-            return plan_res
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
 
         # -------------------------------------------------------------
         # 8.2 APP CONTROL (Dynamic Game Discovery + Static Allowlist)
         # -------------------------------------------------------------
         open_app_match = (
-            re.search(r"^(?:please\s+)?(?:launch|open|start|run|play)\s+(.+?)[\.\?!]*$", cmd_query)
-            or re.search(r"^(?:please\s+)?(?:launch|open|start|run|play)\s+(.+?)[\.\?!]*$", q_lower)
+            re.search(r"^(?:please\s+)?(?:launch|open|start|run|play|fire\s+up|boot\s+up|spin\s+up)\s+(.+?)[\.\?!]*$", cmd_query)
+            or re.search(r"^(?:please\s+)?(?:launch|open|start|run|play|fire\s+up|boot\s+up|spin\s+up)\s+(.+?)[\.\?!]*$", q_lower)
         )
         if open_app_match:
             raw_app = open_app_match.group(1).strip()
@@ -1058,6 +1314,7 @@ class LocalLLM:
             # ABSOLUTE SAFETY GUARD: If raw_app contains "folder" or "directory", it is NEVER an app!
             if any(w in raw_app.lower() for w in ["folder", "directory", "dir"]):
                 res = self.file_mgr.open_in_explorer(raw_app, dry_run=dry_run)
+                self.last_context["folder"] = res.get("path") or raw_app
                 plan_res = {
                     "action": "open_folder",
                     "args": {"folder": raw_app, "path": res.get("path")},
@@ -1068,7 +1325,7 @@ class LocalLLM:
                 if not dry_run:
                     self.session_state["last_action"] = "open_folder"
                     self._record_turn(prompt, plan_res["voice_response"])
-                return plan_res
+                return self._process_response(plan_res, prompt, dry_run=dry_run)
 
             # Guard: If query mentions "on spotify" or is simply "spotify", route to spotify_play
             if raw_app.lower() == "spotify" or re.search(r"\bon\s+spotify\b", raw_app.lower()):
@@ -1084,11 +1341,12 @@ class LocalLLM:
                 if not dry_run:
                     self.session_state["last_action"] = "spotify_play"
                     self._record_turn(prompt, plan_res["voice_response"])
-                return plan_res
+                return self._process_response(plan_res, prompt, dry_run=dry_run)
 
             # Guard: workspace mode or game mode commands are delegated to their dedicated sections
             if not (re.search(r"\b(?:coding|study|gaming)\s+(?:mode|workspace)\b", raw_app) or raw_app in ["game mode", "mode"]):
                 app_id = raw_app
+                self.last_context["app"] = app_id
                 # AUTO GAME MODE HOOK: Free VRAM for competitive gaming
                 if (
                     app_id in ["valorant", "steam", "overwatch", "overwatch 2", "cs", "cs2", "apex", "lol", "dota"]
@@ -1109,15 +1367,15 @@ class LocalLLM:
                     self._record_turn(prompt, plan_res["voice_response"])
                 else:
                     plan_res["voice_response"] = f"Allowlisted launch prepared for {app_id}."
-                return plan_res
+                return self._process_response(plan_res, prompt, dry_run=dry_run)
 
         close_app_match = (
-            re.search(r"^(?:please\s+)?(?:close|shut\s+down|exit|kill)\s+(?:the\s+)?(.+?)[\.\?!]*$", cmd_query)
-            or re.search(r"^(?:please\s+)?(?:close|shut\s+down|exit|kill)\s+(?:the\s+)?(.+?)[\.\?!]*$", q_lower)
+            re.search(r"^(?:hurry(?:\s+up)?(?:\s+and)?\s+|quick(?:ly)?(?:\s+and)?\s+|immediately\s+|please\s+)?(?:close|shut\s+down|exit|kill|terminate)\s+(?:the\s+)?(.+?)(?:\s+right\s+now|\s+now|\s+immediately|\s+asap)?[\.\?!]*$", cmd_query)
+            or re.search(r"^(?:hurry(?:\s+up)?(?:\s+and)?\s+|quick(?:ly)?(?:\s+and)?\s+|immediately\s+|please\s+)?(?:close|shut\s+down|exit|kill|terminate)\s+(?:the\s+)?(.+?)(?:\s+right\s+now|\s+now|\s+immediately|\s+asap)?[\.\?!]*$", q_lower)
         )
         if close_app_match:
             target = close_app_match.group(1).strip()
-            if "active" in target or target in ["window", "it", "current window", "active window", "active app"]:
+            if "active" in target or target in ["window", "it", "current window", "active window", "active app", "process", "the process"]:
                 target = "active"
             plan_res = {"action": "close_app", "args": {"target": target, "target_app": target}, "target": target, "target_app": target}
             if not dry_run:
@@ -1126,8 +1384,9 @@ class LocalLLM:
                 if success and actual_target and actual_target in self.session_state["active_apps"]:
                     self.session_state["active_apps"].remove(actual_target)
                 plan_res["voice_response"] = normalize_for_tts(msg)
-                self._record_turn(prompt, plan_res["voice_response"])
-            return plan_res
+            else:
+                plan_res["voice_response"] = f"Terminated {target}." if target != "active" else "Process terminated immediately."
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
 
         # -------------------------------------------------------------
         # 8.5 SYSTEM TELEMETRY & WINDOW INSPECTION
@@ -1226,6 +1485,63 @@ class LocalLLM:
             return plan_res
 
         # -------------------------------------------------------------
+        # 8.9.5 ACTIVE-WINDOW CONTEXT AWARENESS (v10.0)
+        # -------------------------------------------------------------
+        active_window_match = (
+            "clipboard" not in q_lower
+            and not self.attached_file_path
+            and (
+                re.search(
+                    r"\b(?:what\s+(?:am\s+i|a\s+man|i'm|i\s+am)\s+(?:working|walking|workin)\s+on|what\s+am\s+i\s+(?:doing|looking\s+at)|what\s+(?:window|app|application)\s+(?:am\s+i\s+in|is\s+(?:active|focused|open))|which\s+window\s+is\s+active)\b",
+                    q_lower,
+                )
+                or re.search(
+                    r"\b(?:what\s+does\s+this\s+(?:error|exception|warning|traceback)\s+mean|explain\s+this\s+(?:error|bug|traceback)|how\s+(?:do\s+i\s+|to\s+)?fix\s+this\s+(?:error|bug|issue))\b",
+                    q_lower,
+                )
+                or re.search(
+                    r"\b(?:explain\s+what\s+this\s+(?:script|file|code|module|function)\s+does|what\s+does\s+this\s+(?:script|file|code|module|function)\s+do|summarize\s+this\s+(?:script|code))\b",
+                    q_lower,
+                )
+                or re.search(
+                    r"\b(?:summarize\s+(?:what(?:'s|\s+is)\s+on\s+)?this\s+(?:page|article|tab|website|site|window)|what(?:'s|\s+is)\s+this\s+(?:page|article|tab)\s+about)\b",
+                    q_lower,
+                )
+                or re.search(
+                    r"\b(?:write\s+a\s+reply|draft\s+a\s+reply|reply\s+to\s+this\s+(?:thread|post|email|message|comment)|help\s+me\s+reply\s+to\s+this)\b",
+                    q_lower,
+                )
+            )
+        )
+        if active_window_match:
+            win_res = self.window_engine.handle_contextual_query(
+                prompt=prompt,
+                clipboard_agent=self.clipboard_agent,
+                model_mgr=self.model_mgr,
+                llm_callback=self if not dry_run else None,
+                dry_run=dry_run,
+            )
+            win_info = win_res.get("window_info", {})
+            if win_info.get("app_label"):
+                self.last_context["app"] = win_info["app_label"]
+            if win_info.get("active_file_path") or win_info.get("active_file"):
+                self.last_context["file"] = win_info.get("active_file_path") or win_info.get("active_file")
+
+            plan_res = {
+                "action": "active_window",
+                "sub_action": win_res.get("sub_action", "status"),
+                "args": {"query": cleaned_query, "app": win_info.get("app_label")},
+                "window_info": win_info,
+                "draft": win_res.get("draft"),
+                "status": win_res.get("status", "success"),
+                "voice_response": normalize_for_tts(win_res.get("voice_response", "Checked active window.")),
+            }
+            if not dry_run:
+                self.session_state["last_action"] = "active_window"
+                self._record_turn(prompt, plan_res["voice_response"])
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+        # -------------------------------------------------------------
         # 8.10 CLIPBOARD COPILOT & CODE DEBUGGER
         # -------------------------------------------------------------
         clipboard_assist_match = (
@@ -1288,6 +1604,17 @@ class LocalLLM:
                 raw_target = "Downloads"
             clean_scan_target = re.sub(r"^(?:my\s+)?(?:folder\s+called\s+|folder\s+named\s+|folder\s+)?", "", raw_target).strip().rstrip(".?!")
 
+            # Cross-Module Pronoun Chaining: resolve "that folder", "this folder", "the folder", "it"
+            if clean_scan_target.lower() in ["that folder", "this folder", "the folder", "that", "this", "it"]:
+                clean_scan_target = (
+                    self.last_context.get("folder")
+                    or self.session_state.get("last_folder_path")
+                    or self.session_state.get("last_folder_name")
+                    or self.file_mgr.last_folder_path
+                    or self.file_mgr.last_folder_name
+                    or "Downloads"
+                )
+
             scan_res = self.security_scanner.scan_path(clean_scan_target, dry_run=dry_run)
             plan_res = {
                 "action": "virus_scan",
@@ -1344,6 +1671,7 @@ class LocalLLM:
                 rag_question = cleaned_query
 
         if doc_rag_match:
+            self.last_context["file"] = doc_file
             plan_res = {
                 "action": "document_rag",
                 "args": {"file": doc_file, "question": rag_question},
@@ -1383,15 +1711,34 @@ class LocalLLM:
             if not dry_run:
                 self.session_state["last_action"] = "launch_workspace"
                 self._record_turn(prompt, plan_res["voice_response"])
-            return plan_res
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
 
         # -------------------------------------------------------------
-        # 8.12.5 FULL SPOTIFY SEARCH & PLAYBACK
+        # 8.12.5 FULL SPOTIFY SEARCH, PLAYBACK & NOW-PLAYING INSPECTOR
         # -------------------------------------------------------------
+        spotify_now_playing_match = re.search(
+            r"\b(?:what\s+(?:song|track|music)\s+is\s+(?:playing|this)|what(?:'s|\s+is)\s+playing\s+on\s+spotify|who\s+sings\s+this\s+song|what\s+am\s+i\s+listening\s+to)\b",
+            q_lower,
+        )
+        if spotify_now_playing_match:
+            np_res = self.spotify_agent.get_now_playing(dry_run=dry_run)
+            plan_res = {
+                "action": "spotify_now_playing",
+                "args": {},
+                "track": np_res.get("track"),
+                "artist": np_res.get("artist"),
+                "status": np_res.get("status"),
+                "voice_response": np_res.get("voice_response"),
+            }
+            if not dry_run:
+                self.session_state["last_action"] = "spotify_now_playing"
+                self._record_turn(prompt, plan_res["voice_response"])
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
+
         spotify_play_match = (
-            re.search(r"\b(?:play|listen\s+to)\s+(.+?)\s+on\s+spotify[\.\?!]*$", q_lower)
-            or re.search(r"\bon\s+spotify\s+(?:play|listen\s+to)\s+(.+)[\.\?!]*$", q_lower)
-            or re.search(r"\b(?:play|listen\s+to)(?:\s+some)?\s+music\s+on\s+spotify[\.\?!]*$", q_lower)
+            re.search(r"\b(?:play|listen\s+to|put\s+on|spin)\s+(.+?)\s+on\s+spotify[\.\?!]*$", q_lower)
+            or re.search(r"\bon\s+spotify\s+(?:play|listen\s+to|put\s+on)\s+(.+)[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:play|listen\s+to|put\s+on)(?:\s+some)?\s+music\s+on\s+spotify[\.\?!]*$", q_lower)
             or re.search(r"^(?:play|listen)\s+on\s+spotify[\.\?!]*$", q_lower)
             or re.search(r"^(?:open|launch)\s+spotify[\.\?!]*$", q_lower)
         )
@@ -1411,7 +1758,7 @@ class LocalLLM:
             if not dry_run:
                 self.session_state["last_action"] = "spotify_play"
                 self._record_turn(prompt, plan_res["voice_response"])
-            return plan_res
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
 
         # -------------------------------------------------------------
         # 8.13 ZERO-LATENCY HARDWARE MEDIA CONTROL
@@ -1432,7 +1779,7 @@ class LocalLLM:
             if not dry_run:
                 self.session_state["last_action"] = "media_control"
                 self._record_turn(prompt, plan_res["voice_response"])
-            return plan_res
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
 
         # -------------------------------------------------------------
         # 8.14 PROACTIVE DAILY BRIEFING
@@ -1453,7 +1800,287 @@ class LocalLLM:
             if not dry_run:
                 self.session_state["last_action"] = "daily_briefing"
                 self._record_turn(prompt, plan_res["voice_response"])
-            return plan_res
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+        # -------------------------------------------------------------
+        # 8.14.0 CROSS-MODULE SPATIAL DISTANCE & PRONOUN CHAINING (v9.0)
+        # -------------------------------------------------------------
+        dist_match = (
+            re.search(r"\bhow\s+far\s+is\s+([a-zA-Z\s]+?)\s+from\s+(?:home|here|my\s+house|my\s+place|me)[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:what\s+is\s+the\s+)?distance\s+(?:from\s+home\s+)?to\s+([a-zA-Z\s]+?)[\.\?!]*$", q_lower)
+        )
+        if dist_match:
+            raw_target_city = dist_match.group(1).strip()
+            if raw_target_city in ["it", "there", "that", "that city", "that place"]:
+                target_city = self.last_context.get("city") or self.session_state.get("last_entity") or self.city
+            else:
+                target_city = raw_target_city
+            geo = geocode_location(target_city)
+            dist_km = self.spatial.distance_from_home(geo["latitude"], geo["longitude"])
+            home_name = self.spatial.home_anchor.get("neighborhood", "Taman Bukit Maluri")
+            spoken_dist = f"{geo['name']} is approximately {dist_km} kilometers away from your home in {home_name}."
+            plan_res = {
+                "action": "spatial_distance",
+                "args": {"location": geo["name"], "distance_km": dist_km},
+                "location": geo["name"],
+                "distance_km": dist_km,
+                "status": "success",
+                "voice_response": spoken_dist,
+            }
+            if not dry_run:
+                self.session_state["last_action"] = "spatial_distance"
+                self._record_turn(prompt, spoken_dist)
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+        # -------------------------------------------------------------
+        # 8.14.1 DYNAMIC GLOBAL WEATHER ENGINE (v8.5 / v9.0)
+        # -------------------------------------------------------------
+        is_capability_weather = bool(
+            re.search(r"\b(?:can\s+you\s+predict|predict\s+the\s+weather|next\s+month|next\s+year)\b", q_lower)
+        )
+        weather_match = not is_capability_weather and (
+            re.search(r"\b(?:what(?:'s|\s+is)\s+the\s+weather|how(?:'s|\s+is)\s+the\s+weather|weather\s+(?:in|for|at|like\s+in)|forecast\s+(?:in|for|at)|temperature\s+(?:in|for|at)|is\s+it\s+(?:going\s+to\s+rain|raining|hot|cold)|how\s+(?:hot|cold|warm)\s+(?:is\s+it|it\s+is))\b", q_lower)
+            or re.search(r"^(?:weather|forecast)(?:\s+(?:in|for|at))?\s*([a-zA-Z\s,]+)?[\.\?!]*$", q_lower)
+        )
+        if weather_match:
+            loc_extracted = None
+            loc_m = re.search(
+                r"\b(?:weather|forecast|temperature|rain|raining|hot|cold|warm)(?:\s+like|\s+is\s+it|\s+it\s+is)?\s+(?:in|for|at)\s+([a-zA-Z\s,]+?)[\.\?!]*$",
+                q_lower,
+            )
+            if not loc_m:
+                loc_m = re.search(r"\b(?:in|for|at)\s+([a-zA-Z\s,]+?)[\.\?!]*$", q_lower)
+            if loc_m:
+                raw_loc = loc_m.group(1).strip()
+                raw_loc = re.sub(
+                    r"\b(?:today|tomorrow|right\s+now|now|this\s+weekend|this\s+week|tonight|please|for\s+me)\b",
+                    "",
+                    raw_loc,
+                    flags=re.IGNORECASE,
+                ).strip(" ,.?!'")
+                if raw_loc and raw_loc not in ["me", "here", "my area", "outside"]:
+                    if raw_loc in ["there", "that city", "it"] and self.last_context.get("city"):
+                        loc_extracted = self.last_context["city"]
+                    else:
+                        loc_extracted = raw_loc
+
+            date_label = "today"
+            if "tomorrow" in q_lower:
+                date_label = "tomorrow"
+            elif "weekend" in q_lower:
+                date_label = "this weekend"
+
+            w_res = get_weather(location_query=loc_extracted, dry_run=dry_run)
+            loc_arg = (loc_extracted or w_res.get("location") or self.city).lower()
+            self.last_context["city"] = w_res.get("location") or loc_extracted or self.city
+            plan_res = {
+                "action": "weather",
+                "args": {"location": loc_arg, "date": date_label},
+                "location": w_res.get("location"),
+                "latitude": w_res.get("latitude"),
+                "longitude": w_res.get("longitude"),
+                "temperature_c": w_res.get("temperature_c"),
+                "condition": w_res.get("condition"),
+                "rain_chance": w_res.get("rain_chance"),
+                "status": w_res.get("status", "success"),
+                "voice_response": w_res.get("voice_response"),
+            }
+            if not dry_run:
+                self.session_state["last_action"] = "weather"
+                self._record_turn(prompt, plan_res["voice_response"])
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+        # -------------------------------------------------------------
+        # 8.14.2 FREE UTILITY BELT: CURRENCY, MATH/UNIT, WORLD CLOCK, PING (v9.0)
+        # -------------------------------------------------------------
+        util_res = self.utility_belt.handle_query(cleaned_query, dry_run=dry_run)
+        if util_res is not None:
+            plan_res = {
+                "action": "utility",
+                "sub_action": util_res.get("sub_action", "utility"),
+                "args": {k: v for k, v in util_res.items() if k != "voice_response"},
+                **util_res,
+            }
+            if not dry_run:
+                self.session_state["last_action"] = "utility"
+                self._record_turn(prompt, plan_res.get("voice_response", ""))
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+        # -------------------------------------------------------------
+        # 8.15 HERMES SKILL FORGE: AUTONOMOUS SKILL CREATION
+        # -------------------------------------------------------------
+        skill_create_match = (
+            re.search(r"^(?:please\s+)?(?:create|learn|build|teach\s+yourself)\s+(?:a\s+)?(?:new\s+)?skill\s*(?:called|named)?\s*(.+)$", q_lower)
+            or re.search(r"\bsave\s+(?:that\s+|this\s+)?workflow\s+as\s+(?:a\s+)?skill\s*(?:called|named)?\s*(.+)$", q_lower)
+        )
+        if skill_create_match:
+            raw_task = skill_create_match.group(1).strip().rstrip(".?!")
+            res = self.skill_forge.create_skill(
+                raw_task,
+                llm_callback=self.call_ollama if not dry_run else None,
+                dry_run=dry_run
+            )
+            plan_res = {
+                "action": "create_skill",
+                "args": {"task": raw_task},
+                "slug": res.get("slug"),
+                "name": res.get("name"),
+                "status": res.get("status"),
+                "voice_response": res.get("voice_response")
+            }
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+        # -------------------------------------------------------------
+        # 8.16 HERMES SKILL FORGE: SKILL REGISTRY LISTING
+        # -------------------------------------------------------------
+        skill_list_match = re.search(
+            r"\b(?:what\s+skills\s+do\s+you\s+have|list\s+(?:your\s+)?(?:learned\s+)?skills|show\s+(?:your\s+)?(?:learned\s+)?skills|list\s+skills)\b",
+            q_lower
+        )
+        if skill_list_match:
+            skills = self.skill_forge.list_skills()
+            if skills:
+                names = [s["name"] for s in skills]
+                voice_msg = f"I have {len(skills)} learned skill{'s' if len(skills) > 1 else ''} in my forge: " + ", ".join(names) + "."
+            else:
+                voice_msg = "I do not have any custom skills in my forge yet. You can ask me to learn one anytime."
+            plan_res = {
+                "action": "list_skills",
+                "args": {},
+                "skills": skills,
+                "voice_response": voice_msg
+            }
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+        # -------------------------------------------------------------
+        # 8.17 PERSONA ENGINE: DYNAMIC SOUL TRAIT UPDATE
+        # -------------------------------------------------------------
+        personality_match = (
+            re.search(r"^(?:please\s+)?(?:be\s+more|talk\s+more|sound\s+more|switch\s+to|set\s+tone\s+to)\s+(.+?)[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:update\s+your\s+soul|change\s+your\s+personality|change\s+your\s+tone)\b", q_lower)
+        )
+        if personality_match:
+            ack_msg = self.persona.update_soul_trait(cleaned_query)
+            plan_res = {
+                "action": "update_personality",
+                "args": {"instruction": cleaned_query},
+                "instruction": cleaned_query,
+                "voice_response": ack_msg
+            }
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+        # -------------------------------------------------------------
+        # 8.18 HERMES SKILL FORGE: DYNAMIC TRIGGER MATCHING
+        # -------------------------------------------------------------
+        matched_skill = self.skill_forge.match_skill(prompt)
+        if matched_skill:
+            slug = matched_skill.get("slug")
+            plan_res = {
+                "action": "run_learned_skill",
+                "args": {"skill_slug": slug, "prompt": prompt},
+                "slug": slug,
+                "name": matched_skill.get("name")
+            }
+            if not dry_run:
+                run_res = self.skill_forge.run_skill(
+                    slug,
+                    args={"prompt": prompt},
+                    context={"city": self.city},
+                    llm_callback=self.call_ollama
+                )
+                plan_res["status"] = run_res.get("status")
+                plan_res["result"] = run_res
+                plan_res["voice_response"] = run_res.get("voice_response", f"Executed skill {matched_skill.get('name')}.")
+            else:
+                plan_res["status"] = "success"
+                plan_res["voice_response"] = f"Learned skill '{matched_skill.get('name')}' ready to execute."
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+        # -------------------------------------------------------------
+        # 8.19 AUTONOMOUS DATA SCIENCE & VISUALIZATION PIPELINE (v7.0)
+        # -------------------------------------------------------------
+        ds_match = (
+            re.search(r"\b(?:find\s+(?:me\s+)?(?:valid\s+)?data\s+(?:on|about|for)|analyze\s+(?:the\s+)?dataset|make\s+(?:it\s+into\s+)?a\s+visualization|generate\s+a\s+(?:plot|chart|visualization)|plot\s+(?:the\s+)?data|correlate)\b", q_lower)
+            or (
+                any(k in q_lower for k in ["data", "dataset", "statistics", "trend", "correlation", "csv"])
+                and any(v in q_lower for v in ["visualization", "visualize", "plot", "chart", "graph", "explain", "analyze"])
+            )
+        )
+        if ds_match:
+            self.idle_daemon.record_user_activity()
+            ds_res = self.data_scientist.run_analysis(
+                cleaned_query,
+                llm_callback=self.call_ollama if not dry_run else None,
+                dry_run=dry_run
+            )
+            plan_res = {
+                "action": "data_science",
+                "args": {"query": cleaned_query},
+                "query": cleaned_query,
+                "status": ds_res.get("status", "success"),
+                "plot_path": ds_res.get("plot_path"),
+                "stats": ds_res.get("stats", {}),
+                "hud_card": ds_res.get("hud_card"),
+                "voice_response": ds_res.get("voice_response", "Data analysis and visualization completed.")
+            }
+            self.last_context["dataframe"] = "df"
+            if not dry_run:
+                self.session_state["last_action"] = "data_science"
+                self._record_turn(prompt, plan_res["voice_response"])
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+        # -------------------------------------------------------------
+        # 8.20 LAYER 2: SEMANTIC EXEMPLAR INTENT MATCHER (v9.0)
+        # -------------------------------------------------------------
+        sem_hit = self._semantic_intent_match(cleaned_query)
+        if sem_hit is not None:
+            s_intent = sem_hit.get("intent")
+            s_slot = sem_hit.get("slot")
+            if s_intent == "weather":
+                w_res = get_weather(location_query=s_slot, dry_run=dry_run)
+                loc_arg = (s_slot or w_res.get("location") or self.city).lower()
+                self.last_context["city"] = w_res.get("location") or s_slot or self.city
+                plan_res = {
+                    "action": "weather",
+                    "args": {"location": loc_arg, "date": "today"},
+                    "location": w_res.get("location"),
+                    "latitude": w_res.get("latitude"),
+                    "longitude": w_res.get("longitude"),
+                    "status": w_res.get("status", "success"),
+                    "voice_response": w_res.get("voice_response"),
+                }
+                if not dry_run:
+                    self.session_state["last_action"] = "weather"
+                    self._record_turn(prompt, plan_res["voice_response"])
+                return self._process_response(plan_res, prompt, dry_run=dry_run)
+            elif s_intent == "open_app" and s_slot:
+                self.last_context["app"] = s_slot
+                plan_res = {
+                    "action": "open_app",
+                    "args": {"app_id": s_slot, "target_app": s_slot},
+                    "app_id": s_slot,
+                    "target_app": s_slot,
+                }
+                if not dry_run:
+                    success, msg = self.dispatcher.launch_app(s_slot, dry_run=False)
+                    plan_res["voice_response"] = normalize_for_tts(msg)
+                    self._record_turn(prompt, plan_res["voice_response"])
+                else:
+                    plan_res["voice_response"] = f"Allowlisted launch prepared for {s_slot}."
+                return self._process_response(plan_res, prompt, dry_run=dry_run)
+            elif s_intent == "close_app" and s_slot:
+                plan_res = {
+                    "action": "close_app",
+                    "args": {"target": s_slot, "target_app": s_slot},
+                    "target": s_slot,
+                    "target_app": s_slot,
+                }
+                if not dry_run:
+                    _, msg = self.dispatcher.close_app(s_slot, dry_run=False)
+                    plan_res["voice_response"] = normalize_for_tts(msg)
+                else:
+                    plan_res["voice_response"] = f"Terminated {s_slot}."
+                return self._process_response(plan_res, prompt, dry_run=dry_run)
 
         # -------------------------------------------------------------
         # 9. OPEN-ENDED NATURAL QUERIES: OLLAMA JSON CLASSIFICATION
@@ -1501,7 +2128,7 @@ class LocalLLM:
                 plan_res["voice_response"] = res_data["voice_response"]
                 plan_res["sources"] = res_data["sources"]
                 self._record_turn(prompt, res_data["voice_response"])
-            return plan_res
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
         else:
             plan_res = {"action": "chat", "args": {}}
             if not dry_run:
@@ -1516,7 +2143,9 @@ class LocalLLM:
                 sys_inst = (
                     f"You are Libra, an elite autonomous cybernetic desktop assistant. Date: {datetime.now().strftime('%A, %B %d, %Y')}. Location: {self.city}.\n"
                     f"<user_context>\n{mem_ctx}\n</user_context>\n"
+                    f"{self.persona.get_system_prompt_addon()}\n"
                     "Respond conversationally in 1-2 spoken sentences.\n"
+                    "ABSOLUTE RULE: NEVER tell the user to 'search online yourself', 'check a weather website', or 'I don't have real-time access'. You are equipped with live weather, web search, and desktop tools.\n"
                     "CRITICAL: NEVER claim you have created a folder, opened a folder, or launched an application if you are in 'chat' mode. Only report actions when a tool actually executed them."
                 )
                 reply = self.call_ollama(
@@ -1527,9 +2156,147 @@ class LocalLLM:
                     include_history=True
                 )
                 clean_reply = re.sub(r"\{.*?\}", "", reply, flags=re.DOTALL).strip() or reply
+                intercepted = self._intercept_lazy_refusal(prompt, clean_reply, dry_run=False)
+                if intercepted is not None:
+                    self._record_turn(prompt, intercepted.get("voice_response", ""))
+                    return self._process_response(intercepted, prompt, dry_run=False)
                 plan_res["voice_response"] = clean_reply or "Understood. How can I assist you?"
-                self._record_turn(prompt, plan_res["voice_response"])
-            return plan_res
+            else:
+                plan_res["voice_response"] = "Dry-run response."
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+    def _semantic_intent_match(self, prompt: str) -> Optional[Dict[str, Any]]:
+        """
+        Layer 2 Semantic Exemplar Matcher (v9.0).
+        Catches casual phrasing, slang, and indirect requests across tool domains
+        when Layer 1 exact regexes do not trigger.
+        """
+        q_low = (prompt or "").lower().strip()
+        if not q_low:
+            return None
+
+        # Exclude hypothetical capability questions or static textbook questions
+        if re.search(r"\b(?:can\s+you\s+predict|predict\s+the\s+weather|next\s+month|next\s+year|speed\s+of\s+light)\b", q_low):
+            return None
+
+        # 1. Casual Weather Exemplars ("yo could you check how hot it is in Kuantan", "do I need an umbrella in Penang")
+        weather_signals = ["umbrella", "humid", "thunderstorm", "pouring", "sunny", "chilly", "degrees outside"]
+        if any(ws in q_low for ws in weather_signals) or (
+            any(w in q_low for w in ["weather", "rain", "hot", "cold", "forecast", "temperature"])
+            and any(prep in q_low for prep in [" in ", " for ", " at ", " outside", " today", " right now"])
+        ):
+            loc_slot = None
+            loc_m = re.search(r"\b(?:in|for|at)\s+([a-zA-Z\s,]+?)[\.\?!]*$", q_low)
+            if loc_m:
+                raw_loc = re.sub(
+                    r"\b(?:today|tomorrow|right\s+now|now|this\s+weekend|this\s+week|tonight|please|for\s+me)\b",
+                    "",
+                    loc_m.group(1).strip(),
+                    flags=re.IGNORECASE,
+                ).strip(" ,.?!'")
+                if raw_loc and raw_loc not in ["me", "here", "my area", "outside"]:
+                    loc_slot = raw_loc
+            return {"intent": "weather", "slot": loc_slot, "score": 0.88}
+
+        # 2. Casual App Launch Exemplars ("fire up Roblox", "hop on Overwatch", "boot up Valorant")
+        launch_slang = re.search(
+            r"\b(?:fire\s+up|boot\s+up|spin\s+up|hop\s+on|jump\s+into|load\s+up)\s+([a-zA-Z0-9_\-\s]+?)[\.\?!]*$",
+            q_low,
+        )
+        if launch_slang:
+            app_slot = launch_slang.group(1).strip()
+            return {"intent": "open_app", "slot": app_slot, "score": 0.90}
+
+        # 3. Casual App Close Exemplars ("shut off Discord", "nuke Notepad", "force quit Roblox")
+        close_slang = re.search(
+            r"\b(?:shut\s+off|nuke|force\s+quit|quit\s+out\s+of|end\s+task\s+on)\s+([a-zA-Z0-9_\-\s]+?)[\.\?!]*$",
+            q_low,
+        )
+        if close_slang:
+            app_slot = close_slang.group(1).strip()
+            return {"intent": "close_app", "slot": app_slot, "score": 0.89}
+
+        return None
+
+    def _intercept_lazy_refusal(self, user_prompt: str, llm_reply: str, dry_run: bool = False) -> Optional[dict]:
+        """
+        Layer 3 Zero-Refusal Autonomous Interceptor (v9.0).
+        Intercepts lazy LLM refusals ('search online yourself', 'check a weather website',
+        'check a website yourself', 'I don't have real-time data', 'as an AI') and
+        autonomously escalates to live Weather, App Launch, or HardenedResearchEngine tools.
+        """
+        if not llm_reply:
+            return None
+
+        reply_lower = llm_reply.lower()
+        refusal_phrases = [
+            "search online",
+            "search it yourself",
+            "check a weather",
+            "check a website",
+            "website yourself",
+            "i don't have real-time",
+            "i do not have real-time",
+            "i cannot browse",
+            "i can't browse",
+            "i don't have access to live",
+            "i do not have access to live",
+            "visit a website",
+            "look it up on",
+            "check online yourself",
+            "as an ai",
+        ]
+        if not any(phrase in reply_lower for phrase in refusal_phrases):
+            return None
+
+        q_low = (user_prompt or "").lower()
+        if any(w in q_low for w in ["weather", "rain", "temperature", "forecast", "hot", "cold", "humid"]):
+            loc_extracted = None
+            loc_m = re.search(r"\b(?:in|for|at)\s+([a-zA-Z\s,]+?)[\.\?!]*$", q_low)
+            if loc_m:
+                raw_loc = re.sub(
+                    r"\b(?:today|tomorrow|right\s+now|now|this\s+weekend|this\s+week|tonight|please|for\s+me)\b",
+                    "",
+                    loc_m.group(1).strip(),
+                    flags=re.IGNORECASE,
+                ).strip(" ,.?!'")
+                if raw_loc and raw_loc not in ["me", "here", "my area", "outside"]:
+                    loc_extracted = raw_loc
+
+            w_res = get_weather(location_query=loc_extracted, dry_run=dry_run)
+            loc_arg = (loc_extracted or w_res.get("location") or self.city).lower()
+            self.last_context["city"] = w_res.get("location") or loc_extracted or self.city
+            return {
+                "action": "weather",
+                "args": {"location": loc_arg},
+                "location": w_res.get("location"),
+                "latitude": w_res.get("latitude"),
+                "longitude": w_res.get("longitude"),
+                "status": w_res.get("status", "success"),
+                "voice_response": w_res.get("voice_response"),
+                "intercepted_refusal": True,
+            }
+
+        # Non-weather refusal -> escalate to live web research
+        if dry_run:
+            return {
+                "action": "web_search",
+                "args": {"query": user_prompt},
+                "query": user_prompt,
+                "status": "success",
+                "voice_response": f"Live web research completed for: {user_prompt}.",
+                "intercepted_refusal": True,
+            }
+
+        res_data = self.execute_research(user_prompt, prompt=user_prompt)
+        return {
+            "action": "web_search",
+            "args": {"query": user_prompt},
+            "query": user_prompt,
+            "sources": res_data.get("sources", []),
+            "voice_response": res_data.get("voice_response", f"Completed live lookup for {user_prompt}."),
+            "intercepted_refusal": True,
+        }
 
     def plan_and_respond(self, user_query: str) -> dict:
         return self.plan(user_query, dry_run=False)
@@ -1570,13 +2337,17 @@ class LocalLLM:
         return {"action": "lookup_entity", "voice_response": voice_text or summary[:200]}
 
     def _record_turn(self, user_text: str, assistant_text: str):
-        """Maintains the sliding window conversation history and logs episodic memory."""
+        """Maintains the sliding window conversation history with rolling distillation and logs episodic memory."""
         if user_text:
             self.conversation_history.append({"role": "user", "content": user_text})
         if assistant_text:
             self.conversation_history.append({"role": "assistant", "content": assistant_text})
         if len(self.conversation_history) > 8:
-            self.conversation_history = self.conversation_history[-8:]
+            try:
+                compressed, _ = self.distiller.compress_history(self.conversation_history, threshold=8)
+                self.conversation_history = compressed
+            except Exception:
+                self.conversation_history = self.conversation_history[-8:]
 
         # Log episode into SemanticMemory
         if user_text and assistant_text:

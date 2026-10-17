@@ -95,6 +95,8 @@ class VoiceAssistantWorker(QThread):
     mic_level = pyqtSignal(float)
     log_received = pyqtSignal(str, str)
     telemetry_update = pyqtSignal(str, str)
+    hud_update_signal = pyqtSignal(str, str)
+    orb_state_signal = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
@@ -104,7 +106,7 @@ class VoiceAssistantWorker(QThread):
         self.text_input_queue = queue.Queue()
         self.mute_tts = False
         self.llm = None
-        self.attached_file_path: Optional[str] = None
+        self.attached_file_path = None
 
     def stop(self):
         self.running = False
@@ -259,15 +261,43 @@ class VoiceAssistantWorker(QThread):
                 synthesis_done.set()
                 audio_queue.put(None)
 
+            # Flush input stream and reset wakeword detectors so the user's prior "Hey Libra" doesn't linger
+            try:
+                if self.input_stream:
+                    while self.input_stream.get_read_available() > 0:
+                        self.input_stream.read(self.input_stream.get_read_available(), exception_on_overflow=False)
+            except Exception:
+                pass
+            oww_model.reset()
+            ww_booster.reset()
+
+            playback_start_time = time.time()
+
             # Wait until playback naturally ends or user interrupts
             while not playback_finished.is_set() and not self.interrupted.is_set():
                 if not self.text_input_queue.empty():
                     trigger_barge_in()
                     break
 
+                # 600ms grace period after starting playback: don't false-trigger on startup audio
+                if time.time() - playback_start_time < 0.6:
+                    try:
+                        if self.input_stream and self.input_stream.get_read_available() >= 512:
+                            self.input_stream.read(self.input_stream.get_read_available(), exception_on_overflow=False)
+                    except Exception:
+                        pass
+                    time.sleep(0.02)
+                    continue
+
                 try:
                     if self.input_stream and self.input_stream.get_read_available() >= 512:
                         chunk_barge = self.input_stream.read(512, exception_on_overflow=False)
+                        audio_np = np.frombuffer(chunk_barge, dtype=np.int16).astype(np.float32) / 32768.0
+                        rms = float(np.sqrt(np.mean(audio_np ** 2)))
+                        if rms < 0.025:
+                            time.sleep(0.01)
+                            continue
+
                         frames_barge = ww_booster.process_chunk(chunk_barge, apply_agc=True)
                         for f_barge in frames_barge:
                             preds_barge = oww_model.predict(f_barge)
@@ -280,8 +310,9 @@ class VoiceAssistantWorker(QThread):
                                 elif "libra" in m_lower:
                                     libra_score = max(libra_score, score)
 
-                            if stop_score >= 0.55 or libra_score >= 0.60:
-                                print(f"\n[Voice Barge-In]: Detected wakeword during playback! (stop={stop_score:.2f}, libra={libra_score:.2f}). Cutting speech.")
+                            # Tightened thresholds for voice barge-in during active TTS playback
+                            if stop_score >= 0.65 or libra_score >= 0.85:
+                                print(f"\n[Voice Barge-In]: Detected wakeword during playback! (stop={stop_score:.2f}, libra={libra_score:.2f}, rms={rms:.3f}). Cutting speech.")
                                 trigger_barge_in()
                                 break
                 except Exception:
@@ -449,10 +480,14 @@ class VoiceAssistantWorker(QThread):
                             continue
 
                         self.status_changed.emit("NEURAL TRANSCRIBING...")
-                        with profiler.measure("STT_LATENCY"):
-                            user_text = stt.transcribe(full_audio)
-                        stt_latency = profiler.current_turn.get("STT_LATENCY", 0.0)
-                        self.telemetry_update.emit("STT_LATENCY", f"{stt_latency:.0f} ms")
+                        try:
+                            with profiler.measure("STT_LATENCY"):
+                                user_text = stt.transcribe(full_audio)
+                            stt_latency = profiler.current_turn.get("STT_LATENCY", 0.0)
+                            self.telemetry_update.emit("STT_LATENCY", f"{stt_latency:.0f} ms")
+                        except Exception as stt_err:
+                            print(f"[STT Worker Guard]: {stt_err}")
+                            user_text = None
 
             if not user_text or not user_text.strip():
                 ww_booster.clear_followup_window()
@@ -464,27 +499,65 @@ class VoiceAssistantWorker(QThread):
             self.log_received.emit("USER", user_text)
 
             # STATE 4: REASON & EXECUTE VIA LLM CORE
+            import json
             self.status_changed.emit("PROCESSING REASONING...")
-            with profiler.measure("LLM_LATENCY"):
-                response_data = supervisor.execute(user_text)
-            llm_latency = profiler.current_turn.get("LLM_LATENCY", 0.0)
-            self.telemetry_update.emit("LLM_LATENCY", f"{llm_latency:.0f} ms")
-            route_label = response_data.get("action") or ("compound" if response_data.get("compound") else "chat")
-            profiler.flush(transcript=user_text, route=route_label)
+            self.orb_state_signal.emit("reasoning")
+            if hasattr(llm, "idle_daemon") and llm.idle_daemon:
+                llm.idle_daemon.record_user_activity()
+
+            try:
+                with profiler.measure("LLM_LATENCY"):
+                    response_data = supervisor.execute(user_text)
+                llm_latency = profiler.current_turn.get("LLM_LATENCY", 0.0)
+                self.telemetry_update.emit("LLM_LATENCY", f"{llm_latency:.0f} ms")
+                route_label = response_data.get("action") or ("compound" if response_data.get("compound") else "chat")
+                profiler.flush(transcript=user_text, route=route_label)
+            except Exception as exec_err:
+                print(f"[Supervisor Worker Guard]: {exec_err}")
+                response_data = {
+                    "action": "error_recovery",
+                    "voice_response": "I encountered a temporary hiccup while processing that request, but my systems remain online."
+                }
             print(f"[Libra Core]: {response_data}")
+
+            # Emit HUD card and Orb state updates if present
+            try:
+                if response_data.get("action") == "data_science" or response_data.get("hud_card"):
+                    self.orb_state_signal.emit("data_science")
+                    hud_card = response_data.get("hud_card")
+                    if hud_card:
+                        self.hud_update_signal.emit(
+                            hud_card.get("type", "plot"),
+                            json.dumps(hud_card)
+                        )
+                if response_data.get("scratchpad"):
+                    self.hud_update_signal.emit("scratchpad", json.dumps(response_data["scratchpad"]))
+                if response_data.get("artifacts"):
+                    for art in response_data["artifacts"]:
+                        self.hud_update_signal.emit("artifact", json.dumps(art))
+            except Exception as hud_err:
+                print(f"[HUD Emit Guard]: {hud_err}")
 
             # Grab final voice response formulated and executed by LocalLLM
             voice_msg = response_data.get("voice_response", "Understood.")
 
             self.log_received.emit("LIBRA", voice_msg)
             if not self.mute_tts:
-                speak_interruptible(voice_msg)
+                try:
+                    self.orb_state_signal.emit("speaking")
+                    speak_interruptible(voice_msg)
+                except Exception as tts_err:
+                    print(f"[TTS Worker Guard]: {tts_err}")
+            self.orb_state_signal.emit("idle")
             ww_booster.set_followup_window(6.0)
             in_followup_mode = True
 
         if self.input_stream:
-            self.input_stream.stop_stream()
-            self.input_stream.close()
+            try:
+                self.input_stream.stop_stream()
+                self.input_stream.close()
+            except Exception:
+                pass
         pa.terminate()
 
 
@@ -492,7 +565,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
     def __init__(self, start_worker: bool = True):
         super().__init__()
         self.security_scanner = SecurityScanner()
-        self.attached_file_path: Optional[str] = None
+        self.attached_file_path = None
         self.worker = None
         self.setAcceptDrops(True)
         self.init_ui()
@@ -516,7 +589,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         title_label = QLabel("LIBRA AI // NEURAL TERMINAL")
         title_label.setFont(QFont("Consolas", 14, QFont.Weight.Bold))
         title_label.setStyleSheet("color: #00ffcc; letter-spacing: 3px;")
-        sub_label = QLabel("QUANTUM REASONING CORE // ARCHITECTURE V4.0")
+        sub_label = QLabel("QUANTUM REASONING CORE // ARCHITECTURE V7.0")
         sub_label.setFont(QFont("Consolas", 8))
         sub_label.setStyleSheet("color: #0088aa; letter-spacing: 1.5px;")
         title_box.addWidget(title_label)
@@ -772,6 +845,19 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         js_cmd = f"if (window.setMicAmplitude) {{ window.setMicAmplitude({level:.3f}); }}"
         self.orb_view.page().runJavaScript(js_cmd)
 
+    def update_hud_card(self, card_type: str, payload_json: str):
+        import json
+        safe_type = json.dumps(card_type)
+        safe_payload = json.dumps(payload_json)
+        js_cmd = f"if (window.updateHUDCard) {{ window.updateHUDCard({safe_type}, {safe_payload}); }}"
+        self.orb_view.page().runJavaScript(js_cmd)
+
+    def set_orb_state(self, mode: str):
+        import json
+        safe_mode = json.dumps(mode)
+        js_cmd = f"if (window.setOrbState) {{ window.setOrbState({safe_mode}); }}"
+        self.orb_view.page().runJavaScript(js_cmd)
+
     def update_status(self, text: str):
         self.status_banner.setText(text)
         if "SPEAKING" in text:
@@ -815,6 +901,8 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.worker.mic_level.connect(self.on_mic_level)
         self.worker.telemetry_update.connect(self.update_telemetry)
         self.worker.log_received.connect(self.append_log)
+        self.worker.hud_update_signal.connect(self.update_hud_card)
+        self.worker.orb_state_signal.connect(self.set_orb_state)
         self.worker.start()
 
     def closeEvent(self, event):

@@ -12,12 +12,90 @@
       display: flex;
       justify-content: center;
       align-items: center;
+      font-family: 'Consolas', 'Courier New', monospace;
+      color: #e2e8f0;
     }
-    canvas { display: block; outline: none; }
+    canvas { display: block; outline: none; position: absolute; top: 0; left: 0; z-index: 1; }
+    .hud-overlay {
+      position: absolute;
+      z-index: 10;
+      background: rgba(10, 14, 23, 0.78);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(0, 242, 254, 0.32);
+      border-radius: 8px;
+      padding: 10px 12px;
+      max-width: 260px;
+      font-size: 11px;
+      box-shadow: 0 0 18px rgba(0, 242, 254, 0.12);
+      transition: all 0.25s ease;
+      pointer-events: auto;
+    }
+    #hud-left {
+      top: 12px;
+      left: 12px;
+      display: none;
+    }
+    #hud-right {
+      bottom: 12px;
+      right: 12px;
+      max-width: 300px;
+      display: none;
+    }
+    .hud-title {
+      color: #00f2fe;
+      font-weight: bold;
+      font-size: 11px;
+      letter-spacing: 1.5px;
+      border-bottom: 1px solid rgba(0, 242, 254, 0.25);
+      padding-bottom: 4px;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+    }
+    .hud-step { margin: 3px 0; color: #cbd5e1; }
+    .hud-plot-img {
+      width: 100%;
+      max-height: 170px;
+      object-fit: contain;
+      border-radius: 4px;
+      border: 1px solid rgba(168, 85, 247, 0.4);
+      margin-top: 6px;
+    }
+    .hud-code-box {
+      background: rgba(3, 7, 12, 0.9);
+      border: 1px solid #1e293b;
+      border-radius: 4px;
+      padding: 6px;
+      max-height: 110px;
+      overflow-y: auto;
+      font-size: 10px;
+      color: #38bdf8;
+      white-space: pre-wrap;
+      margin-top: 4px;
+    }
+    .hud-copy-btn {
+      margin-top: 6px;
+      background: #0c1829;
+      color: #00f2fe;
+      border: 1px solid #00f2fe;
+      border-radius: 4px;
+      padding: 3px 8px;
+      font-size: 10px;
+      cursor: pointer;
+    }
   </style>
   <script src="three.min.js"></script>
 </head>
 <body>
+  <div id="hud-left" class="hud-overlay">
+    <div id="hud-left-title" class="hud-title">SCRATCHPAD // ACTIVE</div>
+    <div id="hud-left-body"></div>
+  </div>
+
+  <div id="hud-right" class="hud-overlay">
+    <div id="hud-right-title" class="hud-title">DATA & ARTIFACT HUD</div>
+    <div id="hud-right-body"></div>
+  </div>
+
 <script>
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
@@ -57,7 +135,7 @@
   const pGeo = new THREE.BufferGeometry();
   pGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   const pMat = new THREE.PointsMaterial({
-    color: 0x00f0ff,
+    color: 0x00f2fe,
     size: 0.22,
     transparent: true,
     opacity: 0.85
@@ -106,6 +184,35 @@
   let targetMicAmplitude = 0.0;
   let currentMicAmplitude = 0.0;
 
+  const ORB_PALETTES = {
+    normal:       new THREE.Color(0x00f2fe),
+    idle:         new THREE.Color(0x00f2fe),
+    research:     new THREE.Color(0xd946ef),
+    data_science: new THREE.Color(0xd946ef),
+    urgent:       new THREE.Color(0xef4444),
+    security:     new THREE.Color(0xef4444),
+    gaming:       new THREE.Color(0x10b981),
+    clarify:      new THREE.Color(0xf59e0b),
+    night:        new THREE.Color(0x4338ca)
+  };
+
+  const ORB_SPEED_PRESETS = {
+    normal:       1.0,
+    idle:         1.0,
+    research:     1.35,
+    data_science: 1.45,
+    urgent:       2.4,
+    security:     2.4,
+    gaming:       0.55,
+    clarify:      1.2,
+    night:        0.65
+  };
+
+  let defaultColor = new THREE.Color(0x00f2fe);
+  let targetModeColor = new THREE.Color(0x00f2fe);
+  const peakColor = new THREE.Color(0xd946ef);
+  const currentColor = new THREE.Color();
+
   // Accelerated orbital spin while TTS is actively speaking
   window.setSpeechActive = function(active) {
     targetSpeedMultiplier = active ? 2.8 : 1.0;
@@ -116,9 +223,83 @@
     targetMicAmplitude = Math.min(Math.max(val, 0.0), 1.0);
   };
 
-  const defaultColor = new THREE.Color(0x00f0ff);
-  const peakColor = new THREE.Color(0xd946ef); // Neon magenta on loud input
-  const currentColor = new THREE.Color();
+  // Shifts orb color palette and particle speed preset smoothly based on operational mode
+  window.setOrbState = function(mode) {
+    const key = String(mode || 'normal').toLowerCase();
+    if (ORB_PALETTES[key]) {
+      targetModeColor.copy(ORB_PALETTES[key]);
+      ringMat.color.copy(ORB_PALETTES[key]);
+      coreMat.color.copy(ORB_PALETTES[key]);
+      targetSpeedMultiplier = ORB_SPEED_PRESETS[key] || 1.0;
+      pMat.opacity = (key === 'night') ? 0.55 : ((key === 'gaming') ? 0.65 : 0.85);
+    } else {
+      targetModeColor.copy(ORB_PALETTES.normal);
+      targetSpeedMultiplier = 1.0;
+      pMat.opacity = 0.85;
+    }
+  };
+
+  window.togglePlotFullscreen = function(imgEl) {
+    if (!imgEl) return;
+    if (imgEl.style.maxHeight === '80vh') {
+      imgEl.style.maxHeight = '170px';
+      imgEl.parentElement.parentElement.style.maxWidth = '300px';
+    } else {
+      imgEl.style.maxHeight = '80vh';
+      imgEl.parentElement.parentElement.style.maxWidth = '85vw';
+    }
+  };
+
+  // Renders glassmorphic HUD cards around the 3D orb
+  window.updateHUDCard = function(cardType, payloadJson) {
+    let data = payloadJson;
+    if (typeof payloadJson === 'string') {
+      try { data = JSON.parse(payloadJson); } catch (e) { data = { text: payloadJson }; }
+    }
+    data = data || {};
+    const type = String(cardType || data.type || '').toLowerCase();
+
+    if (type === 'scratchpad' || type === 'telemetry') {
+      const leftPanel = document.getElementById('hud-left');
+      const leftTitle = document.getElementById('hud-left-title');
+      const leftBody = document.getElementById('hud-left-body');
+      leftPanel.style.display = 'block';
+      leftTitle.textContent = type === 'scratchpad' ? 'SCRATCHPAD // PLAN' : 'SYSTEM TELEMETRY';
+
+      if (Array.isArray(data.subtasks) && data.subtasks.length > 0) {
+        leftBody.innerHTML = data.subtasks.map(t => {
+          const icon = t.status === 'completed' ? '[✓]' : (t.status === 'failed' ? '[✗]' : '[⟳]');
+          return `<div class="hud-step">${icon} Step ${t.id}: ${t.action}</div>`;
+        }).join('');
+      } else {
+        leftBody.innerHTML = `<div class="hud-step">${data.summary || data.text || 'Active'}</div>`;
+      }
+    } else if (type === 'data_science' || type === 'plot') {
+      const rightPanel = document.getElementById('hud-right');
+      const rightTitle = document.getElementById('hud-right-title');
+      const rightBody = document.getElementById('hud-right-body');
+      rightPanel.style.display = 'block';
+      rightTitle.textContent = data.title || 'DATA SCIENCE // EDA';
+      const stats = data.stats || {};
+      const imgUrl = data.plot_path ? ('file:///' + String(data.plot_path).replace(/\\/g, '/') + '?t=' + Date.now()) : '';
+      rightBody.innerHTML = `
+        <div>Source: ${data.source || 'Open Data'}</div>
+        <div>Mean: <b>${stats.mean ?? '--'}</b> | Min: <b>${stats.min ?? '--'}</b> | Max: <b>${stats.max ?? '--'}</b></div>
+        ${imgUrl ? `<img class="hud-plot-img" onclick="window.togglePlotFullscreen(this)" title="Click to toggle full-screen" src="${imgUrl}" alt="Analysis Plot"/>` : ''}
+      `;
+    } else if (type === 'artifact' || type === 'code') {
+      const rightPanel = document.getElementById('hud-right');
+      const rightTitle = document.getElementById('hud-right-title');
+      const rightBody = document.getElementById('hud-right-body');
+      rightPanel.style.display = 'block';
+      rightTitle.textContent = `ARTIFACT // ${(data.language || 'CODE').toUpperCase()}`;
+      const safeCode = String(data.content || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      rightBody.innerHTML = `
+        <div class="hud-code-box">${safeCode}</div>
+        <button class="hud-copy-btn" onclick="navigator.clipboard && navigator.clipboard.writeText(decodeURIComponent('${encodeURIComponent(data.content || '')}'))">Copied to Clipboard ✓</button>
+      `;
+    }
+  };
 
   function animate() {
     requestAnimationFrame(animate);
@@ -126,6 +307,7 @@
     // Smooth exponential damping (Lerp)
     currentMicAmplitude += (targetMicAmplitude - currentMicAmplitude) * 0.18;
     speedMultiplier += (targetSpeedMultiplier - speedMultiplier) * 0.1;
+    defaultColor.lerp(targetModeColor, 0.08);
     
     // Decay target amplitude when silence returns
     targetMicAmplitude *= 0.92;
@@ -141,6 +323,7 @@
     // Color shift based on mic intensity
     currentColor.copy(defaultColor).lerp(peakColor, currentMicAmplitude * 1.2);
     pMat.color.copy(currentColor);
+    lineMat.color.copy(defaultColor);
     lineMat.opacity = 0.20 + currentMicAmplitude * 0.45;
 
     for (let i = 0; i < particleCount; i++) {

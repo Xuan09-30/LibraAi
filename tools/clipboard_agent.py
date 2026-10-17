@@ -24,12 +24,12 @@ class ClipboardAgent:
 
     def __init__(self):
         self.available = PYPERCLIP_AVAILABLE
+        self.last_copied: str = ""
+        # Optional rich extractor (PDF/DOCX) injected by LocalLLM (DocumentRAGEngine.extract_text)
+        self.text_extractor = None
 
-    def get_clipboard_text(self) -> str:
-        """
-        Reads and sanitizes text from Windows clipboard using native ctypes,
-        with pyperclip as a fallback. Zero heavy dependencies required.
-        """
+    def _read_live_clipboard_text(self) -> str:
+        """Reads CF_UNICODETEXT from the real Windows clipboard (ctypes, then pyperclip)."""
         if sys.platform == "win32":
             try:
                 import ctypes
@@ -71,23 +71,156 @@ class ClipboardAgent:
                 return (pyperclip.paste() or "").strip()
             except Exception as e:
                 print(f"[ClipboardAgent pyperclip warning]: {e}")
-
         return ""
+
+    def get_clipboard_files(self) -> list:
+        """
+        Returns file paths currently on the clipboard (files copied with Ctrl+C in File Explorer).
+        Uses the Win32 CF_HDROP format via DragQueryFileW.
+        """
+        if sys.platform != "win32":
+            return []
+        paths = []
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            shell32 = ctypes.windll.shell32
+            CF_HDROP = 15
+
+            user32.OpenClipboard.argtypes = [wintypes.HWND]
+            user32.OpenClipboard.restype = wintypes.BOOL
+            user32.GetClipboardData.argtypes = [wintypes.UINT]
+            user32.GetClipboardData.restype = wintypes.HANDLE
+            user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+            user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+            shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
+            shell32.DragQueryFileW.restype = wintypes.UINT
+
+            if not user32.IsClipboardFormatAvailable(CF_HDROP):
+                return []
+            if user32.OpenClipboard(None):
+                try:
+                    h_drop = user32.GetClipboardData(CF_HDROP)
+                    if h_drop:
+                        count = shell32.DragQueryFileW(h_drop, 0xFFFFFFFF, None, 0)
+                        for i in range(count):
+                            length = shell32.DragQueryFileW(h_drop, i, None, 0)
+                            buff = ctypes.create_unicode_buffer(length + 1)
+                            shell32.DragQueryFileW(h_drop, i, buff, length + 1)
+                            if buff.value:
+                                paths.append(buff.value)
+                finally:
+                    user32.CloseClipboard()
+        except Exception as e:
+            print(f"[ClipboardAgent CF_HDROP warning]: {e}")
+        return paths
+
+    def get_clipboard_text(self) -> str:
+        """
+        Reads text from the live Windows clipboard. Falls back to the last text Libra copied
+        only if the live clipboard holds no text.
+        """
+        live = self._read_live_clipboard_text()
+        if live:
+            return live
+        if self.get_clipboard_files():
+            return ""
+        return self.last_copied or ""
+
+    def _read_file_for_analysis(self, path: str, max_chars: int = 6000) -> str:
+        """Reads a file's text (PDF/DOCX via injected extractor, otherwise plain text)."""
+        try:
+            if os.path.isdir(path):
+                entries = sorted(os.listdir(path))[:40]
+                return f"Folder '{os.path.basename(path)}' containing: " + ", ".join(entries) if entries else ""
+            if callable(self.text_extractor):
+                txt = self.text_extractor(path) or ""
+            else:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    txt = f.read(max_chars)
+            return txt[:max_chars]
+        except Exception as e:
+            return f"Error reading file: {e}"
+
+    def resolve_clipboard_payload(self) -> Dict[str, Any]:
+        """
+        Unified clipboard reader: returns {'kind': 'text'|'file'|'empty_file'|'empty', 'text', 'source', 'path'}.
+        Handles both copied text and copied files from File Explorer.
+        """
+        text = self.get_clipboard_text()
+        if text:
+            return {"kind": "text", "text": text, "source": "your clipboard", "path": None}
+
+        files = self.get_clipboard_files()
+        if files:
+            path = files[0]
+            name = os.path.basename(path) or path
+            content = self._read_file_for_analysis(path).strip()
+            if not content:
+                return {"kind": "empty_file", "text": "", "source": name, "path": path}
+            return {"kind": "file", "text": content, "source": name, "path": path}
+
+        return {"kind": "empty", "text": "", "source": "your clipboard", "path": None}
 
     def get_clipboard(self) -> str:
         """Alias for get_clipboard_text."""
         return self.get_clipboard_text()
 
     def set_clipboard(self, text: str) -> bool:
-        """Safely writes text to clipboard."""
-        if not self.available:
-            return False
-        try:
-            pyperclip.copy(text)
-            return True
-        except Exception as e:
-            print(f"[ClipboardAgent Warning] copy failed: {e}")
-            return False
+        """Safely writes text to clipboard and records in internal buffer."""
+        clean = (text or "").strip()
+        self.last_copied = clean
+
+        if self.available:
+            try:
+                pyperclip.copy(clean)
+                return True
+            except Exception:
+                pass
+
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                user32 = ctypes.windll.user32
+                kernel32 = ctypes.windll.kernel32
+                CF_UNICODETEXT = 13
+                GMEM_MOVEABLE = 0x0002
+
+                user32.OpenClipboard.argtypes = [wintypes.HWND]
+                user32.OpenClipboard.restype = wintypes.BOOL
+                user32.EmptyClipboard.restype = wintypes.BOOL
+                user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+                user32.SetClipboardData.restype = wintypes.HANDLE
+                user32.CloseClipboard.restype = wintypes.BOOL
+                kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+                kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+                kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+                kernel32.GlobalLock.restype = wintypes.LPVOID
+                kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+                kernel32.GlobalUnlock.restype = wintypes.BOOL
+
+                if user32.OpenClipboard(None):
+                    try:
+                        user32.EmptyClipboard()
+                        encoded = clean.encode("utf-16-le") + b"\x00\x00"
+                        h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(encoded))
+                        if h_mem:
+                            ptr = kernel32.GlobalLock(h_mem)
+                            if ptr:
+                                ctypes.memmove(ptr, encoded, len(encoded))
+                                kernel32.GlobalUnlock(h_mem)
+                                user32.SetClipboardData(CF_UNICODETEXT, h_mem)
+                    finally:
+                        user32.CloseClipboard()
+                return True
+            except Exception:
+                pass
+
+        return True
 
     def explain_clipboard(
         self,
@@ -99,15 +232,31 @@ class ClipboardAgent:
         Reads current clipboard text (e.g. Python traceback, C++ error, or code snippet)
         and prompts the LLM to explain or debug it concisely in 2-3 spoken sentences.
         """
-        raw_text = text if text is not None else self.get_clipboard_text()
+        source_label = "your clipboard"
+        if text is not None:
+            raw_text = text
+        else:
+            payload = self.resolve_clipboard_payload()
+            raw_text = payload["text"]
+            source_label = payload["source"]
+            if payload["kind"] == "empty_file":
+                return {
+                    "status": "empty",
+                    "error_type": "None",
+                    "source": source_label,
+                    "voice_response": f"I found {source_label} on your clipboard, but the file is empty, so there's nothing to explain yet."
+                }
         clean_text = (raw_text or "").strip()
 
         if not clean_text:
             return {
                 "status": "empty",
                 "error_type": "None",
-                "voice_response": "Your clipboard is empty. Please copy an error or text snippet first."
+                "voice_response": "Your clipboard is empty. Copy some text, an error, or a file in File Explorer first."
             }
+
+        if source_label != "your clipboard":
+            clean_text = f"[File: {source_label}]\n{clean_text}"
 
         # 1. Deterministic error classification
         error_type = "Code / Text Snippet"
@@ -194,14 +343,26 @@ class ClipboardAgent:
         llm: Optional[Any] = None,
         dry_run: bool = False
     ) -> Dict[str, Any]:
-        """Summarizes copied clipboard content in 1-2 spoken sentences."""
-        raw_text = text if text is not None else self.get_clipboard_text()
+        """Summarizes copied clipboard content (text or a copied file) in 1-2 spoken sentences."""
+        source_label = "your clipboard"
+        if text is not None:
+            raw_text = text
+        else:
+            payload = self.resolve_clipboard_payload()
+            raw_text = payload["text"]
+            source_label = payload["source"]
+            if payload["kind"] == "empty_file":
+                return {
+                    "status": "empty",
+                    "source": source_label,
+                    "voice_response": f"{source_label} is on your clipboard, but it's an empty file."
+                }
         clean_text = (raw_text or "").strip()
 
         if not clean_text:
             return {
                 "status": "empty",
-                "voice_response": "Your clipboard is empty. Please copy text first to summarize."
+                "voice_response": "Your clipboard is empty. Copy some text or a file first and I'll summarize it."
             }
 
         if dry_run or llm is None:
