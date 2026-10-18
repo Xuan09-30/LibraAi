@@ -1,9 +1,13 @@
 import os
 import sys
+import re
 import subprocess
 import webbrowser
 import ctypes
+from ctypes import wintypes
 import psutil
+
+PSUTIL_AVAILABLE = True
 
 from core.game_discovery import GameDiscoveryEngine
 
@@ -345,11 +349,51 @@ class SafeOSDispatcher:
             if sys.platform == "win32":
                 user32 = ctypes.windll.user32
                 hwnd = user32.GetForegroundWindow()
-                if hwnd:
-                    # WM_CLOSE = 0x0010
-                    user32.PostMessageW(hwnd, 0x0010, 0, 0)
-                    return True, "Closed active window."
-                return False, "No active foreground window detected."
+                if not hwnd:
+                    return False, "No active foreground window detected."
+
+                # Check if foreground window is Libra herself; if so, resolve user workspace
+                w_pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(w_pid))
+                if w_pid.value == os.getpid():
+                    from tools.window_context import ActiveWindowEngine
+                    ext_hwnd = ActiveWindowEngine._find_top_external_window(user32, hwnd, os.getpid())
+                    if ext_hwnd:
+                        hwnd = ext_hwnd
+                        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(w_pid))
+
+                app_name = "active window"
+                proc_name = ""
+                if w_pid.value > 0 and PSUTIL_AVAILABLE:
+                    try:
+                        p = psutil.Process(w_pid.value)
+                        proc_name = (p.name() or "").lower()
+                        app_name = proc_name.replace(".exe", "").title()
+                        if proc_name in self.PROTECTED_SYSTEM_PROCESSES:
+                            return False, f"Process '{proc_name}' is a protected system process and cannot be closed."
+                        # For stubborn tray apps like Discord or Spotify, force kill process via taskkill
+                        if proc_name in ["discord.exe", "spotify.exe", "steam.exe"]:
+                            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                            try:
+                                subprocess.run(
+                                    ["taskkill.exe", "/F", "/T", "/IM", proc_name],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    creationflags=creation_flags,
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                p.kill()
+                            except Exception:
+                                pass
+                            return True, f"Closed {app_name}."
+                    except Exception:
+                        pass
+
+                # WM_CLOSE = 0x0010
+                user32.PostMessageW(hwnd, 0x0010, 0, 0)
+                return True, f"Closed {app_name}."
             return False, "Active window close is only supported on Windows."
         except Exception as e:
             return False, f"Error closing active window: {e}"
@@ -360,9 +404,14 @@ class SafeOSDispatcher:
         while strictly protecting critical Windows and Python system processes.
         """
         raw_norm = target.lower().strip()
+        raw_norm = re.sub(r"^(?:my|the)\s+", "", raw_norm).strip()
         norm = raw_norm.replace(".exe", "").strip()
 
-        if norm in ["active", "close_active", "window", "it", "current window", "active window"]:
+        # Handle Whisper acoustic slip for Discord ("this card", "this cord")
+        if norm in ["this card", "this cord", "dis card", "discord"]:
+            norm = "discord"
+
+        if norm in ["active", "close_active", "window", "it", "current window", "active window", "this", "this window", "this app"]:
             return self.close_active_window(dry_run=dry_run)
 
         # Protect critical Windows & Python system processes
@@ -379,7 +428,7 @@ class SafeOSDispatcher:
             "browser": ["chrome.exe", "msedge.exe", "firefox.exe", "brave.exe"],
             "chrome": ["chrome.exe"],
             "spotify": ["spotify.exe"],
-            "discord": ["discord.exe"],
+            "discord": ["discord.exe", "discordcanary.exe", "discordptb.exe"],
             "roblox": ["robloxplayerbeta.exe", "robloxplayerlauncher.exe", "windows10universal.exe"],
             "notepad": ["notepad.exe"],
             "vscode": ["code.exe"],
@@ -387,6 +436,23 @@ class SafeOSDispatcher:
             "calculator": ["calculatorapp.exe", "calc.exe"],
         }
         target_names = set(aliases.get(norm, [candidate_exe, norm]))
+
+        # Dynamically inspect discovery engine to resolve target executable
+        if self.discovery:
+            try:
+                resolved = self.discovery.resolve_app(norm)
+                if resolved:
+                    t_path = resolved.get("target") or ""
+                    if t_path.lower().endswith(".exe"):
+                        exe_name = os.path.basename(t_path).lower()
+                        target_names.add(exe_name)
+                        target_names.add(exe_name.replace(".exe", ""))
+                    name_str = (resolved.get("name") or "").lower()
+                    if name_str:
+                        target_names.add(f"{name_str}.exe")
+                        target_names.add(name_str)
+            except Exception:
+                pass
 
         terminated_count = 0
         try:
@@ -396,11 +462,36 @@ class SafeOSDispatcher:
                     if not pname or pname in self.PROTECTED_SYSTEM_PROCESSES:
                         continue
                     pname_stem = pname.replace(".exe", "")
-                    if pname in target_names or pname_stem == norm or (len(norm) >= 4 and norm in pname_stem):
-                        proc.terminate()
+                    if (
+                        pname in target_names
+                        or pname_stem in target_names
+                        or pname_stem == norm
+                        or (len(norm) >= 4 and (norm in pname_stem or pname_stem in norm))
+                    ):
+                        try:
+                            proc.kill()
+                        except Exception:
+                            proc.terminate()
                         terminated_count += 1
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
+
+            # On Windows, run taskkill for stubborn tray apps or if psutil missed handles
+            if sys.platform == "win32" and (norm in ["discord", "spotify", "steam"] or terminated_count == 0):
+                for exe in list(target_names):
+                    if exe.endswith(".exe") and exe not in self.PROTECTED_SYSTEM_PROCESSES:
+                        try:
+                            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                            res = subprocess.run(
+                                ["taskkill.exe", "/F", "/T", "/IM", exe],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                creationflags=creation_flags,
+                            )
+                            if res.returncode == 0:
+                                terminated_count += 1
+                        except Exception:
+                            pass
         except Exception as e:
             return False, f"Failed to close {target}: {e}"
 

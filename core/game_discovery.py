@@ -4,6 +4,7 @@ import re
 import json
 import subprocess
 import difflib
+import shutil
 from typing import Dict, Any, Optional, List
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -558,15 +559,264 @@ class GameDiscoveryEngine:
 
         return None
 
+    def _scan_windows_utilities(self) -> Dict[str, Dict[str, Any]]:
+        """Scans and registers standard Windows built-in tools and accessories."""
+        discovered: Dict[str, Dict[str, Any]] = {}
+        system32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+
+        utils = [
+            ("notepad", "Notepad", "notepad.exe", "executable"),
+            ("calculator", "Calculator", "calc.exe", "executable"),
+            ("calc", "Calculator", "calc.exe", "executable"),
+            ("paint", "Paint", "mspaint.exe", "executable"),
+            ("mspaint", "Paint", "mspaint.exe", "executable"),
+            ("task manager", "Task Manager", "taskmgr.exe", "executable"),
+            ("taskmgr", "Task Manager", "taskmgr.exe", "executable"),
+            ("command prompt", "Command Prompt", "cmd.exe", "executable"),
+            ("cmd", "Command Prompt", "cmd.exe", "executable"),
+            ("powershell", "PowerShell", "powershell.exe", "executable"),
+            ("terminal", "Windows Terminal", "wt.exe", "executable"),
+            ("windows terminal", "Windows Terminal", "wt.exe", "executable"),
+            ("file explorer", "File Explorer", "explorer.exe", "executable"),
+            ("explorer", "File Explorer", "explorer.exe", "executable"),
+            ("control panel", "Control Panel", "control.exe", "executable"),
+            ("settings", "Windows Settings", "ms-settings:", "uri"),
+            ("windows settings", "Windows Settings", "ms-settings:", "uri"),
+            ("snipping tool", "Snipping Tool", "snippingtool.exe", "executable"),
+            ("character map", "Character Map", "charmap.exe", "executable"),
+            ("disk cleanup", "Disk Cleanup", "cleanmgr.exe", "executable"),
+            ("resource monitor", "Resource Monitor", "resmon.exe", "executable"),
+            ("device manager", "Device Manager", "devmgmt.msc", "executable"),
+            ("event viewer", "Event Viewer", "eventvwr.msc", "executable"),
+            ("system information", "System Information", "msinfo32.exe", "executable"),
+        ]
+        for key, name, target, l_type in utils:
+            if l_type == "executable" and not os.path.isabs(target) and sys.platform == "win32":
+                full_target = os.path.join(system32, target)
+                if not os.path.isfile(full_target):
+                    full_target = shutil.which(target) or target
+            else:
+                full_target = target
+
+            discovered[key] = {
+                "name": name,
+                "launch_type": l_type,
+                "target": full_target,
+                "source": "windows_utility",
+            }
+        return discovered
+
+    def _scan_registry_app_paths(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Scans HKLM and HKCU 'Software\\Microsoft\\Windows\\CurrentVersion\\App Paths'
+        for system-registered application binaries (Chrome, Edge, VLC, Acrobat, etc.).
+        """
+        discovered: Dict[str, Dict[str, Any]] = {}
+        if sys.platform != "win32":
+            return discovered
+
+        try:
+            import winreg
+            roots = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"),
+            ]
+            for root, subkey in roots:
+                try:
+                    with winreg.OpenKey(root, subkey) as key:
+                        count = winreg.QueryInfoKey(key)[0]
+                        for i in range(count):
+                            try:
+                                sub = winreg.EnumKey(key, i)
+                                with winreg.OpenKey(key, sub) as app_key:
+                                    val, _ = winreg.QueryValueEx(app_key, "")
+                                    if val and os.path.isfile(val):
+                                        clean_name = os.path.splitext(sub)[0].replace("_", " ").title()
+                                        key_name = clean_name.lower()
+                                        entry = {
+                                            "name": clean_name,
+                                            "launch_type": "executable",
+                                            "target": os.path.normpath(val),
+                                            "args": [],
+                                            "source": "registry_app_paths",
+                                        }
+                                        discovered[key_name] = entry
+                                        discovered[sub.lower()] = entry
+                                        if sub.lower().endswith(".exe"):
+                                            discovered[sub.lower()[:-4]] = entry
+                            except (OSError, FileNotFoundError):
+                                continue
+                except (OSError, FileNotFoundError):
+                    continue
+        except Exception:
+            pass
+
+        return discovered
+
+    def _scan_registry_uninstall(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Scans Windows Uninstall registry keys (HKLM, WOW6432Node, HKCU)
+        to identify third-party installed software and resolve primary executables.
+        """
+        discovered: Dict[str, Dict[str, Any]] = {}
+        if sys.platform != "win32":
+            return discovered
+
+        try:
+            import winreg
+            roots = [
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
+                (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+            ]
+            skip_words = ("uninstall", "update", "redistributable", "sdk", "driver", "runtime", "support", "prerequisite")
+            for root, subkey in roots:
+                try:
+                    with winreg.OpenKey(root, subkey) as key:
+                        count = winreg.QueryInfoKey(key)[0]
+                        for i in range(count):
+                            try:
+                                sub = winreg.EnumKey(key, i)
+                                with winreg.OpenKey(key, sub) as app_key:
+                                    try:
+                                        display_name, _ = winreg.QueryValueEx(app_key, "DisplayName")
+                                    except OSError:
+                                        continue
+                                    if not display_name or not isinstance(display_name, str):
+                                        continue
+                                    dn_clean = re.sub(r'[®™©\xae\x99]', '', display_name).strip()
+                                    if not dn_clean or len(dn_clean) < 2:
+                                        continue
+                                    dn_low = dn_clean.lower()
+                                    if any(sw in dn_low for sw in skip_words):
+                                        continue
+
+                                    exe_target = None
+                                    # 1. Try DisplayIcon
+                                    try:
+                                        icon_val, _ = winreg.QueryValueEx(app_key, "DisplayIcon")
+                                        if icon_val and isinstance(icon_val, str):
+                                            raw_p = icon_val.split(",")[0].strip('"').strip()
+                                            if raw_p.lower().endswith(".exe") and os.path.isfile(raw_p):
+                                                if not any(sw in os.path.basename(raw_p).lower() for sw in skip_words):
+                                                    exe_target = raw_p
+                                    except OSError:
+                                        pass
+
+                                    # 2. Try InstallLocation if DisplayIcon didn't give an exe
+                                    if not exe_target:
+                                        try:
+                                            inst_loc, _ = winreg.QueryValueEx(app_key, "InstallLocation")
+                                            if inst_loc and os.path.isdir(inst_loc):
+                                                for f in os.listdir(inst_loc):
+                                                    if f.lower().endswith(".exe") and not any(sw in f.lower() for sw in skip_words):
+                                                        cand = os.path.join(inst_loc, f)
+                                                        if os.path.isfile(cand):
+                                                            exe_target = cand
+                                                            break
+                                        except OSError:
+                                            pass
+
+                                    if exe_target:
+                                        entry = {
+                                            "name": dn_clean,
+                                            "launch_type": "executable",
+                                            "target": os.path.normpath(exe_target),
+                                            "args": [],
+                                            "source": "registry_uninstall",
+                                        }
+                                        discovered[dn_low] = entry
+                                        stem = os.path.splitext(os.path.basename(exe_target))[0].lower()
+                                        if stem and stem not in discovered:
+                                            discovered[stem] = entry
+                            except (OSError, FileNotFoundError):
+                                continue
+                except (OSError, FileNotFoundError):
+                    continue
+        except Exception:
+            pass
+
+        return discovered
+
+    def _scan_program_files_binaries(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Scans C:\\Program Files and C:\\Program Files (x86) top-level folders
+        for primary application executables.
+        """
+        discovered: Dict[str, Dict[str, Any]] = {}
+        if sys.platform != "win32":
+            return discovered
+
+        roots = [
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        ]
+        skip_words = ("unins", "update", "crash", "elevate", "helper", "setup", "install", "vcredist", "dotnet")
+
+        for root in roots:
+            if not root or not os.path.isdir(root):
+                continue
+            try:
+                for app_dir in os.listdir(root):
+                    folder_path = os.path.join(root, app_dir)
+                    if not os.path.isdir(folder_path):
+                        continue
+                    if app_dir.lower() in ("common files", "windows nt", "windows defender", "windows mail", "internet explorer"):
+                        continue
+                    try:
+                        candidates = []
+                        for f in os.listdir(folder_path):
+                            if f.lower().endswith(".exe") and not any(sw in f.lower() for sw in skip_words):
+                                p = os.path.join(folder_path, f)
+                                if os.path.isfile(p):
+                                    candidates.append((f, p))
+
+                        if not candidates:
+                            for sub in os.listdir(folder_path):
+                                sub_p = os.path.join(folder_path, sub)
+                                if os.path.isdir(sub_p) and sub.lower() in ("bin", "app", app_dir.lower()):
+                                    for f in os.listdir(sub_p):
+                                        if f.lower().endswith(".exe") and not any(sw in f.lower() for sw in skip_words):
+                                            p = os.path.join(sub_p, f)
+                                            if os.path.isfile(p):
+                                                candidates.append((f, p))
+
+                        for fname, full_exe in candidates:
+                            base_name = os.path.splitext(fname)[0]
+                            clean_app = app_dir.strip()
+                            entry = {
+                                "name": clean_app if clean_app.lower() in fname.lower() else base_name.replace("_", " ").title(),
+                                "launch_type": "executable",
+                                "target": full_exe,
+                                "args": [],
+                                "source": "program_files",
+                            }
+                            discovered[base_name.lower()] = entry
+                            discovered[clean_app.lower()] = entry
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+
+        return discovered
+
     def refresh(self):
-        """Refreshes discovered apps from UWP, shortcuts, AppData binaries, and Steam manifests."""
+        """Refreshes discovered apps from Windows utilities, Program Files, Registry, UWP, shortcuts, AppData, and Steam."""
+        win_utils = self._scan_windows_utilities()
+        prog_apps = self._scan_program_files_binaries()
+        uninstall_apps = self._scan_registry_uninstall()
+        reg_apps = self._scan_registry_app_paths()
         uwp_apps = self._scan_uwp_start_apps()
         shortcut_apps = self._scan_shortcuts_and_launchers()
         appdata_apps = self._scan_appdata_binaries()
         steam_apps = self._scan_steam_libraries()
 
-        # Priority order: UWP base -> Shortcuts -> AppData direct binaries -> Steam manifests
+        # Priority order: Utilities -> Program Files -> Registry Uninstall -> App Paths -> UWP -> Shortcuts -> AppData -> Steam
         self.apps = {}
+        self.apps.update(win_utils)
+        self.apps.update(prog_apps)
+        self.apps.update(uninstall_apps)
+        self.apps.update(reg_apps)
         self.apps.update(uwp_apps)
         self.apps.update(shortcut_apps)
         self.apps.update(appdata_apps)
@@ -578,8 +828,9 @@ class GameDiscoveryEngine:
         1. Strips conversational commands ('launch', 'open', 'play').
         2. Resolves gaming acronyms and slang.
         3. Matches exact, condensed, substring, and fuzzy candidates (difflib).
-        4. Queries Layer 3 Voidtools Everything (es.exe) live fallback.
-        5. Provides dry-run/mock fallbacks for known core titles in test environments.
+        4. Checks system PATH via shutil.which.
+        5. Queries Layer 3 Voidtools Everything (es.exe) live fallback.
+        6. Provides dry-run/mock fallbacks for known core titles in test environments.
         """
         clean = query.lower().strip()
         clean = re.sub(r"^(?:please\s+)?(?:launch|open|play|start|run)\s+", "", clean).strip()
@@ -623,7 +874,21 @@ class GameDiscoveryEngine:
             if matches:
                 return self.apps[matches[0]]
 
-        # 6. Layer 3: Live Voidtools Everything fallback
+        # 6. Check system PATH via shutil.which
+        which_hit = shutil.which(mapped_target) or shutil.which(clean)
+        if which_hit and os.path.isfile(which_hit):
+            stem = os.path.splitext(os.path.basename(which_hit))[0]
+            entry = {
+                "name": stem.title(),
+                "launch_type": "executable",
+                "target": which_hit,
+                "args": [],
+                "source": "system_path",
+            }
+            self.apps[stem.lower()] = entry
+            return entry
+
+        # 7. Layer 3: Live Voidtools Everything fallback
         live_hit = self._live_everything_fallback(mapped_target)
         if live_hit:
             return live_hit

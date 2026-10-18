@@ -175,12 +175,24 @@ class PersonaEngine:
                 f"Security scan complete: {target}",
                 f"File safety assessment finished: {target}",
                 f"Diagnostics complete: {target}"
+            ],
+            "show_ui": [
+                "Displaying neural interface.",
+                "Bringing up the interface now.",
+                "Interface online and visible.",
+                "Revealing UI."
+            ],
+            "hide_ui": [
+                "Hiding interface. I'll remain active in the background.",
+                "Minimizing to system tray.",
+                "Interface hidden. I'm still listening in the background.",
+                "Returning to background mode."
             ]
         }
 
         chosen = None
 
-        if action_type in pools and target:
+        if action_type in pools and (target or action_type in ["show_ui", "hide_ui", "media_control"]):
             candidates = pools[action_type]
             # Filter out responses that appear in recent responses
             unseen = [c for c in candidates if c not in self.recent_responses]

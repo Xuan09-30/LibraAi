@@ -106,7 +106,7 @@ class ReminderEngine:
             "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument; "
             "$xml.LoadXml($template); "
             "$toast = [Windows.UI.Notifications.ToastNotification]::new($xml); "
-            "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Project Libra AI').Show($toast);"
+            "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show($toast);"
         )
 
         try:
@@ -142,91 +142,108 @@ class ReminderEngine:
           - 'Remind me at 5 PM to check the build'
           - 'Wake me up at 8 AM' / 'Set an alarm for 7:30 AM'
         """
+        # Punctuation normalization: replace commas/semicolons with spaces
         q = (prompt or "").strip().rstrip(".?!")
-        q_low = q.lower()
+        q_norm = re.sub(r"[,;]+", " ", q).strip()
+        q_low = q_norm.lower()
 
-        # 1. "Set a [duration] timer [for task]"
-        m_timer_alt = re.search(
-            r"^(?:please\s+)?set\s+a\s+([0-9]+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?))\s+timer(?:\s+for\s+(.+))?$",
+        # Clean conversational prefixes: "okay now i want you to", "can you please", "hey libra"
+        q_clean = re.sub(
+            r"^(?:(?:okay|alright|hey\s+libra|libra|uhh|now|first|please|can\s+you(?:\s+please)?|could\s+you(?:\s+please)?|can\s+i(?:\s+please)?|could\s+i(?:\s+please)?|i\s+want\s+you\s+to|i\s+want\s+to|i\s+need\s+you\s+to|would\s+you(?:\s+please)?|i\s+want\s+a|let\'s\s+set|let\'s|i|we)\s+)+",
+            "",
             q_low,
-        )
-        if m_timer_alt:
-            dur = m_timer_alt.group(1).strip()
-            task = (m_timer_alt.group(2) or "Timer").strip()
-            return {"task": task, "time": f"in {dur}"}
+        ).strip()
 
-        # 2. "Set a timer for [duration] [for/to task]"
-        m_timer = re.search(
-            r"^(?:please\s+)?(?:set\s+a\s+timer|timer)\s+(?:for\s+)?([0-9]+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?)(?:\s+and\s+[0-9]+\s*(?:seconds?|secs?|minutes?|mins?))?)(?:\s+(?:for|to)\s+(.+))?$",
-            q_low,
-        )
-        if m_timer:
-            dur = m_timer.group(1).strip()
-            task = (m_timer.group(2) or "Timer").strip()
-            return {"task": task, "time": f"in {dur}"}
+        # Strip trailing conversational politeness / filler
+        q_clean = re.sub(r"\s+(?:please|for\s+me|thanks|thank\s+you|again)[\.\?!]*$", "", q_clean, flags=re.IGNORECASE).strip()
 
-        # 3. "Set an alarm for [time]" / "Wake me up at/in [time]"
-        m_alarm = re.search(
-            r"^(?:please\s+)?(?:set\s+an\s+alarm\s+for|wake\s+me\s+up\s+(?:at|in))\s+(.+)$",
-            q_low,
-        )
-        if m_alarm:
-            raw_t = m_alarm.group(1).strip()
-            if re.match(r"^[0-9]+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?)", raw_t):
-                raw_t = f"in {raw_t}"
-            return {"task": "Alarm", "time": raw_t}
+        for target_str in [q_clean, q_low]:
+            # 1. "Set [a/the] [duration] timer [for task / for me]"
+            m_timer_alt = re.search(
+                r"^(?:please\s+)?(?:set|start)\s+(?:a|the)?\s*([0-9]+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?))\s+timer(?:\s+(?:for|to)\s+(.+))?[\.\?!]*$",
+                target_str,
+            )
+            if m_timer_alt:
+                dur = m_timer_alt.group(1).strip()
+                raw_task = (m_timer_alt.group(2) or "Timer").strip()
+                task = "Timer" if raw_task.lower() in ["me", "for me", "us", "please", "again"] else raw_task
+                return {"task": task, "time": f"in {dur}"}
 
-        # 4. "Remind me in [duration] to [task]"
-        m_in_first = re.search(
-            r"^(?:please\s+)?remind\s+me\s+in\s+([0-9]+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?))\s+to\s+(.+)$",
-            q_low,
-        )
-        if m_in_first:
-            return {
-                "time": f"in {m_in_first.group(1).strip()}",
-                "task": m_in_first.group(2).strip(),
-            }
+            # 2. "Set [a/the] timer [for me] [for/to/of] [duration] [for/to task]" / "timer [duration]"
+            m_timer = re.search(
+                r"^(?:please\s+)?(?:(?:set|start)\s+(?:a|the)?\s*timer|timer)\s+(?:for\s+me\s+)?(?:for|to|of)?\s*([0-9]+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?)(?:\s+and\s+[0-9]+\s*(?:seconds?|secs?|minutes?|mins?))?)(?:\s+(?:for|to)\s+(.+))?[\.\?!]*$",
+                target_str,
+            )
+            if m_timer:
+                dur = m_timer.group(1).strip()
+                raw_task = (m_timer.group(2) or "Timer").strip()
+                task = "Timer" if raw_task.lower() in ["me", "for me", "us", "please", "again"] else raw_task
+                return {"task": task, "time": f"in {dur}"}
 
-        # 5. "Remind me at [time] to [task]"
-        m_at_first = re.search(
-            r"^(?:please\s+)?remind\s+me\s+(?:at|on)\s+([0-9:apm\s]+?)\s+to\s+(.+)$",
-            q_low,
-        )
-        if m_at_first:
-            return {
-                "time": m_at_first.group(1).strip(),
-                "task": m_at_first.group(2).strip(),
-            }
+            # 3. "Set an alarm for [time]" / "Wake me up at/in [time]"
+            m_alarm = re.search(
+                r"^(?:please\s+)?(?:set\s+(?:an|the)?\s*alarm\s+for|wake\s+me\s+up\s+(?:at|in))\s+(.+)$",
+                target_str,
+            )
+            if m_alarm:
+                raw_t = m_alarm.group(1).strip()
+                if re.match(r"^[0-9]+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?)", raw_t):
+                    raw_t = f"in {raw_t}"
+                return {"task": "Alarm", "time": raw_t}
 
-        # 6. "Remind me to [task] in [duration]"
-        m_to_in = re.search(
-            r"^(?:please\s+)?remind\s+me\s+to\s+(.+?)\s+in\s+([0-9]+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?))$",
-            q_low,
-        )
-        if m_to_in:
-            return {
-                "task": m_to_in.group(1).strip(),
-                "time": f"in {m_to_in.group(2).strip()}",
-            }
+            # 4. "Remind me in [duration] to [task]"
+            m_in_first = re.search(
+                r"^(?:please\s+)?remind\s+me\s+in\s+([0-9]+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?))\s+(?:to\s+)?(.+)?$",
+                target_str,
+            )
+            if m_in_first:
+                dur = m_in_first.group(1).strip()
+                task = (m_in_first.group(2) or "Reminder").strip()
+                return {
+                    "time": f"in {dur}",
+                    "task": task,
+                }
 
-        # 7. "Remind me to [task] at [time]"
-        m_to_at = re.search(
-            r"^(?:please\s+)?remind\s+me\s+to\s+(.+?)\s+at\s+([0-9:apm\s]+)$",
-            q_low,
-        )
-        if m_to_at:
-            return {
-                "task": m_to_at.group(1).strip(),
-                "time": m_to_at.group(2).strip(),
-            }
+            # 5. "Remind me at [time] to [task]"
+            m_at_first = re.search(
+                r"^(?:please\s+)?remind\s+me\s+(?:at|on)\s+([0-9:apm\s]+?)\s+to\s+(.+)$",
+                target_str,
+            )
+            if m_at_first:
+                return {
+                    "time": m_at_first.group(1).strip(),
+                    "task": m_at_first.group(2).strip(),
+                }
 
-        # 8. Generic "Remind me to [task]"
-        m_generic = re.search(r"^(?:please\s+)?remind\s+me\s+to\s+(.+)$", q_low)
-        if m_generic:
-            return {
-                "task": m_generic.group(1).strip(),
-                "time": "in 1 hour",
-            }
+            # 6. "Remind me to [task] in [duration]"
+            m_to_in = re.search(
+                r"^(?:please\s+)?remind\s+me\s+to\s+(.+?)\s+in\s+([0-9]+\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?))$",
+                target_str,
+            )
+            if m_to_in:
+                return {
+                    "task": m_to_in.group(1).strip(),
+                    "time": f"in {m_to_in.group(2).strip()}",
+                }
+
+            # 7. "Remind me to [task] at [time]"
+            m_to_at = re.search(
+                r"^(?:please\s+)?remind\s+me\s+to\s+(.+?)\s+at\s+([0-9:apm\s]+)$",
+                target_str,
+            )
+            if m_to_at:
+                return {
+                    "task": m_to_at.group(1).strip(),
+                    "time": m_to_at.group(2).strip(),
+                }
+
+            # 8. Generic "Remind me to [task]"
+            m_generic = re.search(r"^(?:please\s+)?remind\s+me\s+to\s+(.+)$", target_str)
+            if m_generic:
+                return {
+                    "task": m_generic.group(1).strip(),
+                    "time": "in 1 hour",
+                }
 
         return None
 
@@ -482,9 +499,12 @@ class ReminderEngine:
                 }
                 due.append(item)
                 if trigger_toast:
+                    is_timer = "timer" in str(r[1]).lower()
+                    t_title = "Libra Timer Finished" if is_timer else "Libra Reminder"
+                    t_msg = f"Hold up, your {r[1]} went off right now!" if is_timer else f"Hold up, it's time to {r[1]}."
                     self.send_windows_toast(
-                        title="Libra Reminder",
-                        message=f"Time to {r[1]}",
+                        title=t_title,
+                        message=t_msg,
                         dry_run=dry_run,
                     )
 
@@ -493,7 +513,7 @@ class ReminderEngine:
 
         return due
 
-    def start_watchdog(self, notify_callback, check_interval_sec: float = 10.0):
+    def start_watchdog(self, notify_callback, check_interval_sec: float = 1.0):
         """
         Runs a daemon background thread that sleeps and checks get_due_reminders().
         If due reminders exist, fires a Windows 11 toast and calls notify_callback(task_dict).

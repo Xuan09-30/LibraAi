@@ -43,7 +43,10 @@ ACTION_CLAUSE_PATTERNS = [
     r"\b(?:weather|forecast|temperature|is\s+it\s+going\s+to\s+rain|how\s+hot\s+is\s+it)\b",
     r"\b(?:check\s+my\s+ping|what\s+time\s+is\s+it|convert\s+\d+|how\s+much\s+is\s+\d+|how\s+far\s+is)\b",
     r"\b(?:what\s+am\s+i\s+working\s+on|what\s+window\s+am\s+i\s+in|what\s+does\s+this\s+error\s+mean|explain\s+what\s+this\s+script\s+does|summarize\s+what(?:'s|\s+is)\s+on\s+this\s+page|write\s+a\s+reply\s+to\s+this)\b",
-    r"\b(?:what\s+song\s+is\s+playing|what(?:'s|\s+is)\s+playing\s+on\s+spotify|list\s+my\s+reminders|cancel\s+my\s+reminders|wake\s+me\s+up)\b"
+    r"\b(?:what\s+song\s+is\s+playing|what(?:'s|\s+is)\s+playing\s+on\s+spotify|list\s+my\s+reminders|cancel\s+my\s+reminders|wake\s+me\s+up)\b",
+    r"\b(?:show|open|bring\s+up|display)\s+(?:me\s+)?(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)\b",
+    r"\b(?:hide|close|minimize)\s+(?:me\s+)?(?:your\s+)?(?:neural\s+)?(?:ui|window|interface)\b",
+    r"\b(?:go\s+to\s+background|send\s+to\s+background|hide\s+window|minimize\s+window|minimize\s+ui)\b"
 ]
 
 
@@ -88,8 +91,10 @@ class SupervisorHub:
         single complex requests (e.g., explicit web searches, relative clauses).
         Capped at MAX_STEPS (4).
         """
-        # Preserve explicit compound web search idioms and unified data science requests
+        # Preserve explicit compound web search idioms, Spotify play idioms, and unified data science requests
         if re.search(r"open\s+(?:google|chrome|browser)\s+and\s+search", prompt, re.IGNORECASE):
+            return [prompt]
+        if re.search(r"\b(?:open|launch|start|play)\s+(?:my\s+)?spotify\s+(?:and|to)\s+(?:play|place)\b", prompt, re.IGNORECASE):
             return [prompt]
         if re.search(r"\b(?:find\s+(?:me\s+)?(?:valid\s+)?data\s+(?:on|about|for)|analyze\s+(?:the\s+)?dataset|make\s+(?:it\s+into\s+)?a\s+visualization)\b", prompt, re.IGNORECASE):
             return [prompt]
