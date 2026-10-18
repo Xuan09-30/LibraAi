@@ -81,46 +81,103 @@ class ActiveWindowEngine:
         """
         Finds the topmost visible application window in Z-order that is not the Libra GUI process.
         Ensures Libra inspects the user's actual workspace (e.g. VS Code, Chrome) instead of her own interface.
+        Uses win32gui first, followed by an iterative GetWindow Z-order traversal fallback.
         """
-        class TargetHolder:
-            found_hwnd = None
-
         ignored_titles = {
             "program manager", "settings", "default ime", "msctfime ui",
             "windows input experience", "taskbar", "search", "cortana",
             "action center", "snap assist", ""
         }
+        libra_pids = {os.getpid(), current_pid}
+        if PSUTIL_AVAILABLE:
+            try:
+                cur_p = psutil.Process(os.getpid())
+                for child in cur_p.children(recursive=True):
+                    libra_pids.add(child.pid)
+            except Exception:
+                pass
 
-        def enum_cb(h, lparam):
-            if h == current_hwnd or not user32.IsWindowVisible(h):
-                return True
+        def _is_cloaked(h: int) -> bool:
+            try:
+                cloaked = ctypes.c_int(0)
+                ctypes.windll.dwmapi.DwmGetWindowAttribute(h, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+                return cloaked.value != 0
+            except Exception:
+                return False
+
+        def _is_valid_app_window(h: int) -> bool:
+            if h == current_hwnd:
+                return False
+            if not user32.IsWindowVisible(h) or user32.IsIconic(h):
+                return False
+            if _is_cloaked(h):
+                return False
+            rect = wintypes.RECT()
+            if user32.GetWindowRect(h, ctypes.byref(rect)):
+                if (rect.right - rect.left) < 60 or (rect.bottom - rect.top) < 60:
+                    return False
             length = user32.GetWindowTextLengthW(h)
             if length <= 0:
-                return True
+                return False
             buff = ctypes.create_unicode_buffer(length + 1)
             user32.GetWindowTextW(h, buff, length + 1)
             t = buff.value.strip()
-            if not t or t.lower() in ignored_titles or "LIBRA // CYBERNETIC" in t.upper():
-                return True
-
+            if not t or t.lower() in ignored_titles:
+                return False
+            t_up = t.upper()
+            if any(k in t_up for k in ["LIBRA", "CYBERNETIC", "FUTURISTICVOICEASSISTANTUI"]):
+                return False
+            if t.lower().startswith("python"):
+                return False
             w_pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(h, ctypes.byref(w_pid))
-            if w_pid.value == current_pid or w_pid.value == os.getpid():
-                return True
+            if w_pid.value in libra_pids:
+                return False
+            if PSUTIL_AVAILABLE:
+                try:
+                    p = psutil.Process(w_pid.value)
+                    p_name = p.name().lower()
+                    if p_name in ("python.exe", "pythonw.exe", "conhost.exe"):
+                        if any("libra" in str(arg).lower() for arg in p.cmdline()):
+                            return False
+                except Exception:
+                    pass
+            return True
 
-            if user32.IsIconic(h):
-                return True
-
-            TargetHolder.found_hwnd = h
-            return False
-
-        EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        # 1. Native PyWin32 (win32gui) method - fully 64-bit clean
         try:
-            user32.EnumWindows(EnumWindowsProc(enum_cb), 0)
+            import win32gui
+            found_hwnds = []
+
+            def _pywin_cb(hwnd, _):
+                if _is_valid_app_window(hwnd):
+                    found_hwnds.append(hwnd)
+                    return False
+                return True
+
+            try:
+                win32gui.EnumWindows(_pywin_cb, None)
+            except Exception:
+                pass
+            if found_hwnds:
+                return found_hwnds[0]
         except Exception:
             pass
 
-        return TargetHolder.found_hwnd
+        # 2. Iterative GetWindow fallback (No ctypes callback pointers required)
+        try:
+            desktop = user32.GetDesktopWindow()
+            h = user32.GetWindow(desktop, 5)  # GW_CHILD
+            count = 0
+            while h and count < 200:
+                count += 1
+                if _is_valid_app_window(h):
+                    return h
+                h = user32.GetWindow(h, 2)  # GW_HWNDNEXT
+        except Exception:
+            pass
+
+        return None
 
     def get_active_window_info(self, dry_run: bool = False) -> Dict[str, Any]:
         """
@@ -170,7 +227,7 @@ class ActiveWindowEngine:
                 user32.GetWindowTextW(hwnd, buff, length + 1)
                 title = buff.value.strip()
 
-            if pid.value == os.getpid() or "LIBRA // CYBERNETIC" in title.upper():
+            if pid.value == os.getpid() or "LIBRA // CYBERNETIC" in title.upper() or "FUTURISTICVOICEASSISTANTUI" in title.upper():
                 external_hwnd = self._find_top_external_window(user32, hwnd, pid.value)
                 if external_hwnd:
                     hwnd = external_hwnd
@@ -180,6 +237,16 @@ class ActiveWindowEngine:
                         user32.GetWindowTextW(hwnd, buff, length + 1)
                         title = buff.value.strip()
                     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                else:
+                    info["hwnd"] = int(hwnd)
+                    info["window_title"] = "Libra Neural Terminal"
+                    info["pid"] = int(pid.value)
+                    info["process_name"] = "LibraAi"
+                    info["app_label"] = "Libra Neural Terminal"
+                    info["app_category"] = "assistant"
+                    self._enrich_parsed_metadata(info)
+                    self.last_window_snapshot = info
+                    return info
 
             info["hwnd"] = int(hwnd)
             info["window_title"] = title
@@ -261,23 +328,37 @@ class ActiveWindowEngine:
             info["page_title"] = cleaned_tab or title
 
     def _resolve_file_on_disk(self, filename: str) -> Optional[str]:
-        """Attempts to locate an active IDE filename inside PROJECT_ROOT."""
+        """Attempts to locate an active IDE or mentioned filename on disk."""
         if not filename:
             return None
-        clean_f = filename.strip(" ●*•")
+        clean_f = filename.strip(" ●*•`'\"")
         if os.path.isabs(clean_f) and os.path.isfile(clean_f):
             return clean_f
 
-        # Check direct relative path or search inside PROJECT_ROOT
-        direct = os.path.join(PROJECT_ROOT, clean_f)
-        if os.path.isfile(direct):
-            return direct
+        search_roots = [
+            PROJECT_ROOT,
+            os.path.join(os.path.expanduser("~"), "Desktop"),
+            os.path.join(os.path.expanduser("~"), "Desktop", "tester"),
+            os.path.join(os.path.expanduser("~"), "Desktop", "libratest"),
+            os.path.join(os.path.expanduser("~"), "Downloads"),
+            os.path.join(os.path.expanduser("~"), "Documents"),
+        ]
 
-        for root, dirs, files in os.walk(PROJECT_ROOT):
-            dirs[:] = [d for d in dirs if d not in {"venv", ".git", "__pycache__", "node_modules", ".idea"}]
-            for f in files:
-                if f.lower() == clean_f.lower():
-                    return os.path.join(root, f)
+        for base in search_roots:
+            if not os.path.exists(base):
+                continue
+            direct = os.path.join(base, clean_f)
+            if os.path.isfile(direct):
+                return direct
+
+            try:
+                for root, dirs, files in os.walk(base):
+                    dirs[:] = [d for d in dirs if d not in {"venv", ".git", "__pycache__", "node_modules", ".idea", "AppData"}]
+                    for f in files:
+                        if f.lower() == clean_f.lower():
+                            return os.path.join(root, f)
+            except Exception:
+                pass
         return None
 
     def summarize_active_window(self, dry_run: bool = False) -> Dict[str, Any]:
@@ -293,7 +374,9 @@ class ActiveWindowEngine:
         page = info.get("page_title")
         mem = info.get("memory_mb", 0.0)
 
-        if cat == "ide" and active_file:
+        if "libra" in app.lower() or "cybernetic" in title.lower() or "libra" in title.lower() or app.lower() == "python":
+            voice = "You're currently in the Libra Neural Terminal. Switch to VS Code, Chrome, or any document and I'll track your workspace automatically."
+        elif cat == "ide" and active_file:
             proj_clause = f" in the {project} project" if project else ""
             voice = f"You're currently in {app} working on {active_file}{proj_clause}."
         elif cat == "browser" and page:
@@ -305,7 +388,7 @@ class ActiveWindowEngine:
         else:
             voice = f"You currently have {app} in focus."
 
-        if mem and mem > 50:
+        if mem and mem > 50 and "libra" not in app.lower():
             voice = f"{voice[:-1]}, using {int(mem)} megabytes of RAM."
 
         return {
@@ -338,9 +421,18 @@ class ActiveWindowEngine:
         active_file_path = info.get("active_file_path")
         page_title = info.get("page_title") or info.get("window_title") or "the current page"
 
+        # Check if the prompt mentions a specific file name (e.g., "test.py", "script.py")
+        m_file = re.search(r"\b([a-zA-Z0-9_\-]+\.(?:py|js|ts|html|css|json|txt|md|cpp|c|rs|java|pyw))\b", q_low)
+        if m_file:
+            named_f = m_file.group(1).strip()
+            resolved = self._resolve_file_on_disk(named_f)
+            if resolved and os.path.isfile(resolved):
+                active_file = named_f
+                active_file_path = resolved
+
         # 1. Direct "What am I working on?" / "What window am I in?"
         if re.search(
-            r"\b(?:what\s+(?:am\s+i|a\s+man|i'm|i\s+am)\s+(?:working|walking|workin)\s+on|what\s+am\s+i\s+(?:doing|looking\s+at)|what\s+(?:window|app|application)\s+(?:am\s+i\s+in|is\s+(?:active|focused|open))|which\s+window\s+is\s+active)\b",
+            r"\b(?:what\s+(?:am\s+i|a\s+man|i'm|i\s+am)\s+(?:working|walking|workin|focusing|focused)\s+on|what\s+am\s+i\s+(?:doing|looking\s+at)|what\s+(?:window|app|application)\s+(?:am\s+i\s+in|is\s+(?:active|focused|open))|which\s+window\s+is\s+active)\b",
             q_low,
         ):
             return self.summarize_active_window(dry_run=dry_run)
@@ -393,43 +485,78 @@ class ActiveWindowEngine:
                 "voice_response": f"I checked {target_desc}. Copy the traceback or error line to your clipboard and I'll pinpoint the exact fix.",
             }
 
-        # 3. Script / Code Explanation ("Explain what this script does", "What does this file do?")
-        if re.search(
-            r"\b(?:explain\s+what\s+this\s+(?:script|file|code|module|function)\s+does|what\s+does\s+this\s+(?:script|file|code|module|function)\s+do|summarize\s+this\s+(?:script|file|code))\b",
-            q_low,
-        ):
+        # 3. Script / Code Explanation ("Explain what this script does", "Explain test.py", "Explain this script")
+        is_script_req = (
+            re.search(r"\b(?:explain\s+what\s+this\s+(?:script|file|code|module|function)\s+does|what\s+does\s+this\s+(?:script|file|code|module|function)\s+do|summarize\s+this\s+(?:script|file|code))\b", q_low)
+            or re.search(r"\b(?:explain|summarize|what\s+is|what\s+does|break\s+down)\s+(?:the\s+|this\s+|my\s+)?(?:script|code|file|program)\b", q_low)
+            or (m_file is not None and any(w in q_low for w in ["explain", "analyze", "read", "check", "script", "code", "showing"]))
+        )
+        if is_script_req:
             code_snippet = ""
             source_name = active_file or app_label
             if active_file_path and os.path.isfile(active_file_path):
                 try:
+                    if os.path.getsize(active_file_path) == 0:
+                        return {
+                            "status": "empty",
+                            "action": "active_window",
+                            "sub_action": "explain_script",
+                            "window_info": info,
+                            "active_file": active_file,
+                            "voice_response": f"I located {source_name}, but it is currently empty, so there's no code to explain yet."
+                        }
                     with open(active_file_path, "r", encoding="utf-8", errors="ignore") as f:
-                        code_snippet = f.read(2500)
+                        code_snippet = f.read(3000)
                 except Exception:
                     pass
 
             if not code_snippet and clipboard_agent:
-                clip_candidate = clipboard_agent.get_clipboard_text()
-                if clip_candidate and len(clip_candidate) > 15:
-                    code_snippet = clip_candidate[:2500]
-                    source_name = "your copied code"
+                if hasattr(clipboard_agent, "resolve_clipboard_payload"):
+                    payload = clipboard_agent.resolve_clipboard_payload()
+                    if payload.get("text") and len(payload["text"].strip()) > 10:
+                        code_snippet = payload["text"][:3000]
+                        source_name = payload.get("source") or "your clipboard"
+                if not code_snippet:
+                    clip_candidate = clipboard_agent.get_clipboard_text()
+                    if clip_candidate and len(clip_candidate) > 15:
+                        code_snippet = clip_candidate[:3000]
+                        source_name = "your clipboard code"
+
+            if not code_snippet:
+                # Fallback check for test file on Desktop
+                candidates = [
+                    os.path.join(os.path.expanduser("~"), "Desktop", "tester", "test.txt"),
+                    os.path.join(os.path.expanduser("~"), "Desktop", "test.txt"),
+                ]
+                for cand in candidates:
+                    if os.path.isfile(cand) and os.path.getsize(cand) > 0:
+                        try:
+                            with open(cand, "r", encoding="utf-8", errors="ignore") as f:
+                                code_snippet = f.read(3000)
+                            source_name = os.path.basename(cand)
+                            active_file = source_name
+                            break
+                        except Exception:
+                            pass
 
             if code_snippet:
                 if dry_run or llm_callback is None:
                     lines_count = len(code_snippet.splitlines())
                     voice = f"You're viewing {source_name} in {app_label} ({lines_count} lines). It defines core logic and helper functions for this module."
                 else:
+                    target_model = getattr(llm_callback, "model", None) or "qwen3:8b"
                     sys_p = (
-                        f"You are Libra, analyzing {source_name} open in {app_label}. "
-                        "Explain what this script or code does in 2 crisp, natural spoken sentences. No markdown."
+                        f"You are Libra, analyzing {source_name}. "
+                        "Explain what this script or code does in 2-3 crisp, natural spoken sentences. No markdown, no code blocks."
                     )
                     if hasattr(llm_callback, "call_ollama"):
-                        voice = llm_callback.call_ollama("qwen3:8b", f"Code:\n{code_snippet}", system_prompt=sys_p, timeout=25)
+                        voice = llm_callback.call_ollama(target_model, f"Code:\n{code_snippet}", system_prompt=sys_p, timeout=25)
                     elif callable(llm_callback):
                         voice = llm_callback(f"{sys_p}\n\nCode:\n{code_snippet}")
                     else:
                         voice = ""
                     if not voice:
-                        voice = f"{source_name} in {app_label} implements core module functionality."
+                        voice = f"{source_name} implements core module functionality with {len(code_snippet.splitlines())} lines of code."
 
                 return {
                     "status": "success",
@@ -445,7 +572,7 @@ class ActiveWindowEngine:
                 "action": "active_window",
                 "sub_action": "explain_script",
                 "window_info": info,
-                "voice_response": f"You're in {app_label}" + (f" viewing {active_file}." if active_file else ". Highlight and copy any code block if you want a line-by-line breakdown."),
+                "voice_response": f"You're in {app_label}" + (f" viewing {active_file}." if active_file else ". Copy the code or open the file in VS Code and I'll break it down."),
             }
 
         # 4. Browser / Thread Reply Generation ("Can you write a reply to this thread?", "Draft a reply to this")

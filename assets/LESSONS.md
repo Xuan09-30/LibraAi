@@ -18,3 +18,4 @@ Whenever a similar ambiguous query or command arises, Libra consults these lesso
 - **Trigger**: `open my project folder` | **Avoid**: `OldDrafts` | **Corrected Action**: `LibraAi` (2026-10-17 22:34)
 - **Trigger**: `open my project folder` | **Avoid**: `OldDrafts` | **Corrected Action**: `LibraAi` (2026-10-17 22:45)
 - **Trigger**: `open my project folder` | **Avoid**: `OldDrafts` | **Corrected Action**: `LibraAi` (2026-10-17 22:47)
+- **Trigger**: `open my project folder` | **Avoid**: `OldDrafts` | **Corrected Action**: `LibraAi` (2026-10-18 09:05)

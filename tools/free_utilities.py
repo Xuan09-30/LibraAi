@@ -486,7 +486,12 @@ class FreeUtilityBelt:
             "voice_response": f"You appear to be offline right now. Your local IP address is {local_ip}.",
         }
 
-    def handle_query(self, query: str, dry_run: bool = False) -> Optional[Dict[str, Any]]:
+    def handle_query(
+        self,
+        query: str,
+        context: Optional[Dict[str, Any]] = None,
+        dry_run: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         """
         Inspects a natural language query and executes the matching FreeUtilityBelt tool
         (currency, math/unit/percentage, world clock/date, or network/ping/IP).
@@ -504,13 +509,25 @@ class FreeUtilityBelt:
             return self.check_network_ping(dry_run=dry_run)
 
         # 2. Time & Date / World Clock
-        time_m = re.search(
-            r"\b(?:what\s+time\s+is\s+it|what(?:'s|\s+is)\s+the\s+(?:current\s+)?time|current\s+time|tell\s+me\s+the\s+time|what(?:'s|\s+is)\s+today(?:'s)?\s+date|what\s+day\s+is\s+(?:it\s+)?today|what\s+is\s+the\s+date\s+today)(?:\s+(?:in|at|for)\s+([a-zA-Z\s]+?))?[\.\?!]*$",
-            q_low,
+        time_m = (
+            re.search(
+                r"\b(?:what\s+time\s+is\s+it|what(?:'s|\s+is)\s+the\s+(?:current\s+)?time|current\s+time|tell\s+me\s+the\s+time|what(?:'s|\s+is)\s+today(?:'s)?\s+date|what\s+day\s+is\s+(?:it\s+)?today|what\s+is\s+the\s+date\s+today)\b(?:\s+(?:in|at|for|there|over\s+there)\s*([a-zA-Z\s]*))?",
+                q_low,
+            )
+            or re.search(r"\b(?:what(?:'s|\s+is)\s+the\s+time|what\s+time\s+is\s+it)\b", q_low)
         )
         if time_m:
-            loc = time_m.group(1).strip() if time_m.group(1) else None
-            if loc and loc in ["right now", "now", "today", "here"]:
+            loc = None
+            if hasattr(time_m, "group") and time_m.groups() and time_m.group(1):
+                raw_loc = time_m.group(1).strip()
+                clean_loc = re.sub(r"\b(?:right\s+now|now|today|here|please)\b", "", raw_loc).strip()
+                loc = clean_loc or None
+            if loc in ["there", "over there"] or (not loc and ("there" in q_low or "over there" in q_low)):
+                if context and context.get("city"):
+                    loc = context["city"]
+                else:
+                    loc = None
+            elif loc and loc.lower() in ["right now", "now", "today", "here"]:
                 loc = None
             return self.get_time_in(location=loc, query=q_low)
 

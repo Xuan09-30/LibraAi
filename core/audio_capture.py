@@ -140,3 +140,67 @@ class WASAPIAudioCapture:
                 self.pa.terminate()
         except Exception:
             pass
+
+
+def scale_pcm_amplitude(pcm_bytes: bytes, gain: float) -> bytes:
+    """
+    Scales 16-bit signed PCM audio amplitude in memory.
+
+    :param pcm_bytes: Raw 16-bit mono PCM byte string.
+    :param gain: Volume multiplier (0.0 = mute, 0.5 = -6dB, 1.0 = original).
+    :return: Scaled 16-bit mono PCM byte string.
+    """
+    if not pcm_bytes or gain <= 0.0:
+        return b"\x00" * len(pcm_bytes)
+    if gain == 1.0:
+        return pcm_bytes
+
+    # Convert 16-bit signed PCM bytes to float32 to prevent integer overflow
+    samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+
+    # Scale and clamp strictly between signed 16-bit integer boundaries
+    scaled = np.clip(samples * gain, -32768, 32767).astype(np.int16)
+
+    return scaled.tobytes()
+
+
+def get_windows_master_volume() -> float:
+    """Returns the current Windows master volume as a float between 0.0 and 1.0."""
+    try:
+        from pycaw.pycaw import AudioUtilities
+        speakers = AudioUtilities.GetSpeakers()
+        if hasattr(speakers, "EndpointVolume") and speakers.EndpointVolume:
+            return float(speakers.EndpointVolume.GetMasterVolumeLevelScalar())
+        elif hasattr(speakers, "volume_percent"):
+            return float(speakers.volume_percent) / 100.0
+        elif hasattr(speakers, "Activate"):
+            from comtypes import CLSCTX_ALL
+            from pycaw.pycaw import IAudioEndpointVolume
+            interface = speakers.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            volume = interface.QueryInterface(IAudioEndpointVolume)
+            return float(volume.GetMasterVolumeLevelScalar())
+    except Exception:
+        pass
+    return 1.0  # Fallback to full volume if COM query fails
+
+
+def get_dynamic_chime_pcm(cached_chime_bytes: bytes, base_gain: float = 0.35) -> bytes:
+    """
+    Computes an adaptive chime buffer based on active Windows master volume.
+
+    :param cached_chime_bytes: Original unmodified PCM bytes loaded at startup.
+    :param base_gain: Independent baseline loudness ratio (e.g., 35% of full scale).
+    """
+    if not cached_chime_bytes:
+        return b""
+
+    master_vol = get_windows_master_volume()
+
+    # If the system is completely muted or at 0%, mute the chime
+    if master_vol <= 0.01:
+        return b""
+
+    # Prevent harsh peaks when Windows volume is cranked up
+    adjusted_gain = base_gain * (0.5 + 0.5 * (1.0 - master_vol * 0.4))
+
+    return scale_pcm_amplitude(cached_chime_bytes, gain=adjusted_gain)

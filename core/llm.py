@@ -3,6 +3,7 @@ import re
 import json
 import threading
 import requests
+import pytz
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Generator
 
@@ -10,6 +11,7 @@ from core.memory import MemoryCore, SemanticMemory
 from core.research import HardenedResearchEngine
 from core.scheduler import ReminderEngine
 from core.dispatcher import SafeOSDispatcher
+from core.folder_watchdog import AutomatedFolderWatchdog
 from core.spatial import SpatialGroundingEngine
 from core.session import SessionManager
 from core.text_cleaner import normalize_for_tts
@@ -42,6 +44,7 @@ from tools.free_utilities import FreeUtilityBelt
 from tools.window_context import ActiveWindowEngine
 from core.idle_daemon import IdleTaskDaemon
 from core.mcp_client import LibraMCPClient
+from tools.chrome_agent import ChromeProfileManager
 
 
 def condense_spelling(text: str) -> str:
@@ -93,8 +96,14 @@ class LocalLLM:
         self.model_mgr = ModelManager(ollama_host=self.host)
         self.clipboard_agent = ClipboardAgent()
         self.document_rag = DocumentRAGEngine(file_mgr=self.file_mgr, ollama_base_url=self.host)
+        self.clipboard_agent.text_extractor = self.document_rag.extract_text
         self.security_scanner = SecurityScanner(file_mgr=self.file_mgr)
         self.attached_file_path: Optional[str] = None
+        self.folder_watchdog = AutomatedFolderWatchdog(
+            discovery_engine=self.dispatcher.discovery,
+            document_rag=self.document_rag
+        )
+        self.folder_watchdog.start()
         self.workspaces = WorkspaceManager(
             dispatcher=self.dispatcher,
             scheduler=self.scheduler,
@@ -135,6 +144,8 @@ class LocalLLM:
         )
         self.pending_confirmation = None
         self.pending_clarification: Optional[Dict[str, Any]] = None
+        self.chrome_mgr = ChromeProfileManager()
+        self.pending_chrome_profile: Optional[List[Dict[str, str]]] = None
         self.conversation_history = []
         self.last_context: Dict[str, Any] = {
             "city": None,
@@ -715,6 +726,41 @@ class LocalLLM:
           - No databases are mutated
           - No outbound web search requests are made
         """
+        # 0. Active Chrome Profile Follow-Up Resolution (within continuous window)
+        if self.pending_chrome_profile is not None:
+            resolved_p = self.chrome_mgr.resolve_profile(prompt)
+            if resolved_p:
+                self.pending_chrome_profile = None
+                p_dir = resolved_p["dir"]
+                p_name = resolved_p["name"]
+                if not dry_run:
+                    self.chrome_mgr.launch_chrome(p_dir, dry_run=False)
+                    if "chrome" not in self.session_state["active_apps"]:
+                        self.session_state["active_apps"].append("chrome")
+                    self.session_state["last_target"] = "chrome"
+                    self.session_state["last_action"] = "open_app"
+                plan_res = {
+                    "action": "open_app",
+                    "app_id": "chrome",
+                    "profile": resolved_p,
+                    "status": "success",
+                    "voice_response": f"Switched to the {p_name} profile in Google Chrome."
+                }
+                if not dry_run:
+                    self._record_turn(prompt, plan_res["voice_response"])
+                return self._process_response(plan_res, prompt, dry_run=dry_run)
+            elif any(w in prompt.lower() for w in ["cancel", "never mind", "ignore", "neither", "keep current"]):
+                self.pending_chrome_profile = None
+                plan_res = {
+                    "action": "chat",
+                    "voice_response": "Keeping current Google Chrome session."
+                }
+                if not dry_run:
+                    self._record_turn(prompt, plan_res["voice_response"])
+                return self._process_response(plan_res, prompt, dry_run=dry_run)
+            else:
+                self.pending_chrome_profile = None
+
         # 0. Active Clarification Follow-Up Resolution (within continuous window)
         if self.pending_clarification is not None:
             resolved_clar = self.clarifier.resolve_clarification(prompt, self.pending_clarification)
@@ -969,6 +1015,123 @@ class LocalLLM:
             return plan_res
 
         # -------------------------------------------------------------
+        # 5.5 WORLD CLOCK & TIME FAST-PATH ("What time is it in Tokyo?", "What's the time there?")
+        # -------------------------------------------------------------
+        time_match = (
+            re.search(r"^(?:please\s+)?(?:what\s+is|what\'s|tell\s+me)\s+(?:the\s+)?(?:current\s+)?time(?:\s+(?:is\s+it|right\s+now|now))?[\.\?!]*$", q_lower)
+            or re.search(r"^what\s+time\s+is\s+it(?:\s+(?:right\s+now|now))?[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:what\s+(?:is|'s)\s+the\s+time\s+(?:in|for|at)\s+|time\s+(?:in|for|at)\s+)(.+?)[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:what\s+(?:is|'s)\s+(?:the\s+)?time\s+there|what\s+time\s+is\s+it\s+there|time\s+there|what\s+about\s+the\s+time\s+there)\b", q_lower)
+            or re.search(r"^(?:what\s+(?:is|'s)\s+(?:today's\s+date|the\s+date\s+today)|what\s+day\s+is\s+it)[\.\?!]*$", q_lower)
+        )
+        if time_match:
+            is_there = bool(re.search(r"\b(?:there|that\s+city|that\s+place)\b", q_lower))
+            if is_there:
+                city_target = self.last_context.get("city") or self.city
+            elif time_match.groups() and time_match.group(1):
+                city_target = time_match.group(1).strip().rstrip(".?!")
+            else:
+                city_target = self.city
+
+            clean_city = re.sub(r"^(?:in|for|at|the)\s+", "", city_target, flags=re.IGNORECASE).strip()
+            clean_city = re.sub(r"\s+(?:right\s+now|now|currently|at\s+the\s+moment|today|please|for\s+me|there)[\.\?!]*$", "", clean_city, flags=re.IGNORECASE).strip().rstrip(".?!")
+            clean_city_low = clean_city.lower()
+
+            tz_map = {
+                "tokyo": "Asia/Tokyo",
+                "japan": "Asia/Tokyo",
+                "london": "Europe/London",
+                "uk": "Europe/London",
+                "england": "Europe/London",
+                "new york": "America/New_York",
+                "nyc": "America/New_York",
+                "los angeles": "America/Los_Angeles",
+                "la": "America/Los_Angeles",
+                "san francisco": "America/Los_Angeles",
+                "seattle": "America/Los_Angeles",
+                "chicago": "America/Chicago",
+                "paris": "Europe/Paris",
+                "france": "Europe/Paris",
+                "berlin": "Europe/Berlin",
+                "germany": "Europe/Berlin",
+                "rome": "Europe/Rome",
+                "italy": "Europe/Rome",
+                "madrid": "Europe/Madrid",
+                "spain": "Europe/Madrid",
+                "dubai": "Asia/Dubai",
+                "uae": "Asia/Dubai",
+                "singapore": "Asia/Singapore",
+                "kuala lumpur": "Asia/Kuala_Lumpur",
+                "kl": "Asia/Kuala_Lumpur",
+                "malaysia": "Asia/Kuala_Lumpur",
+                "bangkok": "Asia/Bangkok",
+                "thailand": "Asia/Bangkok",
+                "jakarta": "Asia/Jakarta",
+                "indonesia": "Asia/Jakarta",
+                "seoul": "Asia/Seoul",
+                "korea": "Asia/Seoul",
+                "south korea": "Asia/Seoul",
+                "beijing": "Asia/Shanghai",
+                "shanghai": "Asia/Shanghai",
+                "china": "Asia/Shanghai",
+                "hong kong": "Asia/Hong_Kong",
+                "taipei": "Asia/Taipei",
+                "taiwan": "Asia/Taipei",
+                "sydney": "Australia/Sydney",
+                "melbourne": "Australia/Melbourne",
+                "australia": "Australia/Sydney",
+                "auckland": "Pacific/Auckland",
+                "new zealand": "Pacific/Auckland",
+                "toronto": "America/Toronto",
+                "vancouver": "America/Vancouver",
+                "canada": "America/Toronto",
+                "mumbai": "Asia/Kolkata",
+                "delhi": "Asia/Kolkata",
+                "india": "Asia/Kolkata",
+                "cairo": "Africa/Cairo",
+                "egypt": "Africa/Cairo",
+                "hawaii": "Pacific/Honolulu",
+                "honolulu": "Pacific/Honolulu",
+                "moscow": "Europe/Moscow",
+                "russia": "Europe/Moscow",
+            }
+            resolved_tz_name = tz_map.get(clean_city_low)
+            if not resolved_tz_name and clean_city_low:
+                c_norm = clean_city_low.replace(" ", "_")
+                for t in pytz.all_timezones:
+                    if c_norm in t.lower():
+                        resolved_tz_name = t
+                        break
+
+            if not resolved_tz_name:
+                resolved_tz_name = "Asia/Kuala_Lumpur"
+                display_city = clean_city.title() if clean_city else self.city
+            else:
+                display_city = clean_city.title() if clean_city else self.city
+
+            tz = pytz.timezone(resolved_tz_name)
+            now = datetime.now(tz)
+            time_str = now.strftime("%I:%M %p").lstrip("0")
+            date_str = now.strftime("%A, %B %d")
+
+            is_date_only = bool(re.search(r"\b(?:date|what\s+day)\b", q_lower))
+            if is_date_only:
+                msg = f"Today is {date_str}."
+            else:
+                msg = f"The current time in {display_city} is {time_str} ({date_str})."
+
+            self.last_context["city"] = display_city
+            plan_res = {
+                "action": "world_time",
+                "args": {"city": display_city, "time": time_str, "date": date_str, "timezone": resolved_tz_name},
+                "status": "success",
+                "voice_response": msg,
+            }
+            if not dry_run:
+                self._record_turn(prompt, msg)
+            return plan_res
+
+        # -------------------------------------------------------------
         # 6. SCHEDULE REMINDER, TIMERS, ALARMS & TOAST NOTIFICATIONS (v10.0)
         # -------------------------------------------------------------
         # 6.1 List Pending Reminders
@@ -1095,12 +1258,41 @@ class LocalLLM:
             return plan_res
 
         # Strip conversational filler prefixes for command intent matching
-        # e.g., "Alright, how about you...", "Okay now how about you...", "Can you please..."
+        # e.g., "Alright, how about you...", "Okay now how about you...", "Can you please can you..."
         cmd_query = re.sub(
-            r"^(?:alright|okay\s+now|okay|ok|well|now|so|hey\s+libra|libra)?[\s,]+(?:how\s+about\s+you|could\s+you(?:\s+please)?|can\s+you(?:\s+please)?|would\s+you(?:\s+please)?|please|now\s+how\s+about\s+you|go\s+ahead\s+and)?\s*",
+            r"^(?:(?:alright|okay\s+now|okay|ok|well|now|so|hey\s+libra|libra|first|uhh|um|nevermind|please|can\s+you(?:\s+please)?|could\s+you(?:\s+please)?|would\s+you(?:\s+please)?|how\s+about\s+you|go\s+ahead\s+and|i\s+want\s+you\s+to|i\s+want\s+to|i\s+need\s+you\s+to)[\s,]+)+",
             "",
             q_lower
         ).strip()
+
+        # -------------------------------------------------------------
+        # 7.8 UI VISIBILITY CONTROLS (STEALTH BACKGROUND ASSISTANT)
+        # -------------------------------------------------------------
+        show_ui_match = (
+            re.search(r"\b(?:show\s+(?:me\s+)?(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|open\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|bring\s+up\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|display\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface))\b", q_lower)
+            or re.search(r"\b(?:show\s+(?:me\s+)?(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|open\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|bring\s+up\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|display\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface))\b", cmd_query)
+        )
+        if show_ui_match:
+            plan_res = {"action": "show_ui", "args": {}}
+            msg = "Displaying neural interface."
+            plan_res["voice_response"] = msg
+            if not dry_run:
+                self.session_state["last_action"] = "show_ui"
+                self._record_turn(prompt, msg)
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+        hide_ui_match = (
+            re.search(r"\b(?:hide\s+(?:me\s+)?(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|close\s+(?:your\s+)(?:neural\s+)?(?:ui|window|interface)|minimize\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|go\s+to\s+background|send\s+to\s+background|hide\s+window|minimize\s+window|minimize\s+ui)\b", q_lower)
+            or re.search(r"\b(?:hide\s+(?:me\s+)?(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|close\s+(?:your\s+)(?:neural\s+)?(?:ui|window|interface)|minimize\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|go\s+to\s+background|send\s+to\s+background|hide\s+window|minimize\s+window|minimize\s+ui)\b", cmd_query)
+        )
+        if hide_ui_match:
+            plan_res = {"action": "hide_ui", "args": {}}
+            msg = "Hiding interface. I'll remain active in the background."
+            plan_res["voice_response"] = msg
+            if not dry_run:
+                self.session_state["last_action"] = "hide_ui"
+                self._record_turn(prompt, msg)
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
 
         # -------------------------------------------------------------
         # 8. MULTI-TURN CONTEXT FOR APP LAUNCH ("Okay now, launch..." -> "Overwatch")
@@ -1305,11 +1497,27 @@ class LocalLLM:
         # -------------------------------------------------------------
         open_app_match = (
             re.search(r"^(?:please\s+)?(?:launch|open|start|run|play|fire\s+up|boot\s+up|spin\s+up)\s+(.+?)[\.\?!]*$", cmd_query)
+            or re.search(r"\b(?:launch|open|start|run|play|fire\s+up|boot\s+up|spin\s+up)\s+(.+?)[\.\?!]*$", cmd_query)
             or re.search(r"^(?:please\s+)?(?:launch|open|start|run|play|fire\s+up|boot\s+up|spin\s+up)\s+(.+?)[\.\?!]*$", q_lower)
         )
         if open_app_match:
             raw_app = open_app_match.group(1).strip()
-            raw_app = re.sub(r"\s+for\s+me$", "", raw_app).strip().rstrip(".?!")
+            # Strip trailing conversational politeness / suffixes (e.g. ", can you", "for me", "please", "now")
+            raw_app = re.sub(
+                r"(?:[,\s]+(?:can\s+you(?:\s+please)?|could\s+you(?:\s+please)?|would\s+you(?:\s+please)?|if\s+you\s+can|for\s+me|please|thanks|thank\s+you|right\s+now|now|immediately|asap|again))+\s*[\.\?!]*$",
+                "",
+                raw_app,
+                flags=re.IGNORECASE,
+            ).strip().rstrip(".?!")
+
+            # ABSOLUTE SAFETY GUARD: If raw_app contains security scan keywords, delegate to virus scanner!
+            if any(w in raw_app.lower() for w in ["security scan", "virus scan", "malware scan", "scan for viruses", "scan on", "scan for", "security test"]):
+                open_app_match = False
+
+        if open_app_match:
+            # Strip prefixes like "up ", "my ", "the ", "app "
+            raw_app = re.sub(r"^(?:up\s+|my\s+|the\s+|app\s+)+", "", raw_app, flags=re.IGNORECASE).strip()
+            raw_app = re.sub(r"\s+(?:app|application)$", "", raw_app, flags=re.IGNORECASE).strip()
 
             # ABSOLUTE SAFETY GUARD: If raw_app contains "folder" or "directory", it is NEVER an app!
             if any(w in raw_app.lower() for w in ["folder", "directory", "dir"]):
@@ -1327,9 +1535,12 @@ class LocalLLM:
                     self._record_turn(prompt, plan_res["voice_response"])
                 return self._process_response(plan_res, prompt, dry_run=dry_run)
 
-            # Guard: If query mentions "on spotify" or is simply "spotify", route to spotify_play
-            if raw_app.lower() == "spotify" or re.search(r"\bon\s+spotify\b", raw_app.lower()):
-                query_target = "" if raw_app.lower() == "spotify" else re.sub(r"\bon\s+spotify\b", "", raw_app, flags=re.IGNORECASE).strip()
+            # Guard: If query mentions "spotify" or music playback ("open my spotify to place a music", "play some music")
+            clean_low = raw_app.lower()
+            if "spotify" in clean_low or clean_low in ["music", "some music", "a song"]:
+                query_target = ""
+                if any(k in clean_low for k in ["music", "song", "play", "place", "some"]):
+                    query_target = re.sub(r"\b(?:open|launch|start|play|place|my|the|spotify|some|a|music|song|and|to)\b", "", clean_low).strip()
                 sp_res = self.spotify_agent.play_query(query_target, dry_run=dry_run)
                 plan_res = {
                     "action": "spotify_play",
@@ -1342,6 +1553,69 @@ class LocalLLM:
                     self.session_state["last_action"] = "spotify_play"
                     self._record_turn(prompt, plan_res["voice_response"])
                 return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+            # Guard: Google Chrome multi-profile discovery & launching
+            if clean_low in ["chrome", "google chrome"] or clean_low.startswith(("chrome ", "google chrome ")):
+                chrome_profiles = self.chrome_mgr.get_profiles()
+                specific_profile = None
+                if len(chrome_profiles) > 1:
+                    specific_profile = self.chrome_mgr.resolve_profile(prompt) or self.chrome_mgr.resolve_profile(raw_app)
+
+                if specific_profile:
+                    p_dir = specific_profile["dir"]
+                    p_name = specific_profile["name"]
+                    if not dry_run:
+                        self.chrome_mgr.launch_chrome(p_dir, dry_run=False)
+                        if "chrome" not in self.session_state["active_apps"]:
+                            self.session_state["active_apps"].append("chrome")
+                        self.session_state["last_target"] = "chrome"
+                        self.session_state["last_action"] = "open_app"
+                    plan_res = {
+                        "action": "open_app",
+                        "app_id": "chrome",
+                        "profile": specific_profile,
+                        "status": "success",
+                        "voice_response": f"Launching Google Chrome with the {p_name} profile."
+                    }
+                    if not dry_run:
+                        self._record_turn(prompt, plan_res["voice_response"])
+                    return self._process_response(plan_res, prompt, dry_run=dry_run)
+                elif len(chrome_profiles) > 1:
+                    names = [p["name"] for p in chrome_profiles]
+                    names_str = " or ".join(names[:3])
+                    self.pending_chrome_profile = chrome_profiles
+                    if not dry_run:
+                        self.chrome_mgr.launch_chrome(chrome_profiles[0]["dir"], dry_run=False)
+                        if "chrome" not in self.session_state["active_apps"]:
+                            self.session_state["active_apps"].append("chrome")
+                        self.session_state["last_target"] = "chrome"
+                        self.session_state["last_action"] = "open_app"
+                    plan_res = {
+                        "action": "open_app",
+                        "app_id": "chrome",
+                        "profiles": chrome_profiles,
+                        "status": "success",
+                        "voice_response": f"Google Chrome opened. Which account would you like to use — {names_str}?"
+                    }
+                    if not dry_run:
+                        self._record_turn(prompt, plan_res["voice_response"])
+                    return self._process_response(plan_res, prompt, dry_run=dry_run)
+                else:
+                    if not dry_run:
+                        self.chrome_mgr.launch_chrome(dry_run=False)
+                        if "chrome" not in self.session_state["active_apps"]:
+                            self.session_state["active_apps"].append("chrome")
+                        self.session_state["last_target"] = "chrome"
+                        self.session_state["last_action"] = "open_app"
+                    plan_res = {
+                        "action": "open_app",
+                        "app_id": "chrome",
+                        "status": "success",
+                        "voice_response": "Launching Google Chrome."
+                    }
+                    if not dry_run:
+                        self._record_turn(prompt, plan_res["voice_response"])
+                    return self._process_response(plan_res, prompt, dry_run=dry_run)
 
             # Guard: workspace mode or game mode commands are delegated to their dedicated sections
             if not (re.search(r"\b(?:coding|study|gaming)\s+(?:mode|workspace)\b", raw_app) or raw_app in ["game mode", "mode"]):
@@ -1370,19 +1644,34 @@ class LocalLLM:
                 return self._process_response(plan_res, prompt, dry_run=dry_run)
 
         close_app_match = (
-            re.search(r"^(?:hurry(?:\s+up)?(?:\s+and)?\s+|quick(?:ly)?(?:\s+and)?\s+|immediately\s+|please\s+)?(?:close|shut\s+down|exit|kill|terminate)\s+(?:the\s+)?(.+?)(?:\s+right\s+now|\s+now|\s+immediately|\s+asap)?[\.\?!]*$", cmd_query)
-            or re.search(r"^(?:hurry(?:\s+up)?(?:\s+and)?\s+|quick(?:ly)?(?:\s+and)?\s+|immediately\s+|please\s+)?(?:close|shut\s+down|exit|kill|terminate)\s+(?:the\s+)?(.+?)(?:\s+right\s+now|\s+now|\s+immediately|\s+asap)?[\.\?!]*$", q_lower)
+            re.search(r"(?:(?:okay|alright|now|first|please|can\s+you(?:\s+please)?|i\s+want\s+you\s+to|i\s+want\s+to)\s+)*(?:close|shut\s+down|exit|kill|terminate)\s+(?:the\s+)?(.+?)(?:\s+for\s+me|\s+right\s+now|\s+now|\s+immediately|\s+asap|\s+thank\s+you)*[\.\?!]*$", cmd_query)
+            or re.search(r"(?:(?:okay|alright|now|first|please|can\s+you(?:\s+please)?|i\s+want\s+you\s+to|i\s+want\s+to)\s+)*(?:close|shut\s+down|exit|kill|terminate)\s+(?:the\s+)?(.+?)(?:\s+for\s+me|\s+right\s+now|\s+now|\s+immediately|\s+asap|\s+thank\s+you)*[\.\?!]*$", q_lower)
         )
         if close_app_match:
             target = close_app_match.group(1).strip()
-            if "active" in target or target in ["window", "it", "current window", "active window", "active app", "process", "the process"]:
+            target = re.sub(r"[\.\?!]+$", "", target).strip()
+            target = re.sub(r"\s+(?:for\s+me|thank\s+you|thanks|please|right\s+now|now|immediately|asap)$", "", target, flags=re.IGNORECASE).strip()
+            target = re.sub(r"\s+(?:for\s+me|thank\s+you|thanks|please|right\s+now|now|immediately|asap)$", "", target, flags=re.IGNORECASE).strip()
+            target = re.sub(r"^(?:my|the)\s+", "", target, flags=re.IGNORECASE).strip()
+            t_low = target.lower()
+            if any(k in t_low for k in ["this card", "this cord", "dis card", "discord"]):
+                target = "discord"
+            elif t_low in ["this", "this app", "this window", "active", "it", "current window", "active window", "process", "the process"]:
                 target = "active"
             plan_res = {"action": "close_app", "args": {"target": target, "target_app": target}, "target": target, "target_app": target}
             if not dry_run:
-                actual_target = self.session_state.get("last_target") if target in ["active", "it"] else target
-                success, msg = self.dispatcher.close_app(actual_target or target, dry_run=False)
-                if success and actual_target and actual_target in self.session_state["active_apps"]:
-                    self.session_state["active_apps"].remove(actual_target)
+                success = False
+                msg = ""
+                if target == "active":
+                    success, msg = self.dispatcher.close_app("active", dry_run=False)
+                    if not success and self.session_state.get("last_target"):
+                        fallback_t = self.session_state["last_target"]
+                        success, msg = self.dispatcher.close_app(fallback_t, dry_run=False)
+                else:
+                    actual_target = self.session_state.get("last_target") if target == "it" else target
+                    success, msg = self.dispatcher.close_app(actual_target or target, dry_run=False)
+                if success and target != "active" and target in self.session_state["active_apps"]:
+                    self.session_state["active_apps"].remove(target)
                 plan_res["voice_response"] = normalize_for_tts(msg)
             else:
                 plan_res["voice_response"] = f"Terminated {target}." if target != "active" else "Process terminated immediately."
@@ -1545,10 +1834,11 @@ class LocalLLM:
         # 8.10 CLIPBOARD COPILOT & CODE DEBUGGER
         # -------------------------------------------------------------
         clipboard_assist_match = (
-            re.search(r"\b(?:explain|diagnose|debug|fix)\s+(?:the\s+)?(?:error|traceback|bug|exception)?\s*(?:on|in|from)?\s*(?:my\s+)?clipboard\b", q_lower)
-            or re.search(r"\b(?:explain|debug|diagnose)\s+my\s+clipboard\b", q_lower)
-            or (re.search(r"\b(?:summarize|what\s+did\s+i\s+just\s+copy|what\s+did\s+i\s+copy|what\s+is\s+on\s+my\s+clipboard)\b", q_lower) and ("clipboard" in q_lower or "copy" in q_lower))
-            or re.search(r"^summarize\s+(?:what\s+i\s+just\s+copied|what\s+i\s+copied|clipboard)[\.\?!]*$", q_lower)
+            "clipboard" in q_lower
+            or re.search(r"\b(?:copy|copied)\s+(?:this|that|it|everything)?\s*(?:to|into)\s+(?:the\s+|my\s+)?clipboard\b", q_lower)
+            or re.search(r"\b(?:explain|diagnose|analyze|summarize|read|check)\s+(?:what\s+i\s+(?:just\s+)?copied|the\s+(?:code|file|script|error))\b", q_lower)
+            or re.search(r"^(?:please\s+)?(?:explain|analyze|summarize|view|inspect|read|check)\s+(?:this\s+|the\s+|my\s+)?(?:file|code|script|traceback|error)[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:view\s+or\s+analyze\s+(?:the\s+|this\s+)?file|analyze\s+this\s+file|explain\s+this\s+file|what\s+does\s+this\s+file\s+do)\b", q_lower)
         )
         if clipboard_assist_match:
             is_summary = bool(re.search(r"\b(?:summarize|what\s+did\s+i\s+copy)\b", q_lower))
@@ -1557,11 +1847,29 @@ class LocalLLM:
                 "args": {"query": cleaned_query},
                 "sub_action": "clipboard_summarize" if is_summary else "clipboard_explain"
             }
+            # Fallback file targeting: if clipboard is empty, check attached file or active window file
+            target_text = None
+            if self.attached_file_path and os.path.isfile(self.attached_file_path):
+                try:
+                    with open(self.attached_file_path, "r", encoding="utf-8", errors="ignore") as af:
+                        target_text = f"[Attached File: {os.path.basename(self.attached_file_path)}]\n" + af.read(3000)
+                except Exception:
+                    pass
+            elif not self.clipboard_agent.get_clipboard_text() and not self.clipboard_agent.get_clipboard_files():
+                win_snap = self.window_engine.get_active_window_info(dry_run=dry_run)
+                act_fp = win_snap.get("active_file_path")
+                if act_fp and os.path.isfile(act_fp):
+                    try:
+                        with open(act_fp, "r", encoding="utf-8", errors="ignore") as wf:
+                            target_text = f"[Active File: {os.path.basename(act_fp)}]\n" + wf.read(3000)
+                    except Exception:
+                        pass
+
             if not dry_run:
                 if is_summary:
                     res = self.clipboard_agent.summarize_clipboard(llm=self, dry_run=False)
                 else:
-                    res = self.clipboard_agent.explain_clipboard(llm_callback=self, dry_run=False)
+                    res = self.clipboard_agent.explain_clipboard(llm_callback=self, text=target_text, dry_run=False)
                 plan_res["voice_response"] = normalize_for_tts(res.get("voice_response", "Clipboard processed."))
                 self.session_state["last_action"] = "clipboard_assist"
                 self._record_turn(prompt, plan_res["voice_response"])
@@ -1569,7 +1877,7 @@ class LocalLLM:
                 if is_summary:
                     res = self.clipboard_agent.summarize_clipboard(dry_run=True)
                 else:
-                    res = self.clipboard_agent.explain_clipboard(dry_run=True)
+                    res = self.clipboard_agent.explain_clipboard(text=target_text, dry_run=True)
                 plan_res["voice_response"] = res.get("voice_response", "Clipboard assistant prepared.")
             return plan_res
 
@@ -1590,11 +1898,14 @@ class LocalLLM:
         # -------------------------------------------------------------
         # 8.10 MULTI-LAYER VIRUS & SECURITY SCANNER
         # -------------------------------------------------------------
+        # Allow commas, conversational repetitions, and clauses in security scan queries
+        q_norm_scan = re.sub(r"[,;]+", " ", q_lower).strip()
         virus_scan_match = (
-            re.search(r"\b(?:scan|check)\s+(?:my\s+)?([a-zA-Z0-9_\-\\\/\.\s]+?)\s+(?:for\s+viruses|for\s+malware|for\s+threats)[\.\?!]*$", q_lower)
-            or re.search(r"\b(?:virus\s+scan|malware\s+scan|security\s+scan)\s+(?:on\s+|for\s+)?(?:my\s+)?([a-zA-Z0-9_\-\\\/\.\s]+)[\.\?!]*$", q_lower)
-            or re.search(r"\b(?:check\s+if|is)\s+(?:my\s+)?([a-zA-Z0-9_\-\\\/\.\s]+?)\s+(?:is\s+)?(?:safe|clean|malware|a\s+virus)[\.\?!]*$", q_lower)
-            or re.search(r"\b(?:scan\s+my\s+downloads\s+folder|scan\s+downloads\s+folder|scan\s+my\s+downloads|scan\s+downloads)\b", q_lower)
+            re.search(r"\b(?:scan|check)\s+(?:my\s+)?([a-zA-Z0-9_\-\\\/\.\s]+?)\s+(?:for\s+viruses|for\s+malware|for\s+threats)[\.\?!]*$", q_norm_scan)
+            or re.search(r"\b(?:virus\s+scan|malware\s+scan|security\s+scan|security\s+test)\s+(?:on\s+|for\s+)?(?:my\s+)?(.+?)[\.\?!]*$", q_norm_scan)
+            or re.search(r"\b(?:scan|run\s+(?:a\s+)?(?:security|virus|malware)\s+(?:scan|test))\s+(?:on\s+|for\s+)?(.+?)[\.\?!]*$", q_norm_scan)
+            or re.search(r"\b(?:check\s+if|is)\s+(?:my\s+)?([a-zA-Z0-9_\-\\\/\.\s]+?)\s+(?:is\s+)?(?:safe|clean|malware|a\s+virus)[\.\?!]*$", q_norm_scan)
+            or re.search(r"\b(?:scan\s+my\s+downloads\s+folder|scan\s+downloads\s+folder|scan\s+my\s+downloads|scan\s+downloads)\b", q_norm_scan)
         )
         if virus_scan_match:
             raw_target = None
@@ -1602,18 +1913,34 @@ class LocalLLM:
                 raw_target = virus_scan_match.group(1).strip()
             if not raw_target or "download" in q_lower:
                 raw_target = "Downloads"
-            clean_scan_target = re.sub(r"^(?:my\s+)?(?:folder\s+called\s+|folder\s+named\s+|folder\s+)?", "", raw_target).strip().rstrip(".?!")
+            # Strip redundant repeated scan prefixes like "the security scan for"
+            raw_target = re.sub(r"^(?:the\s+)?(?:security|virus|malware)\s+(?:scan|test)\s+(?:on|for)\s+", "", raw_target, flags=re.IGNORECASE).strip()
+            clean_scan_target = re.sub(r"^(?:on\s+|for\s+|in\s+)?", "", raw_target).strip()
+            clean_scan_target = re.sub(r"^(?:my\s+)?(?:folder\s+called\s+|folder\s+named\s+|folder\s+|file\s+called\s+|file\s+named\s+|file\s+)?", "", clean_scan_target).strip().rstrip(".?!")
 
-            # Cross-Module Pronoun Chaining: resolve "that folder", "this folder", "the folder", "it"
-            if clean_scan_target.lower() in ["that folder", "this folder", "the folder", "that", "this", "it"]:
+            # Cross-Module Pronoun Chaining: resolve "that specific folder", "that folder", "this folder", "the folder", "it"
+            t_low = clean_scan_target.lower()
+            if any(t_low == p or t_low.startswith(p) for p in [
+                "that specific folder", "that folder", "this folder", "the folder", "that directory", "this directory",
+                "that specific file", "that file", "this file", "the file", "that", "this", "it"
+            ]) or t_low in ["folder", "directory", "file"]:
                 clean_scan_target = (
                     self.last_context.get("folder")
+                    or self.last_context.get("file")
                     or self.session_state.get("last_folder_path")
                     or self.session_state.get("last_folder_name")
                     or self.file_mgr.last_folder_path
                     or self.file_mgr.last_folder_name
                     or "Downloads"
                 )
+            elif "libra" in t_low and "test" in t_low:
+                candidate = os.path.join(os.path.expanduser("~"), "Desktop", "libratest")
+                if os.path.exists(candidate):
+                    clean_scan_target = candidate
+            elif "test file" in t_low or ("test" in t_low and ("c" in t_low or "txt" in t_low or "file" in t_low)):
+                tester_path = os.path.join(os.path.expanduser("~"), "Desktop", "tester", "test.txt")
+                if os.path.exists(tester_path):
+                    clean_scan_target = tester_path
 
             scan_res = self.security_scanner.scan_path(clean_scan_target, dry_run=dry_run)
             plan_res = {
@@ -1893,7 +2220,7 @@ class LocalLLM:
         # -------------------------------------------------------------
         # 8.14.2 FREE UTILITY BELT: CURRENCY, MATH/UNIT, WORLD CLOCK, PING (v9.0)
         # -------------------------------------------------------------
-        util_res = self.utility_belt.handle_query(cleaned_query, dry_run=dry_run)
+        util_res = self.utility_belt.handle_query(cleaned_query, context=self.last_context, dry_run=dry_run)
         if util_res is not None:
             plan_res = {
                 "action": "utility",

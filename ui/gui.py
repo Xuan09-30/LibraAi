@@ -10,18 +10,25 @@ import math
 import random
 import threading
 import warnings
+import re
+import json
 import numpy as np
 import pyaudio
 import torch
 import keyboard
 import queue
+import wave
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QTextEdit, QFrame, QLineEdit, QPushButton, QFileDialog
+    QLabel, QTextEdit, QFrame, QLineEdit, QPushButton, QFileDialog,
+    QSystemTrayIcon, QMenu
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QThread, QRectF, QUrl
-from PyQt6.QtGui import QFont, QColor, QPainter, QBrush, QLinearGradient
+from PyQt6.QtGui import (
+    QFont, QColor, QPainter, QBrush, QLinearGradient,
+    QAction, QIcon, QPixmap, QPen, QRadialGradient
+)
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 
 from openwakeword.model import Model
@@ -33,6 +40,7 @@ from core.llm import LocalLLM
 from core.orchestrator import SupervisorHub
 from core.telemetry import profiler
 from core.text_cleaner import normalize_for_tts
+from core.audio_capture import scale_pcm_amplitude, get_windows_master_volume, get_dynamic_chime_pcm
 from tools.security_scanner import SecurityScanner
 
 warnings.filterwarnings("ignore")
@@ -97,20 +105,33 @@ class VoiceAssistantWorker(QThread):
     telemetry_update = pyqtSignal(str, str)
     hud_update_signal = pyqtSignal(str, str)
     orb_state_signal = pyqtSignal(str)
+    core_response_signal = pyqtSignal(dict)
+    notification_signal = pyqtSignal(str, str)
 
-    def __init__(self):
+    def __init__(self, raw_chime_pcm: bytes = b""):
         super().__init__()
         self.running = True
         self.interrupted = threading.Event()
         self.input_stream = None  # Holds the PyAudio input handle to clear Pylance closure warning
         self.text_input_queue = queue.Queue()
+        self.proactive_speech_queue = queue.Queue()
         self.mute_tts = False
         self.llm = None
         self.attached_file_path = None
+        self.raw_chime_pcm = raw_chime_pcm
+        self.chime_pcm = raw_chime_pcm
 
     def stop(self):
         self.running = False
         self.interrupted.set()
+        if self.llm:
+            try:
+                if hasattr(self.llm, "scheduler") and self.llm.scheduler:
+                    self.llm.scheduler.stop_watchdog()
+                if hasattr(self.llm, "folder_watchdog") and self.llm.folder_watchdog:
+                    self.llm.folder_watchdog.stop()
+            except Exception:
+                pass
 
     def submit_text(self, text: str):
         """Allows instant asynchronous submission of typed text commands."""
@@ -158,6 +179,36 @@ class VoiceAssistantWorker(QThread):
             input=True,
             frames_per_buffer=512
         )
+
+        if not self.raw_chime_pcm:
+            chime_path = os.path.join(project_root, "assets", "sounds", "chime.wav")
+            if os.path.exists(chime_path):
+                try:
+                    with wave.open(chime_path, "rb") as wf:
+                        self.raw_chime_pcm = wf.readframes(wf.getnframes())
+                        self.chime_pcm = self.raw_chime_pcm
+                except Exception:
+                    pass
+
+        def play_chime_async(chime_bytes: bytes):
+            if not chime_bytes or self.mute_tts:
+                return
+            def _stream_worker():
+                try:
+                    pa_chime = pyaudio.PyAudio()
+                    stream = pa_chime.open(
+                        format=pyaudio.paInt16,
+                        channels=1,
+                        rate=24000,
+                        output=True
+                    )
+                    stream.write(chime_bytes)
+                    stream.stop_stream()
+                    stream.close()
+                    pa_chime.terminate()
+                except Exception as ex:
+                    print(f"[Chime Playback Error]: {ex}")
+            threading.Thread(target=_stream_worker, daemon=True).start()
 
         self.status_changed.emit("SYSTEM READY // AWAITING VOCAL PROMPT")
 
@@ -310,9 +361,10 @@ class VoiceAssistantWorker(QThread):
                                 elif "libra" in m_lower:
                                     libra_score = max(libra_score, score)
 
-                            # Tightened thresholds for voice barge-in during active TTS playback
-                            if stop_score >= 0.65 or libra_score >= 0.85:
-                                print(f"\n[Voice Barge-In]: Detected wakeword during playback! (stop={stop_score:.2f}, libra={libra_score:.2f}, rms={rms:.3f}). Cutting speech.")
+                            # Voice barge-in during active TTS playback strictly requires explicit STOP command.
+                            # "Hey Libra" is ignored during active speech to prevent assistant audio echo self-interruption.
+                            if stop_score >= 0.70:
+                                print(f"\n[Voice Barge-In]: Detected STOP command during playback! (stop={stop_score:.2f}, rms={rms:.3f}). Cutting speech.")
                                 trigger_barge_in()
                                 break
                 except Exception:
@@ -339,13 +391,19 @@ class VoiceAssistantWorker(QThread):
         # Start ReminderEngine background watchdog to announce due reminders
         def on_reminder_due(reminder):
             task = reminder.get("task", "Reminder")
-            announcement = f"Reminder: It is time to {task}."
+            is_timer = "timer" in str(task).lower()
+            title = "Libra Timer Finished" if is_timer else "Libra Reminder"
+            if is_timer:
+                announcement = f"Hold up, your {task.lower()} went off right now!"
+            else:
+                announcement = f"Hold up, your reminder to {task} is due now!"
             print(f"\n[Watchdog] Due reminder: {announcement}")
             self.log_received.emit("LIBRA", announcement)
-            speak_interruptible(announcement)
+            self.notification_signal.emit(title, announcement)
+            self.proactive_speech_queue.put(announcement)
 
         if hasattr(llm, "scheduler") and llm.scheduler:
-            llm.scheduler.start_watchdog(on_reminder_due, check_interval_sec=5.0)
+            llm.scheduler.start_watchdog(on_reminder_due, check_interval_sec=1.0)
 
         if hasattr(llm, "missed_reminders") and llm.missed_reminders:
             count = len(llm.missed_reminders)
@@ -357,6 +415,16 @@ class VoiceAssistantWorker(QThread):
         in_followup_mode = False
 
         while self.running:
+            # Drain any proactive background announcements (e.g. timers, alarms)
+            while not self.proactive_speech_queue.empty():
+                try:
+                    ann = self.proactive_speech_queue.get_nowait()
+                    self.orb_state_signal.emit("speaking")
+                    speak_interruptible(ann)
+                    self.orb_state_signal.emit("idle")
+                except queue.Empty:
+                    break
+
             user_text = None
             if not self.text_input_queue.empty():
                 try:
@@ -375,6 +443,15 @@ class VoiceAssistantWorker(QThread):
                     ww_booster.reset()
 
                     while self.running and not in_followup_mode:
+                        while not self.proactive_speech_queue.empty():
+                            try:
+                                ann = self.proactive_speech_queue.get_nowait()
+                                self.orb_state_signal.emit("speaking")
+                                speak_interruptible(ann)
+                                self.orb_state_signal.emit("idle")
+                            except queue.Empty:
+                                break
+
                         if not self.text_input_queue.empty():
                             try:
                                 user_text = self.text_input_queue.get_nowait()
@@ -403,6 +480,10 @@ class VoiceAssistantWorker(QThread):
                                     if ww_booster.is_wakeword_triggered(score, vad_prob=vad_prob):
                                         thresh = ww_booster.get_threshold(vad_prob=vad_prob)
                                         print(f"\n[Worker] Wake word triggered! Score: {score:.3f} (thresh: {thresh:.2f}, vad: {vad_prob:.2f})")
+                                        # 0ms Auditory Acknowledgment: Push pre-cached chime straight to PyAudio output
+                                        if self.raw_chime_pcm:
+                                            scaled_chime = get_dynamic_chime_pcm(self.raw_chime_pcm, base_gain=0.35)
+                                            play_chime_async(scaled_chime)
                                         triggered = True
                                         break
                             if triggered:
@@ -435,6 +516,15 @@ class VoiceAssistantWorker(QThread):
                     full_audio = None
 
                     while self.running:
+                        if not self.proactive_speech_queue.empty() and not vad_detector.has_spoken:
+                            try:
+                                ann = self.proactive_speech_queue.get_nowait()
+                                self.orb_state_signal.emit("speaking")
+                                speak_interruptible(ann)
+                                self.orb_state_signal.emit("idle")
+                            except queue.Empty:
+                                pass
+
                         if not self.text_input_queue.empty():
                             try:
                                 user_text = self.text_input_queue.get_nowait()
@@ -498,8 +588,18 @@ class VoiceAssistantWorker(QThread):
             print(f"[Captured Input]: {user_text}")
             self.log_received.emit("USER", user_text)
 
+            # Check if user spoke solely the wake word ("Hey Libra", "Libra")
+            clean_phrase = re.sub(r"[^a-zA-Z]", " ", user_text).strip().lower()
+            if clean_phrase in ["hey libra", "libra", "hey", "hello libra"]:
+                print(f"[Worker] Standalone wake transcription: '{user_text}'. Playing cybernetic chime.")
+                if self.raw_chime_pcm:
+                    scaled = get_dynamic_chime_pcm(self.raw_chime_pcm, base_gain=0.35)
+                    play_chime_async(scaled)
+                ww_booster.set_followup_window(8.0)
+                in_followup_mode = True
+                continue
+
             # STATE 4: REASON & EXECUTE VIA LLM CORE
-            import json
             self.status_changed.emit("PROCESSING REASONING...")
             self.orb_state_signal.emit("reasoning")
             if hasattr(llm, "idle_daemon") and llm.idle_daemon:
@@ -519,6 +619,7 @@ class VoiceAssistantWorker(QThread):
                     "voice_response": "I encountered a temporary hiccup while processing that request, but my systems remain online."
                 }
             print(f"[Libra Core]: {response_data}")
+            self.core_response_signal.emit(response_data)
 
             # Emit HUD card and Orb state updates if present
             try:
@@ -567,8 +668,20 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.security_scanner = SecurityScanner()
         self.attached_file_path = None
         self.worker = None
+        self.tray_icon = None
+        self.chime_pcm = b""
+        self.raw_chime_pcm = b""
+        chime_file = os.path.join(PROJECT_ROOT, "assets", "sounds", "chime.wav")
+        if os.path.exists(chime_file):
+            try:
+                with wave.open(chime_file, "rb") as wf:
+                    self.raw_chime_pcm = wf.readframes(wf.getnframes())
+                    self.chime_pcm = self.raw_chime_pcm
+            except Exception:
+                pass
         self.setAcceptDrops(True)
         self.init_ui()
+        self.init_tray_icon()
         if start_worker:
             self.init_worker()
 
@@ -846,14 +959,12 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.orb_view.page().runJavaScript(js_cmd)
 
     def update_hud_card(self, card_type: str, payload_json: str):
-        import json
         safe_type = json.dumps(card_type)
         safe_payload = json.dumps(payload_json)
         js_cmd = f"if (window.updateHUDCard) {{ window.updateHUDCard({safe_type}, {safe_payload}); }}"
         self.orb_view.page().runJavaScript(js_cmd)
 
     def set_orb_state(self, mode: str):
-        import json
         safe_mode = json.dumps(mode)
         js_cmd = f"if (window.setOrbState) {{ window.setOrbState({safe_mode}); }}"
         self.orb_view.page().runJavaScript(js_cmd)
@@ -895,7 +1006,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.terminal.verticalScrollBar().setValue(self.terminal.verticalScrollBar().maximum())
 
     def init_worker(self):
-        self.worker = VoiceAssistantWorker()
+        self.worker = VoiceAssistantWorker(raw_chime_pcm=self.raw_chime_pcm)
         self.worker.status_changed.connect(self.update_status)
         self.worker.visualizer_state.connect(self.set_vis_state)
         self.worker.mic_level.connect(self.on_mic_level)
@@ -903,17 +1014,129 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.worker.log_received.connect(self.append_log)
         self.worker.hud_update_signal.connect(self.update_hud_card)
         self.worker.orb_state_signal.connect(self.set_orb_state)
+        self.worker.core_response_signal.connect(self.handle_core_response)
+        self.worker.notification_signal.connect(self.show_notification)
         self.worker.start()
 
-    def closeEvent(self, event):
+    def _create_default_tray_icon(self) -> QIcon:
+        icon_path = os.path.join(PROJECT_ROOT, "assets", "icon.png")
+        if os.path.exists(icon_path):
+            try:
+                icon = QIcon(icon_path)
+                if not icon.isNull():
+                    return icon
+            except Exception:
+                pass
+
+        size = 64
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Outer cyber ring (Neon Cyan)
+        pen = QPen(QColor(0, 229, 255, 230))
+        pen.setWidth(4)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(4, 4, size - 8, size - 8)
+
+        # Glowing purple/cyan radial gradient core
+        grad = QRadialGradient(size / 2, size / 2, size / 2 - 8)
+        grad.setColorAt(0.0, QColor(0, 255, 204, 255))
+        grad.setColorAt(0.6, QColor(138, 43, 226, 220))
+        grad.setColorAt(1.0, QColor(15, 23, 42, 200))
+        painter.setBrush(QBrush(grad))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(8, 8, size - 16, size - 16)
+
+        painter.end()
+
+        try:
+            os.makedirs(os.path.join(PROJECT_ROOT, "assets"), exist_ok=True)
+            pixmap.save(icon_path, "PNG")
+        except Exception:
+            pass
+
+        return QIcon(pixmap)
+
+    def init_tray_icon(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self._create_default_tray_icon())
+        self.tray_icon.setToolTip("Libra // Cybernetic Neural Assistant")
+
+        tray_menu = QMenu()
+        show_action = QAction("Show Interface", self)
+        show_action.triggered.connect(self.show_interface)
+        tray_menu.addAction(show_action)
+
+        hide_action = QAction("Hide Interface", self)
+        hide_action.triggered.connect(self.hide_interface)
+        tray_menu.addAction(hide_action)
+
+        tray_menu.addSeparator()
+
+        quit_action = QAction("Exit Libra", self)
+        quit_action.triggered.connect(self._quit_application)
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.toggle_interface()
+
+    def show_interface(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def hide_interface(self):
+        self.hide()
+
+    def toggle_interface(self):
+        if self.isVisible():
+            self.hide_interface()
+        else:
+            self.show_interface()
+
+    def show_notification(self, title: str, message: str):
+        if self.tray_icon and self.tray_icon.isVisible():
+            self.tray_icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 5000)
+
+    def handle_core_response(self, response: dict):
+        action = response.get("action")
+        actions = response.get("actions", [])
+        if action == "show_ui" or "show_ui" in actions:
+            self.show_interface()
+        elif action == "hide_ui" or "hide_ui" in actions:
+            self.hide_interface()
+
+    def _quit_application(self):
+        if self.tray_icon:
+            self.tray_icon.hide()
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait()
-        event.accept()
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        if self.tray_icon and self.tray_icon.isVisible():
+            event.ignore()
+            self.hide_interface()
+        else:
+            if self.worker is not None:
+                self.worker.stop()
+                self.worker.wait()
+            event.accept()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
     window = FuturisticVoiceAssistantUI()
-    window.show()
+    if "--hidden" not in sys.argv:
+        window.show()
     sys.exit(app.exec())
