@@ -78,6 +78,24 @@ CURATED_FALLBACK_PLACES = {
     ],
     "restaurant": [
         {
+            "name": "Ayam Gepuk Pak Gembus Kepong",
+            "rating": 4.6,
+            "address": "Jalan Rimbunan Raya, Laman Rimbunan, Kepong, Kuala Lumpur",
+            "latitude": 3.2148,
+            "longitude": 101.6362,
+            "category": "amenity restaurant",
+            "snippet": "Famous Indonesian crispy fried chicken with signature spicy sambal gepuk, cabbage, and fried tempeh."
+        },
+        {
+            "name": "Restoran Kheng Heong Kepong",
+            "rating": 4.5,
+            "address": "Jalan Kepong, Metro Prima, Kuala Lumpur",
+            "latitude": 3.2132,
+            "longitude": 101.6380,
+            "category": "amenity restaurant",
+            "snippet": "Beloved traditional Kepong eatery famous for aromatic claypot bak kut teh and steamed fish."
+        },
+        {
             "name": "Village Park Restaurant",
             "rating": 4.6,
             "address": "Damansara Utama, Petaling Jaya",
@@ -141,18 +159,20 @@ class PlacesDiscoveryEngine:
         t = raw_query.lower()
         # Strip conversational and request prefixes
         t = re.sub(
-            r"^(?:please\s+)?(?:can\s+you\s+)?(?:find|search\s+for|look\s+for|show\s+me|where\s+are\s+(?:the\s+)?|recommend(?:\s+some)?|what\s+are\s+some|get)\s+",
+            r"^(?:please\s+)?(?:can\s+you\s+)?(?:find|search\s+for|look\s+for|show\s+me|where\s+are\s+(?:the\s+)?|recommend(?:\s+some)?|what\s+are\s+some|get|give\s+me)\s+",
             "",
             t
         )
+        # Strip option quantifiers: 'one or two or three options of', 'options of'
+        t = re.sub(r"\b(?:(?:one|two|three|\d+)\s+)?(?:options?\s+(?:of\s+)?(?:the\s+)?)", "", t)
         # Strip spatial anchor phrases
         t = re.sub(
-            r"\b(near\s+me|around\s+here|nearby|from\s+home|near\s+home|closest\s+to\s+me|close\s+to\s+me|around\s+my\s+area|near\s+my\s+place|in\s+my\s+area|around\s+us)\b",
+            r"\b(near\s+(?:me|my\s+house|my\s+home|my\s+place|home|house|here|my\s+location|my\s+area)|around\s+(?:here|my\s+area|my\s+house|home|house)|nearby|from\s+home|near\s+home|closest\s+to\s+me|close\s+to\s+me|around\s+my\s+area|near\s+my\s+place|in\s+my\s+area|around\s+us)\b",
             "",
             t
         )
         # Strip qualitative adjectives and articles
-        t = re.sub(r"\b(good|best|some|popular|the|a|an)\b", "", t)
+        t = re.sub(r"\b(good|best|some|popular|nearest|closest|top|the|a|an)\b", "", t)
         t = t.strip(" .?!")
 
         # Map common query variants to OSM search terms

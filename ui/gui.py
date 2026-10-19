@@ -5,6 +5,16 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+# In pythonw.exe, stdout and stderr are None, causing HF Hub/tqdm to crash. Redirect to log file.
+if sys.stdout is None or sys.stderr is None:
+    log_dir = os.path.join(PROJECT_ROOT, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    _runtime_log = open(os.path.join(log_dir, "libra_runtime.log"), "a", encoding="utf-8", buffering=1)
+    if sys.stdout is None:
+        sys.stdout = _runtime_log
+    if sys.stderr is None:
+        sys.stderr = _runtime_log
+
 import time
 import math
 import random
@@ -12,6 +22,7 @@ import threading
 import warnings
 import re
 import json
+import html
 import numpy as np
 import pyaudio
 import torch
@@ -211,6 +222,10 @@ class VoiceAssistantWorker(QThread):
             threading.Thread(target=_stream_worker, daemon=True).start()
 
         self.status_changed.emit("SYSTEM READY // AWAITING VOCAL PROMPT")
+        if self.raw_chime_pcm:
+            scaled = get_dynamic_chime_pcm(self.raw_chime_pcm, base_gain=0.25)
+            play_chime_async(scaled)
+        self.notification_signal.emit("Project Libra Online", "Neural Core & Ambient Voice online. Say 'Hey Libra' anytime.")
 
         def speak_interruptible(text_or_stream):
             if self.mute_tts:
@@ -413,6 +428,7 @@ class VoiceAssistantWorker(QThread):
 
         ww_booster = WakeWordBooster(default_threshold=0.50, vad_assisted_threshold=0.32)
         in_followup_mode = False
+        followup_turn_count = 0
 
         while self.running:
             # Drain any proactive background announcements (e.g. timers, alarms)
@@ -433,8 +449,28 @@ class VoiceAssistantWorker(QThread):
                     user_text = None
 
             if user_text is None:
-                if ww_booster.is_in_followup_window():
+                # Context inspection: Check if foreground window is a game or game_mode active
+                is_game_active = False
+                if hasattr(llm, "window_engine") and llm.window_engine:
+                    try:
+                        w_info = llm.window_engine.get_active_window_info()
+                        is_game_active = (
+                            w_info.get("app_category") == "game"
+                            or getattr(llm.model_mgr, "game_mode", False)
+                        )
+                    except Exception:
+                        pass
+
+                if is_game_active:
+                    # In game context, strictly forbid follow-up listening to prevent eavesdropping
+                    ww_booster.reset()
+                    in_followup_mode = False
+                    followup_turn_count = 0
+                elif ww_booster.is_in_followup_window():
                     in_followup_mode = True
+                else:
+                    in_followup_mode = False
+                    followup_turn_count = 0
 
                 if not in_followup_mode:
                     self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
@@ -478,6 +514,9 @@ class VoiceAssistantWorker(QThread):
                             for model_name, score in prediction.items():
                                 if "libra" in str(model_name).lower():
                                     if ww_booster.is_wakeword_triggered(score, vad_prob=vad_prob):
+                                        # In gaming context, require higher confidence score (>=0.68) to filter out gamer callouts
+                                        if is_game_active and score < 0.68:
+                                            continue
                                         thresh = ww_booster.get_threshold(vad_prob=vad_prob)
                                         print(f"\n[Worker] Wake word triggered! Score: {score:.3f} (thresh: {thresh:.2f}, vad: {vad_prob:.2f})")
                                         # 0ms Auditory Acknowledgment: Push pre-cached chime straight to PyAudio output
@@ -485,6 +524,7 @@ class VoiceAssistantWorker(QThread):
                                             scaled_chime = get_dynamic_chime_pcm(self.raw_chime_pcm, base_gain=0.35)
                                             play_chime_async(scaled_chime)
                                         triggered = True
+                                        followup_turn_count = 0
                                         break
                             if triggered:
                                 break
@@ -577,6 +617,7 @@ class VoiceAssistantWorker(QThread):
                             self.telemetry_update.emit("STT_LATENCY", f"{stt_latency:.0f} ms")
                         except Exception as stt_err:
                             print(f"[STT Worker Guard]: {stt_err}")
+                            self.log_received.emit("ERROR", f"Speech-to-Text Transcription Error: {stt_err}")
                             user_text = None
 
             if not user_text or not user_text.strip():
@@ -595,8 +636,9 @@ class VoiceAssistantWorker(QThread):
                 if self.raw_chime_pcm:
                     scaled = get_dynamic_chime_pcm(self.raw_chime_pcm, base_gain=0.35)
                     play_chime_async(scaled)
-                ww_booster.set_followup_window(8.0)
+                ww_booster.set_followup_window(6.0)
                 in_followup_mode = True
+                followup_turn_count = 0
                 continue
 
             # STATE 4: REASON & EXECUTE VIA LLM CORE
@@ -613,13 +655,33 @@ class VoiceAssistantWorker(QThread):
                 route_label = response_data.get("action") or ("compound" if response_data.get("compound") else "chat")
                 profiler.flush(transcript=user_text, route=route_label)
             except Exception as exec_err:
-                print(f"[Supervisor Worker Guard]: {exec_err}")
+                err_detail = f"{type(exec_err).__name__}: {exec_err}"
+                print(f"[Supervisor Worker Guard]: {err_detail}")
                 response_data = {
                     "action": "error_recovery",
-                    "voice_response": "I encountered a temporary hiccup while processing that request, but my systems remain online."
+                    "error": f"Execution Exception ({err_detail})",
+                    "voice_response": "I encountered an error while processing that request, but my systems remain online."
                 }
             print(f"[Libra Core]: {response_data}")
             self.core_response_signal.emit(response_data)
+
+            # Surface any internal tool or execution error messages in the chatbox terminal
+            err_code = response_data.get("error_code") or response_data.get("code")
+            err_msg = response_data.get("error") or response_data.get("error_message")
+            if err_msg or err_code:
+                prefix = f"Error [{err_code}]: " if err_code else "Error: "
+                self.log_received.emit("ERROR", f"{prefix}{err_msg}")
+            elif response_data.get("status") in ["error", "failed"] and response_data.get("issues"):
+                issues_str = "; ".join(str(i) for i in response_data["issues"])
+                self.log_received.emit("ERROR", f"Execution Failed: {issues_str}")
+
+            if response_data.get("compound") and response_data.get("step_results"):
+                for s_res in response_data["step_results"]:
+                    s_err = s_res.get("error") or s_res.get("error_message")
+                    s_code = s_res.get("error_code") or s_res.get("code")
+                    if s_err or s_code:
+                        prefix = f"Step Error [{s_code}]: " if s_code else "Step Error: "
+                        self.log_received.emit("ERROR", f"{prefix}{s_err}")
 
             # Emit HUD card and Orb state updates if present
             try:
@@ -649,9 +711,69 @@ class VoiceAssistantWorker(QThread):
                     speak_interruptible(voice_msg)
                 except Exception as tts_err:
                     print(f"[TTS Worker Guard]: {tts_err}")
+                    self.log_received.emit("ERROR", f"Text-to-Speech Error: {tts_err}")
             self.orb_state_signal.emit("idle")
-            ww_booster.set_followup_window(6.0)
-            in_followup_mode = True
+
+            # Check if active window is a game or in game_mode
+            is_game_active = False
+            if hasattr(llm, "window_engine") and llm.window_engine:
+                try:
+                    w_info = llm.window_engine.get_active_window_info()
+                    is_game_active = (
+                        w_info.get("app_category") == "game"
+                        or getattr(llm.model_mgr, "game_mode", False)
+                    )
+                except Exception:
+                    pass
+
+            if is_game_active:
+                # Strictly suppress follow-up listening in games to protect gamer voice chat / Discord
+                in_followup_mode = False
+                ww_booster.reset()
+                followup_turn_count = 0
+            else:
+                u_text_low = (user_text or "").lower().strip()
+                v_msg_low = (voice_msg or "").lower().strip()
+
+                is_terminal_politeness = any(
+                    phrase in u_text_low
+                    for phrase in [
+                        "thank you", "thanks", "thank u", "bye", "goodbye", "good bye",
+                        "good night", "see you", "that's all", "thats all", "that will be all",
+                        "never mind", "nevermind", "cancel", "dismiss", "stop listening", "go to sleep"
+                    ]
+                ) or any(
+                    v_msg_low.startswith(p)
+                    for p in ["you're welcome", "anytime", "goodbye", "have a great", "good night"]
+                )
+
+                is_oneshot_action = response_data.get("action") in [
+                    "close_app", "schedule_timer", "system_control", "media_control"
+                ]
+
+                is_question = (
+                    voice_msg.strip().endswith("?")
+                    or response_data.get("status") == "clarification_needed"
+                    or getattr(llm, "pending_chrome_profile", None) is not None
+                    or getattr(llm, "pending_clarification", None) is not None
+                )
+
+                if is_terminal_politeness or is_oneshot_action:
+                    in_followup_mode = False
+                    ww_booster.reset()
+                    followup_turn_count = 0
+                elif is_question:
+                    ww_booster.set_followup_window(5.0)
+                    in_followup_mode = True
+                    followup_turn_count += 1
+                elif followup_turn_count == 0 and response_data.get("action") in ["chat", "analyze_screen", "web_research"]:
+                    ww_booster.set_followup_window(3.5)
+                    in_followup_mode = True
+                    followup_turn_count = 1
+                else:
+                    in_followup_mode = False
+                    ww_booster.reset()
+                    followup_turn_count = 0
 
         if self.input_stream:
             try:
@@ -681,6 +803,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
                 pass
         self.setAcceptDrops(True)
         self.init_ui()
+        _ = self.winId()
         self.init_tray_icon()
         if start_worker:
             self.init_worker()
@@ -917,28 +1040,31 @@ class FuturisticVoiceAssistantUI(QMainWindow):
                 self.handle_file_ingestion(file_path)
 
     def handle_file_ingestion(self, file_path: str):
-        filename = os.path.basename(file_path)
-        self.append_log("SYSTEM", f"Security scanning dropped file: {filename}...")
+        try:
+            filename = os.path.basename(file_path)
+            self.append_log("SYSTEM", f"Security scanning dropped file: {filename}...")
 
-        scan_res = self.security_scanner.scan_path(file_path, dry_run=False)
-        status = scan_res.get("status")
+            scan_res = self.security_scanner.scan_path(file_path, dry_run=False)
+            status = scan_res.get("status")
 
-        if status == "clean":
-            self.attached_file_path = file_path
-            if hasattr(self, "worker") and self.worker is not None:
-                self.worker.attached_file_path = file_path
-                if hasattr(self.worker, "llm") and self.worker.llm is not None:
-                    self.worker.llm.attached_file_path = file_path
-            sha = scan_res.get("sha256")
-            sha_disp = f" (SHA-256: {sha[:10]}...)" if sha else ""
-            msg = f"Scanned {filename}{sha_disp} — no threats found. Ready for questions about this file."
-            self.append_log("SECURITY", msg)
-            self.subtitle_label.setText(f"FILE ATTACHED: {filename}")
-        else:
-            primary_issue = scan_res.get("issues", ["Threat detected"])[0] if scan_res.get("issues") else "Threat detected"
-            warn_msg = f"Security Alert: Ingestion blocked for {filename} ({primary_issue})."
-            self.append_log("SECURITY", warn_msg)
-            self.subtitle_label.setText(f"SECURITY BLOCKED: {filename}")
+            if status == "clean":
+                self.attached_file_path = file_path
+                if hasattr(self, "worker") and self.worker is not None:
+                    self.worker.attached_file_path = file_path
+                    if hasattr(self.worker, "llm") and self.worker.llm is not None:
+                        self.worker.llm.attached_file_path = file_path
+                sha = scan_res.get("sha256")
+                sha_disp = f" (SHA-256: {sha[:10]}...)" if sha else ""
+                msg = f"Scanned {filename}{sha_disp} — no threats found. Ready for questions about this file."
+                self.append_log("SECURITY", msg)
+                self.subtitle_label.setText(f"FILE ATTACHED: {filename}")
+            else:
+                primary_issue = scan_res.get("issues", ["Threat detected"])[0] if scan_res.get("issues") else "Threat detected"
+                warn_msg = f"Security Alert: Ingestion blocked for {filename} ({primary_issue})."
+                self.append_log("SECURITY", warn_msg)
+                self.subtitle_label.setText(f"SECURITY BLOCKED: {filename}")
+        except Exception as ingest_err:
+            self.append_log("ERROR", f"File Ingestion Failure: {ingest_err}")
 
     def update_clock(self):
         self.clock_label.setText(time.strftime("%H:%M:%S // %Y-%m-%d"))
@@ -990,19 +1116,34 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             )
 
     def append_log(self, sender: str, msg: str):
-        color = "#00ffcc" if sender == "LIBRA" else ("#f43f5e" if sender == "SECURITY" else "#fbbf24")
+        safe_msg = html.escape(str(msg))
         if sender == "LIBRA":
+            color = "#00ffcc"
+            bg = "#080d19"
             self.subtitle_label.setText(f"LIBRA: {msg[:120]}...")
         elif sender == "USER":
+            color = "#38bdf8"
+            bg = "#080d19"
             self.subtitle_label.setText(f"USER: {msg}")
+        elif sender == "SECURITY":
+            color = "#f43f5e"
+            bg = "#1f0a10"
+            self.subtitle_label.setText(f"SECURITY ALERT: {msg[:120]}")
+        elif sender == "ERROR":
+            color = "#ef4444"
+            bg = "#25080c"
+            self.subtitle_label.setText(f"SYSTEM FAULT: {msg[:120]}")
+        else:
+            color = "#fbbf24"
+            bg = "#080d19"
 
-        html = f"""
-        <div style='margin-bottom: 8px; padding: 5px 8px; background: #080d19; border-left: 3px solid {color}; border-radius: 3px;'>
+        html_entry = f"""
+        <div style='margin-bottom: 8px; padding: 6px 10px; background: {bg}; border-left: 3px solid {color}; border-radius: 4px;'>
             <span style='color: {color}; font-weight: bold;'>[{sender}]:</span> 
-            <span style='color: #f8fafc; font-size: 13px;'>{msg}</span>
+            <span style='color: #f8fafc; font-size: 13px;'>{safe_msg}</span>
         </div>
         """
-        self.terminal.append(html)
+        self.terminal.append(html_entry)
         self.terminal.verticalScrollBar().setValue(self.terminal.verticalScrollBar().maximum())
 
     def init_worker(self):
@@ -1061,8 +1202,10 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         return QIcon(pixmap)
 
     def init_tray_icon(self):
+        icon = self._create_default_tray_icon()
+        self.setWindowIcon(icon)
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(self._create_default_tray_icon())
+        self.tray_icon.setIcon(icon)
         self.tray_icon.setToolTip("Libra // Cybernetic Neural Assistant")
 
         tray_menu = QMenu()
@@ -1083,6 +1226,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.activated.connect(self._on_tray_activated)
         self.tray_icon.show()
+        self.tray_icon.setVisible(True)
 
     def _on_tray_activated(self, reason):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
@@ -1134,9 +1278,40 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
 
 if __name__ == "__main__":
+    from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+
+    # 1. Single Instance Check via Qt Local Socket IPC
+    socket = QLocalSocket()
+    socket.connectToServer("libra_instance_ipc")
+    if socket.waitForConnected(400):
+        # Another instance is actively running. If started without --hidden, ask existing instance to show its window.
+        if "--hidden" not in sys.argv:
+            socket.write(b"show\n")
+            socket.waitForBytesWritten(1000)
+        sys.exit(0)
+
+    # 2. Setup IPC Server to receive 'show' commands from subsequent launches
+    ipc_server = QLocalServer()
+    ipc_server.removeServer("libra_instance_ipc")
+    ipc_server.listen("libra_instance_ipc")
+
     window = FuturisticVoiceAssistantUI()
+
+    def handle_incoming_ipc():
+        conn = ipc_server.nextPendingConnection()
+        if conn:
+            conn.waitForReadyRead(500)
+            msg = bytes(conn.readAll()).decode("utf-8", errors="ignore")
+            if "show" in msg:
+                window.show_interface()
+
+    ipc_server.newConnection.connect(handle_incoming_ipc)
+
     if "--hidden" not in sys.argv:
         window.show()
+    else:
+        _ = window.winId()
     sys.exit(app.exec())

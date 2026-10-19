@@ -15,9 +15,11 @@ ACTION_CLAUSE_PATTERNS = [
     r"\b(?:launch|open|start|run|play)\s+(?:[a-zA-Z0-9_\-]+)\b",
     r"\b(?:close|shut\s*down|exit|kill)\b",
     r"\b(?:system\s+status|cpu|ram|gpu|hardware|windows|diagnostics?)\b",
-    r"\b(?:find|search\s+for|look\s+for)\s+(?:bookstores|cafes|restaurants|places|coffee)\b",
+    r"\b(?:find|search\s+for|look\s+for)\s+(?:bookstores|cafes|restaurants|places|coffee|food)\b",
     r"\bset\s+a\s+timer\b",
     r"\b(?:create|make)\s+(?:a\s+)?(?:new\s+)?folder\b",
+    r"\b(?:create|make|write|build)\s+(?:a\s+)?(?:new\s+)?(?:python\s+|text\s+|code\s+)?file\b",
+    r"\b(?:open|show|reveal|view|edit)\s+(?:the\s+|that\s+)?(?:file|script|[a-zA-Z0-9_\-\.]+\.(?:py|txt|json|md))\b",
     r"\b(?:open|show|reveal|find)\s+(?:the\s+|that\s+)?[a-zA-Z0-9_\-\s]+\s+(?:folder|on\s+here|in\s+file\s+explorer)\b",
     r"\b(?:enable|turn\s+on|activate|disable|turn\s+off|exit)\s+game\s+mode\b",
     r"\b(?:deep\s+research|heavy\s+research|think\s+deeply|analyze\s+in\s+depth)\b",
@@ -41,7 +43,7 @@ ACTION_CLAUSE_PATTERNS = [
     r"\bstatus\s+report\b",
     r"\b(?:find\s+(?:me\s+)?(?:valid\s+)?data\s+(?:on|about|for)|analyze\s+(?:the\s+)?dataset|make\s+(?:it\s+into\s+)?a\s+visualization|generate\s+a\s+(?:plot|chart|visualization))\b",
     r"\b(?:weather|forecast|temperature|is\s+it\s+going\s+to\s+rain|how\s+hot\s+is\s+it)\b",
-    r"\b(?:check\s+my\s+ping|what\s+time\s+is\s+it|convert\s+\d+|how\s+much\s+is\s+\d+|how\s+far\s+is)\b",
+    r"\b(?:check\s+my\s+ping|what\s+time\s+is\s+it|what\s+is\s+the\s+time|what(?:'s|\s+is)\s+the\s+time|time\s+here|time\s+in\s+[a-zA-Z\s]+|convert\s+\d+|how\s+much\s+is\s+\d+|how\s+far\s+is)\b",
     r"\b(?:what\s+am\s+i\s+working\s+on|what\s+window\s+am\s+i\s+in|what\s+does\s+this\s+error\s+mean|explain\s+what\s+this\s+script\s+does|summarize\s+what(?:'s|\s+is)\s+on\s+this\s+page|write\s+a\s+reply\s+to\s+this)\b",
     r"\b(?:what\s+song\s+is\s+playing|what(?:'s|\s+is)\s+playing\s+on\s+spotify|list\s+my\s+reminders|cancel\s+my\s+reminders|wake\s+me\s+up)\b",
     r"\b(?:show|open|bring\s+up|display)\s+(?:me\s+)?(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)\b",
@@ -83,7 +85,8 @@ class SupervisorHub:
 
     def is_action_clause(self, text: str) -> bool:
         """Determines if a clause contains a known actionable intent keyword."""
-        return any(re.search(pat, text, re.IGNORECASE) for pat in ACTION_CLAUSE_PATTERNS)
+        cleaned = re.sub(r"^(?:also\s+|please\s+|can\s+you\s+(?:tell\s+me\s+about\s+)?|now\s+|what\s+about\s+)", "", text.strip(), flags=re.IGNORECASE)
+        return any(re.search(pat, text, re.IGNORECASE) or re.search(pat, cleaned, re.IGNORECASE) for pat in ACTION_CLAUSE_PATTERNS)
 
     def split_compound_intent(self, prompt: str) -> List[str]:
         """
@@ -92,15 +95,15 @@ class SupervisorHub:
         Capped at MAX_STEPS (4).
         """
         # Preserve explicit compound web search idioms, Spotify play idioms, and unified data science requests
-        if re.search(r"open\s+(?:google|chrome|browser)\s+and\s+search", prompt, re.IGNORECASE):
+        if re.search(r"open\s+(?:my\s+)?(?:google|chrome|browser)\s+and\s+search", prompt, re.IGNORECASE):
             return [prompt]
         if re.search(r"\b(?:open|launch|start|play)\s+(?:my\s+)?spotify\s+(?:and|to)\s+(?:play|place)\b", prompt, re.IGNORECASE):
             return [prompt]
         if re.search(r"\b(?:find\s+(?:me\s+)?(?:valid\s+)?data\s+(?:on|about|for)|analyze\s+(?:the\s+)?dataset|make\s+(?:it\s+into\s+)?a\s+visualization)\b", prompt, re.IGNORECASE):
             return [prompt]
 
-        # Sequencing delimiters: 'and then', 'then', ', and', 'and', ';'
-        split_regex = r"\s+(?:,\s*and\s+then|;\s*|then|and\s+then|,\s*and|and)\s+"
+        # Sequencing delimiters: 'and then', 'then', ', and', 'and also', 'and', ';'
+        split_regex = r"\s+(?:,\s*and\s+then|;\s*|then|and\s+then|,\s*and|and\s+also|and)\s+"
         parts = re.split(split_regex, prompt, flags=re.IGNORECASE)
         cleaned_parts = [p.strip() for p in parts if p.strip()]
 
