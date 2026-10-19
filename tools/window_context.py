@@ -42,6 +42,25 @@ APP_FRIENDLY_NAMES = {
     "blender.exe": ("Blender", "creative"),
     "robloxplayerbeta.exe": ("Roblox", "game"),
     "steam.exe": ("Steam", "game"),
+    "overwatch.exe": ("Overwatch 2", "game"),
+    "valorant.exe": ("Valorant", "game"),
+    "valorant-win64-shipping.exe": ("Valorant", "game"),
+    "cs2.exe": ("Counter-Strike 2", "game"),
+    "csgo.exe": ("Counter-Strike", "game"),
+    "r5apex.exe": ("Apex Legends", "game"),
+    "leagueclient.exe": ("League of Legends", "game"),
+    "leagueclientux.exe": ("League of Legends", "game"),
+    "leagueclientuxrender.exe": ("League of Legends", "game"),
+    "league of legends.exe": ("League of Legends", "game"),
+    "dota2.exe": ("Dota 2", "game"),
+    "gta5.exe": ("Grand Theft Auto V", "game"),
+    "fortniteclient-win64-shipping.exe": ("Fortnite", "game"),
+    "palworld-win64-shipping.exe": ("Palworld", "game"),
+    "stardew valley.exe": ("Stardew Valley", "game"),
+    "riot client.exe": ("Riot Client", "game"),
+    "riotclientelectron.exe": ("Riot Client", "game"),
+    "riotclientservices.exe": ("Riot Client", "game"),
+    "antigravity.exe": ("Antigravity IDE", "ide"),
     "explorer.exe": ("File Explorer", "system"),
 }
 
@@ -164,7 +183,19 @@ class ActiveWindowEngine:
         except Exception:
             pass
 
-        # 2. Iterative GetWindow fallback (No ctypes callback pointers required)
+        # 2. GetTopWindow fallback (Direct Z-order scan from desktop top window)
+        try:
+            h = user32.GetTopWindow(0)
+            count = 0
+            while h and count < 200:
+                count += 1
+                if _is_valid_app_window(h):
+                    return h
+                h = user32.GetWindow(h, 2)  # GW_HWNDNEXT
+        except Exception:
+            pass
+
+        # 3. Iterative GetWindow fallback (No ctypes callback pointers required)
         try:
             desktop = user32.GetDesktopWindow()
             h = user32.GetWindow(desktop, 5)  # GW_CHILD
@@ -212,23 +243,26 @@ class ActiveWindowEngine:
 
         try:
             user32 = ctypes.windll.user32
+            try:
+                hdesk = user32.OpenInputDesktop(0, False, 0x01FF)
+                if hdesk:
+                    user32.SetThreadDesktop(hdesk)
+            except Exception:
+                pass
+
             hwnd = user32.GetForegroundWindow()
-            if not hwnd:
-                self.last_window_snapshot = info
-                return info
-
-            # Check if foreground window is Libra herself
-            pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            length = user32.GetWindowTextLengthW(hwnd)
+            pid = wintypes.DWORD(0)
             title = ""
-            if length > 0:
-                buff = ctypes.create_unicode_buffer(length + 1)
-                user32.GetWindowTextW(hwnd, buff, length + 1)
-                title = buff.value.strip()
+            if hwnd:
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buff = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buff, length + 1)
+                    title = buff.value.strip()
 
-            if pid.value == os.getpid() or "LIBRA // CYBERNETIC" in title.upper() or "FUTURISTICVOICEASSISTANTUI" in title.upper():
-                external_hwnd = self._find_top_external_window(user32, hwnd, pid.value)
+            if not hwnd or pid.value == os.getpid() or not title or "LIBRA // CYBERNETIC" in title.upper() or "FUTURISTICVOICEASSISTANTUI" in title.upper():
+                external_hwnd = self._find_top_external_window(user32, hwnd or 0, pid.value or os.getpid())
                 if external_hwnd:
                     hwnd = external_hwnd
                     length = user32.GetWindowTextLengthW(hwnd)
@@ -237,6 +271,9 @@ class ActiveWindowEngine:
                         user32.GetWindowTextW(hwnd, buff, length + 1)
                         title = buff.value.strip()
                     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                elif not hwnd:
+                    self.last_window_snapshot = info
+                    return info
                 else:
                     info["hwnd"] = int(hwnd)
                     info["window_title"] = "Libra Neural Terminal"
@@ -303,6 +340,13 @@ class ActiveWindowEngine:
                 category = "terminal"
                 info["app_category"] = "terminal"
                 info["app_label"] = "Terminal"
+            elif any(g in title_lower for g in ["overwatch", "valorant", "counter-strike", "apex legends", "league of legends", "dota", "fortnite", "palworld", "roblox", "stardew valley", "genshin impact"]):
+                category = "game"
+                info["app_category"] = "game"
+                for g_cand in ["overwatch", "valorant", "apex legends", "counter-strike", "league of legends", "dota", "fortnite", "palworld", "roblox"]:
+                    if g_cand in title_lower:
+                        info["app_label"] = g_cand.title()
+                        break
 
         # 1. IDE Title Parsing: e.g., "● llm.py - LibraAi - Visual Studio Code"
         if category == "ide" and title:
@@ -374,7 +418,12 @@ class ActiveWindowEngine:
         page = info.get("page_title")
         mem = info.get("memory_mb", 0.0)
 
-        if "libra" in app.lower() or "cybernetic" in title.lower() or "libra" in title.lower() or app.lower() == "python":
+        is_libra_ui = (
+            app.lower() in ["libra", "libra assistant", "libra neural terminal"]
+            or "cybernetic neural interface" in title.lower()
+            or (app.lower() == "python" and "libra" in title.lower())
+        )
+        if is_libra_ui:
             voice = "You're currently in the Libra Neural Terminal. Switch to VS Code, Chrome, or any document and I'll track your workspace automatically."
         elif cat == "ide" and active_file:
             proj_clause = f" in the {project} project" if project else ""

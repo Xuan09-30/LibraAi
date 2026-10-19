@@ -842,6 +842,16 @@ class GameDiscoveryEngine:
         # 1. Resolve via acronym map
         mapped_target = self.ACRONYM_MAP.get(clean, clean)
 
+        GENERIC_STOP_WORDS = {
+            "app", "apps", "application", "applications", "program", "programs",
+            "game", "games", "window", "windows", "computer", "system", "file",
+            "folder", "anything", "something", "a program", "the program",
+            "a game", "the game", "an app", "the app", "any app", "any apps",
+            "any program", "any programs", "all apps", "all programs", "it", "this"
+        }
+        if clean in GENERIC_STOP_WORDS or mapped_target in GENERIC_STOP_WORDS:
+            return None
+
         # 2. Direct match
         if clean in self.apps:
             return self.apps[clean]
@@ -856,21 +866,27 @@ class GameDiscoveryEngine:
             if k_condensed and k_condensed in [condensed_clean, condensed_mapped]:
                 return v
 
-        # 4. Substring match
+        # 4. Word-boundary substring match
         for k, v in self.apps.items():
-            if clean == k or (len(clean) >= 4 and clean in k) or (len(k) >= 4 and k in clean):
+            if clean == k:
                 return v
-            if mapped_target == k or (len(mapped_target) >= 4 and mapped_target in k):
+            if len(clean) >= 4 and re.search(rf"\b{re.escape(clean)}\b", k):
+                return v
+            if len(k) >= 4 and re.search(rf"\b{re.escape(k)}\b", clean):
+                return v
+            if mapped_target == k:
+                return v
+            if len(mapped_target) >= 4 and re.search(rf"\b{re.escape(mapped_target)}\b", k):
                 return v
 
-        # 5. Fuzzy matching via difflib
+        # 5. Fuzzy matching via difflib (high precision cutoff)
         candidates = list(self.apps.keys())
-        if candidates:
-            matches = difflib.get_close_matches(mapped_target, candidates, n=1, cutoff=0.58)
+        if candidates and len(clean) >= 4:
+            matches = difflib.get_close_matches(mapped_target, candidates, n=1, cutoff=0.68)
             if matches:
                 return self.apps[matches[0]]
 
-            matches = difflib.get_close_matches(clean, candidates, n=1, cutoff=0.58)
+            matches = difflib.get_close_matches(clean, candidates, n=1, cutoff=0.68)
             if matches:
                 return self.apps[matches[0]]
 

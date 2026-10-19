@@ -95,6 +95,8 @@ class AutomatedFolderWatchdog:
         self._observer: Optional[Any] = None
         self._running = False
         self._polling_thread: Optional[threading.Thread] = None
+        self._last_refresh_time: float = 0.0
+        self._refresh_cooldown: float = 8.0
 
         self.stats = {
             "is_running": False,
@@ -145,8 +147,11 @@ class AutomatedFolderWatchdog:
             return
 
         filename = os.path.basename(path)
-        # Skip temp / uninstaller shortcuts
+        # Skip temp / uninstaller shortcuts and dev environment folders
+        p_low = path.lower()
         if any(sw in filename.lower() for sw in ("unins", "update", "temp", "tmp", "~$")):
+            return
+        if any(sw in p_low for sw in ("site-packages", "venv", "node_modules", ".git", "cache", "logs", "__pycache__")):
             return
 
         self.stats["program_events_count"] += 1
@@ -156,12 +161,15 @@ class AutomatedFolderWatchdog:
         print(f"[FolderWatchdog] Program change detected ({event_type}): {filename}")
 
         if self.discovery_engine and hasattr(self.discovery_engine, "refresh"):
-            try:
-                self.discovery_engine.refresh()
-                count = len(getattr(self.discovery_engine, "apps", {}))
-                print(f"[FolderWatchdog] Discovered apps refreshed. {count} apps currently indexed.")
-            except Exception as e:
-                print(f"[FolderWatchdog Discovery Refresh Error]: {e}")
+            now = time.time()
+            if (now - self._last_refresh_time) >= self._refresh_cooldown:
+                self._last_refresh_time = now
+                try:
+                    self.discovery_engine.refresh()
+                    count = len(getattr(self.discovery_engine, "apps", {}))
+                    print(f"[FolderWatchdog] Discovered apps refreshed. {count} apps currently indexed.")
+                except Exception as e:
+                    print(f"[FolderWatchdog Discovery Refresh Error]: {e}")
 
         if self.event_callback:
             try:

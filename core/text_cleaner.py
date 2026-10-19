@@ -1,4 +1,5 @@
 import re
+import unicodedata
 
 
 def normalize_for_tts(text: str) -> str:
@@ -52,5 +53,8 @@ def normalize_for_tts(text: str) -> str:
     t = re.sub(r"\s+", " ", t).strip()
     # Clean up double punctuation spaces (e.g., " . " -> ". ")
     t = re.sub(r"\s+([,\.!\?])", r"\1", t)
+
+    # 9. Transliterate non-ASCII accents/diacritics to safe ASCII
+    t = unicodedata.normalize('NFKD', t).encode('ascii', 'ignore').decode('utf-8')
 
     return t

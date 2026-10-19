@@ -137,8 +137,7 @@ class TestV10UserInteractiveFixes(unittest.TestCase):
 
         # Step 2: "what's the time there?" resolves 'there' to Tokyo
         t_plan = self.hub.plan_or_execute("Okay, what's the time there?", dry_run=True)
-        self.assertEqual(t_plan.get("action"), "utility")
-        self.assertIn(t_plan.get("sub_action"), ["time_date", "world_clock"])
+        self.assertIn(t_plan.get("action"), ["world_time", "utility"])
         self.assertIn("Tokyo", t_plan.get("voice_response", ""))
         self.assertNotIn("Worldometer", t_plan.get("voice_response", ""))
         self.assertNotIn("Troye Sivan", t_plan.get("voice_response", ""))

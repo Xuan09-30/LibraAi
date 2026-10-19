@@ -2,20 +2,63 @@ import os
 import sys
 import argparse
 import subprocess
+import winreg
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 STARTUP_DIR = os.path.join(os.environ.get("APPDATA", ""), r"Microsoft\Windows\Start Menu\Programs\Startup")
 SHORTCUT_PATH = os.path.join(STARTUP_DIR, "LibraAssistant.lnk")
-VBS_PATH = os.path.join(PROJECT_ROOT, "scripts", "Launch_Libra_Background.vbs")
 ICON_PATH = os.path.join(PROJECT_ROOT, "assets", "icon.png")
+
+PYTHONW_PATH = os.path.join(PROJECT_ROOT, "venv", "Scripts", "pythonw.exe")
+if not os.path.exists(PYTHONW_PATH):
+    PYTHONW_PATH = "pythonw.exe"
+
+ARGUMENTS = "-m ui.gui --hidden"
+REG_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+REG_APP_NAME = "LibraAssistant"
+
+
+def register_registry_run() -> bool:
+    """Registers Libra directly into Windows Logon Run registry (HKCU\\...\\Run)."""
+    cmd = f'"{PYTHONW_PATH}" {ARGUMENTS}'
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, REG_APP_NAME, 0, winreg.REG_SZ, cmd)
+        print(f"[Success] Registered in Windows Run Registry:\n  HKCU\\{REG_RUN_KEY}\\{REG_APP_NAME} -> {cmd}")
+        return True
+    except Exception as e:
+        print(f"[Warning] Failed to write to Windows Run registry: {e}")
+        return False
+
+
+def unregister_registry_run() -> bool:
+    """Removes Libra from Windows Logon Run registry."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, REG_APP_NAME)
+        print(f"[Success] Removed from Windows Run Registry: HKCU\\{REG_RUN_KEY}\\{REG_APP_NAME}")
+        return True
+    except FileNotFoundError:
+        return True
+    except Exception as e:
+        print(f"[Warning] Failed to remove from Windows Run registry: {e}")
+        return False
+
+
+def is_registry_registered() -> bool:
+    """Checks if Libra is registered in Windows Run registry."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_RUN_KEY, 0, winreg.KEY_QUERY_VALUE) as key:
+            val, _ = winreg.QueryValueEx(key, REG_APP_NAME)
+            return bool(val)
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
 
 
 def create_startup_shortcut() -> bool:
-    """Creates a Windows Startup shortcut pointing to Launch_Libra_Background.vbs."""
-    if not os.path.exists(VBS_PATH):
-        print(f"[Error] Launcher VBS not found at: {VBS_PATH}")
-        return False
-
+    """Creates a Windows Startup shortcut pointing directly to pythonw.exe."""
     os.makedirs(STARTUP_DIR, exist_ok=True)
 
     # 1. Primary method: win32com WScript.Shell
@@ -23,13 +66,14 @@ def create_startup_shortcut() -> bool:
         import win32com.client
         shell = win32com.client.Dispatch("WScript.Shell")
         shortcut = shell.CreateShortCut(SHORTCUT_PATH)
-        shortcut.TargetPath = VBS_PATH
+        shortcut.TargetPath = PYTHONW_PATH
+        shortcut.Arguments = ARGUMENTS
         shortcut.WorkingDirectory = PROJECT_ROOT
         shortcut.Description = "Project Libra // Cybernetic Neural Assistant"
         if os.path.exists(ICON_PATH):
             shortcut.IconLocation = ICON_PATH
         shortcut.save()
-        print(f"[Success] Startup shortcut created via win32com at:\n  {SHORTCUT_PATH}")
+        print(f"[Success] Startup shortcut created at:\n  {SHORTCUT_PATH}")
         return True
     except Exception as e:
         print(f"[Info] win32com method failed ({e}), attempting PowerShell fallback...")
@@ -37,7 +81,7 @@ def create_startup_shortcut() -> bool:
     # 2. Fallback method: PowerShell COM WScript.Shell
     try:
         escaped_shortcut = SHORTCUT_PATH.replace("'", "''")
-        escaped_vbs = VBS_PATH.replace("'", "''")
+        escaped_target = PYTHONW_PATH.replace("'", "''")
         escaped_root = PROJECT_ROOT.replace("'", "''")
         escaped_icon = ICON_PATH.replace("'", "''")
 
@@ -45,7 +89,8 @@ def create_startup_shortcut() -> bool:
         ps_cmd = (
             f"$ws = New-Object -ComObject WScript.Shell; "
             f"$s = $ws.CreateShortcut('{escaped_shortcut}'); "
-            f"$s.TargetPath = '{escaped_vbs}'; "
+            f"$s.TargetPath = '{escaped_target}'; "
+            f"$s.Arguments = '{ARGUMENTS}'; "
             f"$s.WorkingDirectory = '{escaped_root}'; "
             f"$s.Description = 'Project Libra // Cybernetic Neural Assistant'; "
             f"{icon_line} "
@@ -64,29 +109,34 @@ def create_startup_shortcut() -> bool:
 
 
 def remove_startup_shortcut() -> bool:
-    """Removes the Windows Startup shortcut for Project Libra."""
+    """Removes the Windows Startup shortcut and registry key for Project Libra."""
+    reg_ok = unregister_registry_run()
+    sc_ok = True
     if os.path.exists(SHORTCUT_PATH):
         try:
             os.remove(SHORTCUT_PATH)
             print(f"[Success] Removed startup shortcut from:\n  {SHORTCUT_PATH}")
-            return True
         except Exception as e:
             print(f"[Error] Failed to remove shortcut: {e}")
-            return False
+            sc_ok = False
     else:
         print(f"[Notice] Shortcut does not exist at: {SHORTCUT_PATH}")
-        return True
+    return reg_ok and sc_ok
 
 
 def check_status() -> bool:
     """Checks if Project Libra is registered for Windows startup."""
-    exists = os.path.exists(SHORTCUT_PATH)
-    status_str = "ENABLED" if exists else "DISABLED"
+    sc_exists = os.path.exists(SHORTCUT_PATH)
+    reg_exists = is_registry_registered()
+
+    status_str = "ENABLED" if (sc_exists or reg_exists) else "DISABLED"
     print(f"\n[Project Libra Startup Status]: {status_str}")
-    print(f"  Shortcut Path: {SHORTCUT_PATH}")
-    print(f"  Target VBS:    {VBS_PATH}")
-    print(f"  Target Exists: {os.path.exists(VBS_PATH)}\n")
-    return exists
+    print(f"  Windows Run Registry: {'ENABLED' if reg_exists else 'DISABLED'}")
+    print(f"  Startup Folder .lnk:  {'ENABLED' if sc_exists else 'DISABLED'} ({SHORTCUT_PATH})")
+    print(f"  Target Executable:    {PYTHONW_PATH}")
+    print(f"  Arguments:            {ARGUMENTS}")
+    print(f"  Working Directory:    {PROJECT_ROOT}\n")
+    return sc_exists or reg_exists
 
 
 def main():
@@ -99,8 +149,9 @@ def main():
     args = parser.parse_args()
 
     if args.enable:
-        success = create_startup_shortcut()
-        sys.exit(0 if success else 1)
+        reg_ok = register_registry_run()
+        sc_ok = create_startup_shortcut()
+        sys.exit(0 if (reg_ok or sc_ok) else 1)
     elif args.disable:
         success = remove_startup_shortcut()
         sys.exit(0 if success else 1)

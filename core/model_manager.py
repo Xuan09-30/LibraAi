@@ -174,6 +174,20 @@ class ModelManager:
             }
 
     @staticmethod
+    def _attach_thread_desktop():
+        """Attaches calling thread to interactive input desktop on Windows."""
+        import sys
+        import ctypes
+        if sys.platform == "win32" and hasattr(ctypes, "windll"):
+            try:
+                user32 = ctypes.windll.user32
+                hdesk = user32.OpenInputDesktop(0, False, 0x01FF)
+                if hdesk:
+                    user32.SetThreadDesktop(hdesk)
+            except Exception:
+                pass
+
+    @staticmethod
     def _get_active_window_bbox() -> Optional[tuple]:
         """Captures the bounding box of the active foreground window on Windows."""
         import sys
@@ -181,6 +195,7 @@ class ModelManager:
         if sys.platform != "win32" or not hasattr(ctypes, "windll"):
             return None
         try:
+            ModelManager._attach_thread_desktop()
             class RECT(ctypes.Structure):
                 _fields_ = [
                     ("left", ctypes.c_long),
@@ -192,78 +207,153 @@ class ModelManager:
             user32 = ctypes.windll.user32
             hwnd = user32.GetForegroundWindow()
             if not hwnd:
+                hwnd = user32.GetTopWindow(0)
+            if not hwnd:
                 return None
             rect = RECT()
             if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                 width = rect.right - rect.left
                 height = rect.bottom - rect.top
                 if width > 60 and height > 60:
-                    return (rect.left, rect.top, rect.right, rect.bottom)
+                    return (max(0, rect.left), max(0, rect.top), rect.right, rect.bottom)
         except Exception as e:
             print(f"[ActiveWindow BBox Warning]: {e}")
         return None
 
-    def analyze_screen(self, prompt: str = "", active_window_only: bool = True, dry_run: bool = False) -> Dict[str, Any]:
+    @staticmethod
+    def capture_screenshot(bbox: Optional[tuple] = None):
         """
-        Captures the active foreground window (or primary display) and analyzes it using the vision model profile.
+        Captures the screen in an isolated clean worker thread with desktop attachment.
+        This completely bypasses Windows Win32 ERROR_BUSY (170) when GUI/Qt threads
+        have already created window handles. Falls back to mss if needed.
+        """
+        import threading
+        capture_result = {"image": None, "error": None}
+
+        def _isolated_grab():
+            try:
+                import ctypes
+                import sys
+                from PIL import ImageGrab
+
+                if sys.platform == "win32" and hasattr(ctypes, "windll"):
+                    user32 = ctypes.windll.user32
+                    hdesk = user32.OpenInputDesktop(0, False, 0x01FF)
+                    if hdesk:
+                        user32.SetThreadDesktop(hdesk)
+
+                img = ImageGrab.grab(bbox=bbox)
+                capture_result["image"] = img
+            except Exception as ex:
+                try:
+                    import mss
+                    from PIL import Image
+                    with mss.MSS() as sct:
+                        mon = sct.monitors[1]
+                        sct_img = sct.grab(mon)
+                        img = Image.frombytes("RGB", sct_img.size, sct_img.bgra, "raw", "BGRX")
+                        if bbox:
+                            img = img.crop(bbox)
+                        capture_result["image"] = img
+                except Exception as mss_ex:
+                    capture_result["error"] = ex
+
+        grab_thread = threading.Thread(target=_isolated_grab, daemon=True)
+        grab_thread.start()
+        grab_thread.join(timeout=3.5)
+
+        return capture_result.get("image")
+
+    def analyze_screen(self, prompt: str = "", active_window_only: bool = False, window_info: Optional[Dict[str, Any]] = None, dry_run: bool = False) -> Dict[str, Any]:
+        """
+        Captures the active foreground window or primary display and analyzes it using qwen2.5vl:7b.
+        Integrates ground-truth active window metadata to prevent any hallucinations.
         """
         clean_prompt = prompt or "Describe what you see on the screen concisely in 1-2 spoken sentences."
         target_scope = "active window" if active_window_only else "full screen"
 
         if dry_run:
+            app_lbl = window_info.get("app_label", "desktop") if window_info else "desktop"
             return {
                 "status": "analyzed",
                 "scope": target_scope,
                 "vision_response": f"[Dry Run] Screen ({target_scope}) analyzed for: {clean_prompt}",
-                "voice_response": "I see your screen. Everything appears operational."
+                "voice_response": f"I can see {app_lbl} on your screen."
             }
 
         vision_spec = self.acquire_model("vision", dry_run=False)
         active_vision_model = vision_spec["active_model"]
 
-        # Capture cropped active window or full primary monitor screenshot
+        # Capture screenshot using isolated worker thread
         b64_image = None
         try:
-            from PIL import ImageGrab
             bbox = self._get_active_window_bbox() if active_window_only else None
-            screenshot = ImageGrab.grab(bbox=bbox)
-            # Downscale if wider than 1280px to preserve inference latency
-            if screenshot.width > 1280:
-                scale = 1280.0 / screenshot.width
-                new_size = (1280, int(screenshot.height * scale))
-                screenshot = screenshot.resize(new_size)
+            screenshot = self.capture_screenshot(bbox=bbox)
+            if screenshot:
+                if screenshot.width > 1280:
+                    scale = 1280.0 / screenshot.width
+                    new_size = (1280, int(screenshot.height * scale))
+                    screenshot = screenshot.resize(new_size)
 
-            buffer = io.BytesIO()
-            screenshot.save(buffer, format="JPEG", quality=85)
-            b64_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
+                buffer = io.BytesIO()
+                screenshot.save(buffer, format="JPEG", quality=85)
+                b64_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            else:
+                print("[ModelManager Screen Capture Warning]: Screenshot returned None from worker thread.")
         except Exception as e:
             print(f"[ModelManager Screen Capture Warning]: {e}")
 
+        # Grounding context from window_info
+        grounding_context = ""
+        app_lbl = "application"
+        if window_info:
+            app_lbl = window_info.get("app_label") or "application"
+            w_title = window_info.get("window_title") or ""
+            grounding_context = f"Ground Truth: The user currently has {app_lbl} active (window title: '{w_title}').\n"
+
         if not b64_image:
+            if window_info and window_info.get("window_title"):
+                return {
+                    "status": "partial",
+                    "vision_response": f"Screen capture failed, but detected active window {app_lbl}: '{window_info.get('window_title')}'.",
+                    "voice_response": f"I see {app_lbl} active on your screen with title '{window_info.get('window_title')}', though visual screenshot was blocked."
+                }
             return {
                 "status": "error",
                 "vision_response": "Screen capture unavailable in current desktop session.",
                 "voice_response": "I was unable to capture your screen display."
             }
 
+        vision_instruction = (
+            f"{grounding_context}"
+            f"User Query: {clean_prompt}\n"
+            "Guidelines: Answer in 1-2 spoken sentences. State accurately what is visible on the screen. "
+            "If the user asks for their in-game name, username, or fine text, inspect the screenshot carefully. "
+            "If the text is clearly legible, state it exactly. If it is blurry, small, occluded, or not visible, "
+            "truthfully state that you cannot clearly read the name or text on screen. "
+            "NEVER invent, guess, or hallucinate names, windows, or folders."
+        )
+
         payload = {
             "model": active_vision_model,
             "messages": [
                 {
                     "role": "user",
-                    "content": clean_prompt,
+                    "content": vision_instruction,
                     "images": [b64_image]
                 }
             ],
             "stream": False,
             "keep_alive": "2m",
-            "options": {"temperature": 0.2, "num_predict": 128}
+            "options": {"temperature": 0.1, "num_predict": 120}
         }
 
         try:
             resp = requests.post(f"{self.ollama_host}/api/chat", json=payload, timeout=45)
             if resp.status_code == 200:
                 answer = resp.json().get("message", {}).get("content", "").strip()
+                # Clean any markdown or thought tokens if present
+                answer = answer.replace("<think>", "").replace("</think>", "").strip()
                 return {
                     "status": "analyzed",
                     "vision_response": answer,
@@ -272,8 +362,14 @@ class ModelManager:
         except Exception as e:
             print(f"[ModelManager Vision Inference Error]: {e}")
 
+        # Truthful fallback if inference timed out
+        if window_info and window_info.get("window_title"):
+            fallback_voice = f"I see {app_lbl} active on your screen (title: '{window_info.get('window_title')}'). Deep visual reasoning timed out."
+        else:
+            fallback_voice = "I could not complete the visual screen inspection."
+
         return {
             "status": "error",
-            "vision_response": "Vision model inference timed out.",
-            "voice_response": "I could not complete the visual screen inspection."
+            "vision_response": "Vision model inference timed out or failed.",
+            "voice_response": fallback_voice
         }

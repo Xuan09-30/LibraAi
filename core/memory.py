@@ -214,7 +214,7 @@ class SemanticMemory:
             conn.close()
         return fact_id
 
-    def recall_relevant(self, query: str, limit: int = 3, distance_threshold: float = 0.75) -> list[dict]:
+    def recall_relevant(self, query: str, limit: int = 3, distance_threshold: float = 0.50) -> list[dict]:
         """Runs KNN vector search against `vec_facts` JOIN `facts` ORDER BY distance LIMIT k."""
         clean_query = query.strip()
         if not clean_query:
@@ -351,7 +351,7 @@ class SemanticMemory:
             if self.db_path != ":memory:":
                 conn.close()
 
-    def recall_episodes(self, query: str, limit: int = 2, distance_threshold: float = 0.65) -> list[dict]:
+    def recall_episodes(self, query: str, limit: int = 2, distance_threshold: float = 0.45) -> list[dict]:
         """
         Retrieves the most semantically relevant past conversational episodes.
         """
@@ -375,9 +375,14 @@ class SemanticMemory:
             rows = cursor.fetchall()
 
             episodes = []
+            seen_texts = set()
             for r in rows:
                 dist = float(r[4])
                 if dist <= distance_threshold:
+                    asst_clean = (r[2] or "").strip().lower()
+                    if asst_clean in seen_texts:
+                        continue
+                    seen_texts.add(asst_clean)
                     episodes.append({
                         "id": r[0],
                         "user_text": r[1],

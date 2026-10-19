@@ -1,5 +1,6 @@
 import urllib.parse
 import requests
+import unicodedata
 from datetime import datetime
 
 DEFAULT_LAT = 3.2008
@@ -48,9 +49,35 @@ BUILT_IN_LOCATIONS = {
     "tokyo": ("Tokyo", 35.6762, 139.6503, "Japan"),
     "london": ("London", 51.5074, -0.1278, "United Kingdom"),
     "new york": ("New York", 40.7128, -74.0060, "United States"),
+    "nyc": ("New York", 40.7128, -74.0060, "United States"),
     "sydney": ("Sydney", -33.8688, 151.2093, "Australia"),
     "seoul": ("Seoul", 37.5665, 126.9780, "South Korea"),
     "bangkok": ("Bangkok", 13.7563, 100.5018, "Thailand"),
+    "usa": ("Washington, D.C.", 38.9072, -77.0369, "United States"),
+    "us": ("Washington, D.C.", 38.9072, -77.0369, "United States"),
+    "united states": ("Washington, D.C.", 38.9072, -77.0369, "United States"),
+    "america": ("Washington, D.C.", 38.9072, -77.0369, "United States"),
+    "uk": ("London", 51.5074, -0.1278, "United Kingdom"),
+    "united kingdom": ("London", 51.5074, -0.1278, "United Kingdom"),
+    "britain": ("London", 51.5074, -0.1278, "United Kingdom"),
+    "england": ("London", 51.5074, -0.1278, "United Kingdom"),
+    "japan": ("Tokyo", 35.6762, 139.6503, "Japan"),
+    "china": ("Beijing", 39.9042, 116.4074, "China"),
+    "australia": ("Sydney", -33.8688, 151.2093, "Australia"),
+    "germany": ("Berlin", 52.5200, 13.4050, "Germany"),
+    "france": ("Paris", 48.8566, 2.3522, "France"),
+    "canada": ("Toronto", 43.6532, -79.3832, "Canada"),
+    "korea": ("Seoul", 37.5665, 126.9780, "South Korea"),
+    "south korea": ("Seoul", 37.5665, 126.9780, "South Korea"),
+    "taiwan": ("Taipei", 25.0330, 121.5654, "Taiwan"),
+    "indonesia": ("Jakarta", -6.2088, 106.8456, "Indonesia"),
+    "thailand": ("Bangkok", 13.7563, 100.5018, "Thailand"),
+    "india": ("New Delhi", 28.6139, 77.2090, "India"),
+    "uae": ("Dubai", 25.2048, 55.2708, "United Arab Emirates"),
+    "dubai": ("Dubai", 25.2048, 55.2708, "United Arab Emirates"),
+    "russia": ("Moscow", 55.7558, 37.6173, "Russia"),
+    "italy": ("Rome", 41.9028, 12.4964, "Italy"),
+    "spain": ("Madrid", 40.4168, -3.7038, "Spain"),
 }
 
 
@@ -101,11 +128,15 @@ def geocode_location(city_name: str) -> dict:
         results = data.get("results") or []
         if results:
             top = results[0]
+            raw_name = top.get("name", clean.title())
+            clean_name = unicodedata.normalize('NFKD', raw_name).encode('ascii', 'ignore').decode('utf-8') or raw_name
+            raw_country = top.get("country", "Unknown")
+            clean_country = unicodedata.normalize('NFKD', raw_country).encode('ascii', 'ignore').decode('utf-8') or raw_country
             return {
-                "name": top.get("name", clean.title()),
+                "name": clean_name,
                 "latitude": float(top.get("latitude", DEFAULT_LAT)),
                 "longitude": float(top.get("longitude", DEFAULT_LON)),
-                "country": top.get("country", "Unknown"),
+                "country": clean_country,
             }
     except Exception:
         pass

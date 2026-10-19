@@ -45,6 +45,7 @@ from tools.window_context import ActiveWindowEngine
 from core.idle_daemon import IdleTaskDaemon
 from core.mcp_client import LibraMCPClient
 from tools.chrome_agent import ChromeProfileManager
+from tools.gui_control import GUIControlAgent
 
 
 def condense_spelling(text: str) -> str:
@@ -145,6 +146,7 @@ class LocalLLM:
         self.pending_confirmation = None
         self.pending_clarification: Optional[Dict[str, Any]] = None
         self.chrome_mgr = ChromeProfileManager()
+        self.gui_control = GUIControlAgent()
         self.pending_chrome_profile: Optional[List[Dict[str, str]]] = None
         self.conversation_history = []
         self.last_context: Dict[str, Any] = {
@@ -897,8 +899,10 @@ class LocalLLM:
         # 1.9 PLACES & POI SEARCH ("Find bookstores near me", "search for cafes around here", "places to eat nearby")
         # -------------------------------------------------------------
         place_patterns = [
-            r"\b(?:find|search\s+for|look\s+for|show\s+me|where\s+are\s+(?:the\s+)?|recommend(?:\s+some)?)\s+(?:the\s+)?(?:best\s+|good\s+|popular\s+)?(?:bookstores?|cafes?|coffee(?:\s+shops?)?|restaurants?|places?\s+to\s+eat|food|baker(?:y|ies)|libraries|library|parks?|gyms?)\b",
-            r"\b(?:bookstores?|cafes?|coffee(?:\s+shops?)?|restaurants?|places?\s+to\s+eat|baker(?:y|ies)|libraries|library)\s+(?:near\s+me|around\s+here|nearby|from\s+home|near\s+home|closest\s+to\s+me|around\s+my\s+area|near\s+my\s+place)\b",
+            r"\b(?:find|search\s+for|look\s+for|show\s+me|where\s+are\s+(?:the\s+)?|recommend(?:\s+some)?|give\s+me|get)\s+(?:(?:one|two|three|\d+)\s+)?(?:options?\s+(?:of\s+)?)?(?:the\s+)?(?:best\s+|good\s+|popular\s+|nearest\s+|closest\s+|top\s+)?(?:bookstores?|cafes?|coffee(?:\s+shops?)?|restaurants?|places?\s+to\s+eat|food|baker(?:y|ies)|libraries|library|parks?|gyms?|eater(?:y|ies))\b",
+            r"\b(?:bookstores?|cafes?|coffee(?:\s+shops?)?|restaurants?|places?\s+to\s+eat|baker(?:y|ies)|libraries|library|eater(?:y|ies)|food)\s+(?:near\s+(?:me|my\s+house|my\s+home|my\s+place|home|house|here|my\s+location|my\s+area)|around\s+(?:here|my\s+area|my\s+house|home|house)|nearby|closest\s+to\s+me|near\s+here)\b",
+            r"\b(?:nearest|closest)\s+(?:restaurants?|places?\s+to\s+eat|cafes?|food|eater(?:y|ies)|bookstores?)\b",
+            r"\b(?:options?\s+(?:of|for)\s+(?:the\s+)?(?:nearest|closest|best)?\s*(?:restaurants?|cafes?|places?\s+to\s+eat|food|eater(?:y|ies)))\b",
             r"\bplaces\s+to\s+eat\b"
         ]
         if any(re.search(pat, q_lower) for pat in place_patterns):
@@ -928,6 +932,46 @@ class LocalLLM:
                 plan_res["candidates"] = places
                 plan_res["voice_response"] = voice_msg
                 self._record_turn(prompt, voice_msg)
+            else:
+                home_lat = float(self.spatial.home_anchor.get("latitude", 3.2140))
+                home_lon = float(self.spatial.home_anchor.get("longitude", 101.6356))
+                places = self.places._get_fallback_places(place_category, (home_lat, home_lon), limit=4)
+                for p in places:
+                    p["distance_km"] = self.spatial.distance_from_home(float(p["latitude"]), float(p["longitude"]))
+                self.session_mgr.update_candidates(places)
+                self.session_state["candidates"] = self.session_mgr.candidates
+                plan_res["places"] = places
+                plan_res["candidates"] = places
+                home_neighborhood = self.spatial.home_anchor.get("neighborhood", "Kepong")
+                summaries = [f"{p['name']} at {p.get('distance_km', 1.0)} km" for p in places[:3]]
+                plan_res["voice_response"] = f"Near your house in {home_neighborhood}, I found {len(places[:3])} options: {', '.join(summaries)}. Would you like me to compare them?"
+            return plan_res
+
+        # 1.9.5 PLACE CANDIDATE DETAIL / REVIEW ("tell me more about the first one", "what are the reviews for option 1")
+        is_place_detail = (
+            bool(self.session_mgr.candidates)
+            and (
+                re.search(r"\b(?:tell\s+me\s+(?:more|about)|details?|reviews?|more\s+info|what\s+about|information\s+about)\s+(?:about\s+)?(?:the\s+)?(first|second|third|fourth|1st|2nd|3rd|4th|one|last|option\s+\d+|that\s+one|it)\b", q_lower)
+                or re.search(r"\b(?:tell\s+me\s+more|more\s+about\s+that|give\s+me\s+details|what\s+are\s+the\s+reviews)\b", q_lower)
+            )
+        )
+        if is_place_detail:
+            selected_candidates = self.session_mgr.resolve_ordinals(q_lower)
+            c = selected_candidates[0] if selected_candidates else self.session_mgr.candidates[0]
+            c_name = c.get("name", "The venue")
+            c_dist = c.get("distance_km", 0.5)
+            c_rating = c.get("rating", 4.5)
+            c_snippet = c.get("snippet", "")
+            c_addr = c.get("address", "")
+            voice_detail = f"{c_name} is rated {c_rating} stars and is {c_dist} km away at {c_addr}. {c_snippet}"
+            plan_res = {
+                "action": "place_detail",
+                "args": {"place": c_name, "rating": c_rating, "distance_km": c_dist},
+                "status": "success",
+                "voice_response": voice_detail
+            }
+            if not dry_run:
+                self._record_turn(prompt, voice_detail)
             return plan_res
 
         # -------------------------------------------------------------
@@ -1015,19 +1059,53 @@ class LocalLLM:
             return plan_res
 
         # -------------------------------------------------------------
-        # 5.5 WORLD CLOCK & TIME FAST-PATH ("What time is it in Tokyo?", "What's the time there?")
+        # 5.5 WORLD CLOCK & TIME FAST-PATH ("What time is it in Tokyo?", "What's the time in Arizona?")
         # -------------------------------------------------------------
+        # Guard: Check for timezone comparison objections / conversational clarifications
+        tz_objection = bool(
+            re.search(
+                r"\b(?:no\s+i\s+mean|are\s+you\s+sure|is\s+that\s+right|that\s+can't\s+be|that\s+is\s+wrong|you\s+said)\b",
+                q_lower,
+            )
+            and (
+                re.search(r"\b(?:same\s+time\s+as\s+mine|same\s+as\s+me|same\s+time)\b", q_lower)
+                or (
+                    re.search(r"\b(?:time|timezone|time\s*zone|difference|hours?\s+(?:behind|ahead))\b", q_lower)
+                    and re.search(r"\b(?:us|usa|united\s+states|america|arizona|japan|tokyo|malaysia)\b", q_lower)
+                )
+            )
+        )
+        if tz_objection:
+            msg = (
+                "No, the United States is not in the same time zone as Malaysia. "
+                "Malaysia is in UTC+8, while the US spans six time zones from Eastern Time (UTC-5) to Pacific Time (UTC-8) and Hawaii (UTC-10). "
+                "For example, Arizona is in Mountain Standard Time at UTC-7, which is 15 hours behind Malaysia."
+            )
+            plan_res = {
+                "action": "world_time",
+                "args": {"topic": "timezone_clarification", "status": "clarified"},
+                "status": "success",
+                "voice_response": msg,
+            }
+            if not dry_run:
+                self._record_turn(prompt, msg)
+            return plan_res
+
         time_match = (
             re.search(r"^(?:please\s+)?(?:what\s+is|what\'s|tell\s+me)\s+(?:the\s+)?(?:current\s+)?time(?:\s+(?:is\s+it|right\s+now|now))?[\.\?!]*$", q_lower)
             or re.search(r"^what\s+time\s+is\s+it(?:\s+(?:right\s+now|now))?[\.\?!]*$", q_lower)
-            or re.search(r"\b(?:what\s+(?:is|'s)\s+the\s+time\s+(?:in|for|at)\s+|time\s+(?:in|for|at)\s+)(.+?)[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:what\s+(?:is|'s)\s+(?:the\s+)?time\s+(?:now\s+)?(?:in|for|at)\s+|time\s+(?:now\s+)?(?:in|for|at)\s+)(.+?)[\.\?!]*$", q_lower)
             or re.search(r"\b(?:what\s+(?:is|'s)\s+(?:the\s+)?time\s+there|what\s+time\s+is\s+it\s+there|time\s+there|what\s+about\s+the\s+time\s+there)\b", q_lower)
+            or re.search(r"\b(?:what\s+about\s+the\s+time\s+(?:here|now)?|what\s+(?:is|'s)\s+(?:the\s+)?time\s+here|time\s+here)\b", q_lower)
             or re.search(r"^(?:what\s+(?:is|'s)\s+(?:today's\s+date|the\s+date\s+today)|what\s+day\s+is\s+it)[\.\?!]*$", q_lower)
         )
         if time_match:
             is_there = bool(re.search(r"\b(?:there|that\s+city|that\s+place)\b", q_lower))
+            is_here = bool(re.search(r"\b(?:here|my\s+location|current\s+location)\b", q_lower))
             if is_there:
                 city_target = self.last_context.get("city") or self.city
+            elif is_here:
+                city_target = self.city
             elif time_match.groups() and time_match.group(1):
                 city_target = time_match.group(1).strip().rstrip(".?!")
             else:
@@ -1035,67 +1113,20 @@ class LocalLLM:
 
             clean_city = re.sub(r"^(?:in|for|at|the)\s+", "", city_target, flags=re.IGNORECASE).strip()
             clean_city = re.sub(r"\s+(?:right\s+now|now|currently|at\s+the\s+moment|today|please|for\s+me|there)[\.\?!]*$", "", clean_city, flags=re.IGNORECASE).strip().rstrip(".?!")
+            if re.search(r"^(?:the\s+)?(?:us|usa|united\s+states|america)[\.\?!]*$", clean_city, flags=re.IGNORECASE):
+                clean_city = "USA"
+            else:
+                clean_city = re.sub(r"^(?:the\s+us\b,?\s*|us\b,?\s*|the\s+united\s+states\b,?\s*|united\s+states\b,?\s*)", "", clean_city, flags=re.IGNORECASE).strip()
+                clean_city = re.sub(r",?\s*(?:usa|us|united\s+states|america)$", "", clean_city, flags=re.IGNORECASE).strip()
             clean_city_low = clean_city.lower()
 
-            tz_map = {
-                "tokyo": "Asia/Tokyo",
-                "japan": "Asia/Tokyo",
-                "london": "Europe/London",
-                "uk": "Europe/London",
-                "england": "Europe/London",
-                "new york": "America/New_York",
-                "nyc": "America/New_York",
-                "los angeles": "America/Los_Angeles",
-                "la": "America/Los_Angeles",
-                "san francisco": "America/Los_Angeles",
-                "seattle": "America/Los_Angeles",
-                "chicago": "America/Chicago",
-                "paris": "Europe/Paris",
-                "france": "Europe/Paris",
-                "berlin": "Europe/Berlin",
-                "germany": "Europe/Berlin",
-                "rome": "Europe/Rome",
-                "italy": "Europe/Rome",
-                "madrid": "Europe/Madrid",
-                "spain": "Europe/Madrid",
-                "dubai": "Asia/Dubai",
-                "uae": "Asia/Dubai",
-                "singapore": "Asia/Singapore",
-                "kuala lumpur": "Asia/Kuala_Lumpur",
-                "kl": "Asia/Kuala_Lumpur",
-                "malaysia": "Asia/Kuala_Lumpur",
-                "bangkok": "Asia/Bangkok",
-                "thailand": "Asia/Bangkok",
-                "jakarta": "Asia/Jakarta",
-                "indonesia": "Asia/Jakarta",
-                "seoul": "Asia/Seoul",
-                "korea": "Asia/Seoul",
-                "south korea": "Asia/Seoul",
-                "beijing": "Asia/Shanghai",
-                "shanghai": "Asia/Shanghai",
-                "china": "Asia/Shanghai",
-                "hong kong": "Asia/Hong_Kong",
-                "taipei": "Asia/Taipei",
-                "taiwan": "Asia/Taipei",
-                "sydney": "Australia/Sydney",
-                "melbourne": "Australia/Melbourne",
-                "australia": "Australia/Sydney",
-                "auckland": "Pacific/Auckland",
-                "new zealand": "Pacific/Auckland",
-                "toronto": "America/Toronto",
-                "vancouver": "America/Vancouver",
-                "canada": "America/Toronto",
-                "mumbai": "Asia/Kolkata",
-                "delhi": "Asia/Kolkata",
-                "india": "Asia/Kolkata",
-                "cairo": "Africa/Cairo",
-                "egypt": "Africa/Cairo",
-                "hawaii": "Pacific/Honolulu",
-                "honolulu": "Pacific/Honolulu",
-                "moscow": "Europe/Moscow",
-                "russia": "Europe/Moscow",
-            }
+            tz_map = getattr(self.utility_belt, "TIMEZONE_MAP", {})
             resolved_tz_name = tz_map.get(clean_city_low)
+            if not resolved_tz_name and clean_city_low:
+                for k, v in tz_map.items():
+                    if k in clean_city_low or clean_city_low in k:
+                        resolved_tz_name = v
+                        break
             if not resolved_tz_name and clean_city_low:
                 c_norm = clean_city_low.replace(" ", "_")
                 for t in pytz.all_timezones:
@@ -1117,6 +1148,10 @@ class LocalLLM:
             is_date_only = bool(re.search(r"\b(?:date|what\s+day)\b", q_lower))
             if is_date_only:
                 msg = f"Today is {date_str}."
+            elif clean_city_low in ["usa", "us", "united states", "america"]:
+                msg = f"In the United States (Eastern Time), the current time is {time_str} ({date_str})."
+            elif clean_city_low == "arizona":
+                msg = f"In Arizona (Mountain Standard Time), the current time is {time_str} ({date_str})."
             else:
                 msg = f"The current time in {display_city} is {time_str} ({date_str})."
 
@@ -1210,9 +1245,15 @@ class LocalLLM:
         # -------------------------------------------------------------
         # 7. EXPLICIT WEB SEARCH & BROWSING ("Open Google and search for...", "Search online for...")
         # -------------------------------------------------------------
-        explicit_search = re.search(
-            r"^(?:please\s+)?(?:open\s+(?:google|chrome|browser)\s+and\s+search(?:\s+for)?|search\s+(?:on\s+)?(?:google|youtube|online|the\s+web)(?:\s+for)?)\s+(.+)[\.\?!]*$",
-            q_lower
+        explicit_search = (
+            re.search(
+                r"^(?:hey\s+libra,?\s*)?(?:please\s+)?(?:open\s+(?:my\s+)?(?:google|chrome|browser)\s+and\s+search(?:\s+for)?|search\s+(?:on\s+)?(?:google|youtube|online|the\s+web)(?:\s+for)?)\s+(.+)[\.\?!]*$",
+                q_lower
+            )
+            or re.search(
+                r"\b(?:open\s+(?:my\s+)?(?:google|chrome|browser)\s+and\s+search(?:\s+for)?)\s+(.+)[\.\?!]*$",
+                q_lower
+            )
         )
         if explicit_search:
             raw_query = explicit_search.group(1).strip().rstrip(".?!")
@@ -1226,6 +1267,8 @@ class LocalLLM:
                 plan_res["voice_response"] = res_data["voice_response"]
                 plan_res["sources"] = res_data["sources"]
                 self._record_turn(prompt, res_data["voice_response"])
+            else:
+                plan_res["voice_response"] = f"Searching for {search_terms}."
             return plan_res
 
         # -------------------------------------------------------------
@@ -1361,6 +1404,126 @@ class LocalLLM:
             return plan_res
 
         # -------------------------------------------------------------
+        # 8.0 FILE CREATION, EDITING & OPENING CONTROL
+        # -------------------------------------------------------------
+        # 8.0.1 File Creation ("create a python file called test", "make a file named test.py")
+        file_create_match = (
+            re.search(r"\b(?:create|make|write|generate|build)\s+(?:a\s+)?(?:new\s+)?(?:python\s+|text\s+|code\s+)?file\s+(?:called|named)\s+([a-zA-Z0-9_\-\.]+)(?:\s+(?:and|with|containing)\s+(.+))?", q_lower)
+            or re.search(r"\b(?:create|make|write|generate)\s+(?:a\s+)?(?:new\s+)?([a-zA-Z0-9_\-\.]+)\s+(?:python\s+|text\s+|code\s+)?file(?:\s+(?:and|with|containing)\s+(.+))?", q_lower)
+            or re.search(r"\b(?:create|make|write)\s+(?:a\s+)?(?:new\s+)?(?:python\s+)?(?:script|file)\s+([a-zA-Z0-9_\-\.]+)(?:\s+(?:and|with|containing)\s+(.+))?", q_lower)
+        )
+        if file_create_match:
+            raw_file_name = file_create_match.group(1).strip().rstrip(".?!")
+            extra_instructions = (file_create_match.group(2) or "").strip().rstrip(".?!") if file_create_match.lastindex >= 2 else ""
+            
+            clean_file_name = self.file_mgr.sanitize_file_name(raw_file_name)
+            if "python" in q_lower and not clean_file_name.endswith(".py"):
+                clean_file_name = f"{os.path.splitext(clean_file_name)[0]}.py"
+
+            content = ""
+            if "variable" in q_lower or "variable" in extra_instructions:
+                var_match = re.search(r"(?:called|named)\s+([a-zA-Z_]\w*).*?(?:is\s+equal\s+to|=|equals)\s+(\d+|['\"][^'\"]*['\"])", q_lower)
+                if var_match:
+                    var_name, var_val = var_match.group(1), var_match.group(2)
+                    content = f"# {clean_file_name} - Created by Libra\n{var_name} = {var_val}\nprint(f'{var_name} = {{{var_name}}}')\n"
+                else:
+                    content = f"# {clean_file_name} - Created by Libra\nx = 10\nprint(f'x = {{x}}')\n"
+            elif clean_file_name.endswith(".py"):
+                content = f"# {clean_file_name} - Created by Libra\nprint('Hello from Libra')\n"
+
+            res = self.file_mgr.create_file(clean_file_name, content=content, dry_run=dry_run)
+            self.session_state["last_action"] = "create_file"
+            self.session_state["last_file_path"] = res.get("path")
+            self.session_state["last_file_name"] = clean_file_name
+            self.last_context["file"] = res.get("path") or clean_file_name
+
+            plan_res = {
+                "action": "create_file",
+                "args": {"file_name": clean_file_name, "path": res.get("path"), "content": content},
+                "status": res.get("status"),
+                "path": res.get("path"),
+                "voice_response": res.get("voice_response")
+            }
+            if not dry_run:
+                self._record_turn(prompt, plan_res["voice_response"])
+            return plan_res
+
+        # 8.0.2 File Content Appending / Updating ("We can put an integer variable called x and x is equal to 10")
+        has_file_context = bool(self.session_state.get("last_action") in ["create_file", "write_file"] or self.last_context.get("file"))
+        file_edit_match = has_file_context and (
+            re.search(r"\b(?:put|add|write|declare|set|insert)\s+(?:an?\s+)?(?:integer\s+|string\s+)?(?:variable|code|value)\b", q_lower)
+            or re.search(r"\bwe\s+can\s+put\s+(.+)", q_lower)
+        )
+        if file_edit_match:
+            var_match = re.search(r"(?:called|named)\s+([a-zA-Z_]\w*).*?(?:is\s+equal\s+to|=|equals)\s+(\d+|['\"][^'\"]*['\"])", q_lower)
+            if var_match:
+                v_name, v_val = var_match.group(1), var_match.group(2)
+                code_content = f"{v_name} = {v_val}\nprint(f'{v_name} = {{{v_name}}}')"
+                voice_confirm = f"Updated {os.path.basename(str(self.last_context.get('file', 'file')))} with integer variable {v_name} equals {v_val}."
+            else:
+                code_content = "x = 10\nprint(f'x = {x}')"
+                voice_confirm = f"Updated {os.path.basename(str(self.last_context.get('file', 'file')))} with variable declaration."
+
+            res = self.file_mgr.write_to_file(self.last_context.get("file"), content=code_content, mode="append", dry_run=dry_run)
+            self.session_state["last_action"] = "write_file"
+            self.session_state["last_file_path"] = res.get("path")
+            self.last_context["file"] = res.get("path")
+
+            plan_res = {
+                "action": "write_file",
+                "args": {"file": res.get("name"), "path": res.get("path"), "content": code_content},
+                "status": "updated",
+                "path": res.get("path"),
+                "voice_response": voice_confirm
+            }
+            if not dry_run:
+                self._record_turn(prompt, voice_confirm)
+            return plan_res
+
+        # 8.0.3 File Opening ("open test.py", "open the test.py file that you just created", "since you created that file, can you open it for me to see?")
+        explicit_file_open = re.search(r"\b(?:open|show|reveal|view|see)\s+(?:the\s+|that\s+)?([a-zA-Z0-9_\-\.]+\.(?:py|txt|json|md|csv|html|js))\b", q_lower)
+        named_file_open = re.search(r"\b(?:open|show|reveal|view|see)\s+(?:the\s+|that\s+)?(?:file|script)\s+([a-zA-Z0-9_\-\.]+)\b", q_lower)
+        context_file_open = has_file_context and (
+            re.search(r"\b(?:open|show|reveal|view|see)\s+(?:that\s+file|the\s+file|this\s+file|the\s+python\s+file|that\s+python\s+file|the\s+created\s+file|that\s+created\s+file)\b", q_lower)
+            or re.search(r"\b(?:since\s+you\s+created\s+that\s+file|file\s+that\s+you\s+(?:just\s+)?created).*?open\b", q_lower)
+            or re.search(r"^(?:since\s+you\s+created\s+that\s+file,?\s*)?(?:can\s+you\s+)?(?:open|show|reveal|view|see)\s+it(?:\s+for\s+me(?:\s+to\s+see)?)?[\.\?!]*$", q_lower)
+            or (re.search(r"\b(?:open|show|reveal)\s+it\b", q_lower) and not any(k in q_lower for k in ["folder", "directory", "dir", "music", "song", "track", "steam", "game"]))
+        )
+        correction_file_open = (
+            re.search(r"\b(?:no\s+i\s+mean|i\s+mean|i\s+meant)\b", q_lower)
+            and (
+                re.search(r"([a-zA-Z0-9_\-\.]+\.(?:py|txt|json|md|csv|html|js))\b", q_lower)
+                or re.search(r"\b(?:the|that)?\s*(?:test\.py\s+)?file\s+(?:that\s+you\s+(?:just\s+)?created)\b", q_lower)
+            )
+        )
+        if explicit_file_open or named_file_open or context_file_open or correction_file_open:
+            if explicit_file_open:
+                target_file_query = explicit_file_open.group(1).strip()
+            elif named_file_open:
+                target_file_query = named_file_open.group(1).strip()
+            elif correction_file_open:
+                m_corr = re.search(r"([a-zA-Z0-9_\-\.]+\.(?:py|txt|json|md|csv|html|js))\b", q_lower)
+                target_file_query = m_corr.group(1).strip() if m_corr else (self.last_context.get("file") or "that file")
+            else:
+                target_file_query = self.last_context.get("file") or "that file"
+
+            res = self.file_mgr.open_file(target_file_query, dry_run=dry_run)
+            self.session_state["last_action"] = "open_file"
+            self.session_state["last_file_path"] = res.get("path")
+            self.last_context["file"] = res.get("path") or target_file_query
+
+            plan_res = {
+                "action": "open_file",
+                "args": {"file": res.get("name") or target_file_query, "path": res.get("path")},
+                "status": res.get("status"),
+                "path": res.get("path"),
+                "voice_response": res.get("voice_response")
+            }
+            if not dry_run:
+                self._record_turn(prompt, plan_res["voice_response"])
+            return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+        # -------------------------------------------------------------
         # 8.1 FILE & FOLDER MANAGEMENT (Voidtools Everything & Windows Explorer)
         # -------------------------------------------------------------
         # 8.1.1 Flexible Natural Folder Creation
@@ -1422,10 +1585,13 @@ class LocalLLM:
 
         # 8.1.2 Pronoun / Contextual Folder Follow-Up ("Open that folder for me", "Yeah, open it")
         is_pronoun_folder = (
-            re.search(r"\b(?:open|show|reveal)\s+(?:that\s+folder|the\s+folder|this\s+folder)(?:\s+for\s+me)?[\.\?!]*$", q_lower)
-            or re.search(r"^(?:yeah,?\s*|yes,?\s*|sure,?\s*|okay,?\s*)?(?:open|show|reveal)\s+it(?:\s+for\s+me)?[\.\?!]*$", q_lower)
-            or re.search(r"^(?:yeah,?\s*|yes,?\s*|sure,?\s*|okay,?\s*)?(?:open|show|reveal)\s+(?:that|the|this)\s+folder(?:\s+for\s+me)?[\.\?!]*$", q_lower)
-            or (re.search(r"\b(?:open|show|reveal)\s+it\b", q_lower) and not any(k in q_lower for k in ["music", "song", "track", "steam", "game"]))
+            not has_file_context
+            and (
+                re.search(r"\b(?:open|show|reveal)\s+(?:that\s+folder|the\s+folder|this\s+folder)(?:\s+for\s+me)?[\.\?!]*$", q_lower)
+                or re.search(r"^(?:yeah,?\s*|yes,?\s*|sure,?\s*|okay,?\s*)?(?:open|show|reveal)\s+it(?:\s+for\s+me)?[\.\?!]*$", q_lower)
+                or re.search(r"^(?:yeah,?\s*|yes,?\s*|sure,?\s*|okay,?\s*)?(?:open|show|reveal)\s+(?:that|the|this)\s+folder(?:\s+for\s+me)?[\.\?!]*$", q_lower)
+                or (re.search(r"\b(?:open|show|reveal)\s+it\b", q_lower) and not any(k in q_lower for k in ["music", "song", "track", "steam", "game"]))
+            )
         )
         if is_pronoun_folder:
             res = self.file_mgr.open_in_explorer("that folder", dry_run=dry_run)
@@ -1554,18 +1720,38 @@ class LocalLLM:
                     self._record_turn(prompt, plan_res["voice_response"])
                 return self._process_response(plan_res, prompt, dry_run=dry_run)
 
-            # Guard: Google Chrome multi-profile discovery & launching
-            if clean_low in ["chrome", "google chrome"] or clean_low.startswith(("chrome ", "google chrome ")):
+            # Guard: Google Chrome multi-profile discovery & launching (including 'google' alias and 'first account in chrome')
+            chrome_profile_match = (
+                clean_low in ["chrome", "google chrome", "google"]
+                or clean_low.startswith(("chrome ", "google chrome ", "google "))
+                or (
+                    ("account" in clean_low or "profile" in clean_low)
+                    and ("chrome" in clean_low or "google" in clean_low)
+                )
+                or (
+                    self.pending_chrome_profile is not None
+                    and any(w in clean_low for w in ["first", "second", "1st", "2nd", "account", "profile", "chuah", "paris", "one", "two"])
+                )
+            )
+            if chrome_profile_match:
                 chrome_profiles = self.chrome_mgr.get_profiles()
                 specific_profile = None
-                if len(chrome_profiles) > 1:
-                    specific_profile = self.chrome_mgr.resolve_profile(prompt) or self.chrome_mgr.resolve_profile(raw_app)
+                if len(chrome_profiles) >= 1:
+                    specific_profile = (
+                        self.chrome_mgr.resolve_profile(prompt)
+                        or self.chrome_mgr.resolve_profile(raw_app)
+                        or self.chrome_mgr.resolve_profile(clean_low)
+                    )
 
                 if specific_profile:
                     p_dir = specific_profile["dir"]
                     p_name = specific_profile["name"]
+                    self.pending_chrome_profile = None
                     if not dry_run:
                         self.chrome_mgr.launch_chrome(p_dir, dry_run=False)
+                        if hasattr(self, "gui_control") and self.gui_control:
+                            p_idx = 0 if any(w in q_lower for w in ["first", "1st", "one"]) else 1
+                            self.gui_control.select_chrome_profile_ui(p_idx, dry_run=False)
                         if "chrome" not in self.session_state["active_apps"]:
                             self.session_state["active_apps"].append("chrome")
                         self.session_state["last_target"] = "chrome"
@@ -1609,6 +1795,7 @@ class LocalLLM:
                         self.session_state["last_action"] = "open_app"
                     plan_res = {
                         "action": "open_app",
+                        "args": {"app_name": "chrome", "app_id": "chrome", "target_app": "chrome"},
                         "app_id": "chrome",
                         "status": "success",
                         "voice_response": "Launching Google Chrome."
@@ -1629,7 +1816,7 @@ class LocalLLM:
                 ):
                     self.model_mgr.set_game_mode(True, dry_run=dry_run)
 
-                plan_res = {"action": "open_app", "args": {"app_id": app_id, "target_app": app_id}, "app_id": app_id, "target_app": app_id}
+                plan_res = {"action": "open_app", "args": {"app_name": app_id, "app_id": app_id, "target_app": app_id}, "app_id": app_id, "target_app": app_id}
                 if not dry_run:
                     success, msg = self.dispatcher.launch_app(app_id, dry_run=False)
                     if success:
@@ -1643,9 +1830,10 @@ class LocalLLM:
                     plan_res["voice_response"] = f"Allowlisted launch prepared for {app_id}."
                 return self._process_response(plan_res, prompt, dry_run=dry_run)
 
-        close_app_match = (
-            re.search(r"(?:(?:okay|alright|now|first|please|can\s+you(?:\s+please)?|i\s+want\s+you\s+to|i\s+want\s+to)\s+)*(?:close|shut\s+down|exit|kill|terminate)\s+(?:the\s+)?(.+?)(?:\s+for\s+me|\s+right\s+now|\s+now|\s+immediately|\s+asap|\s+thank\s+you)*[\.\?!]*$", cmd_query)
-            or re.search(r"(?:(?:okay|alright|now|first|please|can\s+you(?:\s+please)?|i\s+want\s+you\s+to|i\s+want\s+to)\s+)*(?:close|shut\s+down|exit|kill|terminate)\s+(?:the\s+)?(.+?)(?:\s+for\s+me|\s+right\s+now|\s+now|\s+immediately|\s+asap|\s+thank\s+you)*[\.\?!]*$", q_lower)
+        close_app_match = not any(w in q_lower for w in ["skill", "learn", "teach", "how to"]) and (
+            re.search(r"^(?:(?:okay|alright|now|first|please|can\s+you(?:\s+please)?|i\s+want\s+you\s+to|i\s+want\s+to)\s+)*\b(?:close|shut\s+down|exit|kill|terminate)\s+(?:the\s+)?(.+?)(?:\s+for\s+me|\s+right\s+now|\s+now|\s+immediately|\s+asap|\s+thank\s+you)*[\.\?!]*$", cmd_query)
+            or re.search(r"\b(?:close|shut\s+down|exit|kill|terminate)\s+(?:the\s+)?([a-zA-Z0-9_\-\s]+?)(?:\s+for\s+me|\s+right\s+now|\s+now|\s+immediately|\s+asap|\s+thank\s+you)*[\.\?!]*$", cmd_query)
+            or re.search(r"\b(?:close|shut\s+down|exit|kill|terminate)\s+(?:the\s+)?([a-zA-Z0-9_\-\s]+?)(?:\s+for\s+me|\s+right\s+now|\s+now|\s+immediately|\s+asap|\s+thank\s+you)*[\.\?!]*$", q_lower)
         )
         if close_app_match:
             target = close_app_match.group(1).strip()
@@ -1658,7 +1846,7 @@ class LocalLLM:
                 target = "discord"
             elif t_low in ["this", "this app", "this window", "active", "it", "current window", "active window", "process", "the process"]:
                 target = "active"
-            plan_res = {"action": "close_app", "args": {"target": target, "target_app": target}, "target": target, "target_app": target}
+            plan_res = {"action": "close_app", "args": {"app_name": target, "target": target, "target_app": target}, "target": target, "target_app": target}
             if not dry_run:
                 success = False
                 msg = ""
@@ -1759,12 +1947,26 @@ class LocalLLM:
         # -------------------------------------------------------------
         # 8.9 LOCAL SCREEN VISION INSPECTION
         # -------------------------------------------------------------
-        screen_match = re.search(r"\b(?:look\s+at\s+my\s+screen|what\s+is\s+on\s+my\s+screen|read\s+the\s+error\s+on\s+my\s+screen|analyze\s+my\s+screen|check\s+my\s+screen)\b", q_lower)
+        screen_match = (
+            re.search(
+                r"\b(?:look\s+at\s+my\s+screen|what\s+is\s+(?:on|showing\s+on|visible\s+on)\s+my\s+screen|what\s+is\s+my\s+screen\s+showing|what's\s+the\s+first\s+thing\s+that\s+you\s+see\s+on\s+my\s+screen|what\s+do\s+you\s+see\s+on\s+my\s+screen|see\s+on\s+my\s+screen|can\s+you\s+see\s+my\s+screen|can\s+you\s+see\s+(?:it|this)\s+properly|read\s+(?:the\s+error|the\s+text|what's)\s+on\s+my\s+screen|analyze\s+my\s+screen|check\s+my\s+screen)\b",
+                q_lower,
+            )
+            or re.search(
+                r"\b(?:can\s+you\s+see\s+my\s+(?:in-game\s+name|ign|name|username)|what\s+is\s+my\s+(?:in-game\s+name|ign)|what\s+is\s+my\s+name\s+in(?:\s+the)?\s+game|see\s+my\s+in-game\s+name|check\s+my\s+in-game\s+name)\b",
+                q_lower,
+            )
+            or (
+                self.session_state.get("last_action") == "analyze_screen"
+                and any(w in q_lower for w in ["see that", "see it", "see my", "showing", "in-game", "game name", "ign", "screen", "window", "league", "photo", "folder"])
+            )
+        )
         if screen_match:
-            res = self.model_mgr.analyze_screen(prompt, dry_run=dry_run)
+            w_info = self.window_engine.get_active_window_info(dry_run=dry_run)
+            res = self.model_mgr.analyze_screen(prompt, window_info=w_info, dry_run=dry_run)
             plan_res = {
                 "action": "analyze_screen",
-                "args": {"prompt": prompt},
+                "args": {"prompt": prompt, "active_window": w_info.get("app_label")},
                 "status": res.get("status"),
                 "voice_response": res.get("voice_response")
             }
@@ -1772,6 +1974,26 @@ class LocalLLM:
                 self.session_state["last_action"] = "analyze_screen"
                 self._record_turn(prompt, plan_res["voice_response"])
             return plan_res
+
+        # -------------------------------------------------------------
+        # 8.9.2 DIRECT GUI MOUSE & KEYBOARD CONTROL
+        # -------------------------------------------------------------
+        gui_click_match = re.search(r"\b(?:click|double\s+click|right\s+click)\s+(?:on\s+)?(?:the\s+)?(.+?)[\.\?!]*$", q_lower)
+        if gui_click_match and not any(w in q_lower for w in ["screen showing", "in-game name", "error"]):
+            target = gui_click_match.group(1).strip()
+            if any(w in target for w in ["first account", "second account", "first profile", "second profile"]):
+                idx = 0 if any(w in target for w in ["first", "1st", "1"]) else 1
+                gui_res = self.gui_control.select_chrome_profile_ui(idx, dry_run=dry_run)
+                plan_res = {
+                    "action": "gui_action",
+                    "args": {"sub_action": "select_profile", "index": idx},
+                    "status": gui_res.get("status"),
+                    "voice_response": gui_res.get("voice_response")
+                }
+                if not dry_run:
+                    self.session_state["last_action"] = "gui_action"
+                    self._record_turn(prompt, plan_res["voice_response"])
+                return plan_res
 
         # -------------------------------------------------------------
         # 8.9.5 ACTIVE-WINDOW CONTEXT AWARENESS (v10.0)
@@ -1833,6 +2055,20 @@ class LocalLLM:
         # -------------------------------------------------------------
         # 8.10 CLIPBOARD COPILOT & CODE DEBUGGER
         # -------------------------------------------------------------
+        clipboard_save_match = re.search(r"\bsave\s+(?:my\s+)?clipboard\s+(?:to\s+(?:a\s+)?note(?:\s+called)?|as\s+(?:a\s+)?note(?:\s+called)?|as|to\s+note)\s+['\"]?(.+?)['\"]?[\.\?!]*$", q_lower)
+        if clipboard_save_match:
+            note_title = clipboard_save_match.group(1).strip().strip("'\"").rstrip(".?!")
+            plan_res = {"action": "clipboard_save", "args": {"title": note_title}, "title": note_title}
+            if not dry_run:
+                save_res = self.clipboard_agent.save_clipboard_note(title=note_title, memory=self.memory, dry_run=False)
+                plan_res["voice_response"] = normalize_for_tts(save_res.get("voice_response", f"Saved note {note_title}."))
+                self.session_state["last_action"] = "clipboard_save"
+                self._record_turn(prompt, plan_res["voice_response"])
+            else:
+                save_res = self.clipboard_agent.save_clipboard_note(title=note_title, dry_run=True)
+                plan_res["voice_response"] = save_res.get("voice_response", f"Prepared note {note_title}.")
+            return plan_res
+
         clipboard_assist_match = (
             "clipboard" in q_lower
             or re.search(r"\b(?:copy|copied)\s+(?:this|that|it|everything)?\s*(?:to|into)\s+(?:the\s+|my\s+)?clipboard\b", q_lower)
@@ -1881,20 +2117,6 @@ class LocalLLM:
                 plan_res["voice_response"] = res.get("voice_response", "Clipboard assistant prepared.")
             return plan_res
 
-        clipboard_save_match = re.search(r"\bsave\s+(?:my\s+)?clipboard\s+(?:to\s+(?:a\s+)?note(?:\s+called)?|as\s+(?:a\s+)?note(?:\s+called)?|as|to\s+note)\s+['\"]?(.+?)['\"]?[\.\?!]*$", q_lower)
-        if clipboard_save_match:
-            note_title = clipboard_save_match.group(1).strip().strip("'\"").rstrip(".?!")
-            plan_res = {"action": "clipboard_save", "args": {"title": note_title}, "title": note_title}
-            if not dry_run:
-                save_res = self.clipboard_agent.save_clipboard_note(title=note_title, memory=self.memory, dry_run=False)
-                plan_res["voice_response"] = normalize_for_tts(save_res.get("voice_response", f"Saved note {note_title}."))
-                self.session_state["last_action"] = "clipboard_save"
-                self._record_turn(prompt, plan_res["voice_response"])
-            else:
-                save_res = self.clipboard_agent.save_clipboard_note(title=note_title, dry_run=True)
-                plan_res["voice_response"] = save_res.get("voice_response", f"Prepared note {note_title}.")
-            return plan_res
-
         # -------------------------------------------------------------
         # 8.10 MULTI-LAYER VIRUS & SECURITY SCANNER
         # -------------------------------------------------------------
@@ -1913,8 +2135,8 @@ class LocalLLM:
                 raw_target = virus_scan_match.group(1).strip()
             if not raw_target or "download" in q_lower:
                 raw_target = "Downloads"
-            # Strip redundant repeated scan prefixes like "the security scan for"
-            raw_target = re.sub(r"^(?:the\s+)?(?:security|virus|malware)\s+(?:scan|test)\s+(?:on|for)\s+", "", raw_target, flags=re.IGNORECASE).strip()
+            # Strip redundant repeated scan prefixes like "the security scan for" or "the security virus scan for"
+            raw_target = re.sub(r"^(?:the\s+)?(?:(?:security|virus|malware)\s*)+\s*(?:scan|test)\s+(?:on|for)\s+", "", raw_target, flags=re.IGNORECASE).strip()
             clean_scan_target = re.sub(r"^(?:on\s+|for\s+|in\s+)?", "", raw_target).strip()
             clean_scan_target = re.sub(r"^(?:my\s+)?(?:folder\s+called\s+|folder\s+named\s+|folder\s+|file\s+called\s+|file\s+named\s+|file\s+)?", "", clean_scan_target).strip().rstrip(".?!")
 
@@ -2166,8 +2388,9 @@ class LocalLLM:
             re.search(r"\b(?:can\s+you\s+predict|predict\s+the\s+weather|next\s+month|next\s+year)\b", q_lower)
         )
         weather_match = not is_capability_weather and (
-            re.search(r"\b(?:what(?:'s|\s+is)\s+the\s+weather|how(?:'s|\s+is)\s+the\s+weather|weather\s+(?:in|for|at|like\s+in)|forecast\s+(?:in|for|at)|temperature\s+(?:in|for|at)|is\s+it\s+(?:going\s+to\s+rain|raining|hot|cold)|how\s+(?:hot|cold|warm)\s+(?:is\s+it|it\s+is))\b", q_lower)
+            re.search(r"\b(?:what(?:'s|\s+is|\s+the)?\s+(?:the\s+)?weather|how(?:'s|\s+is|\s+the)?\s+(?:the\s+)?weather|weather\s+(?:in|for|at|like\s+in)|forecast\s+(?:in|for|at)|temperature\s+(?:in|for|at)|is\s+it\s+(?:going\s+to\s+rain|raining|hot|cold)|how\s+(?:hot|cold|warm)\s+(?:is\s+it|it\s+is))\b", q_lower)
             or re.search(r"^(?:weather|forecast)(?:\s+(?:in|for|at))?\s*([a-zA-Z\s,]+)?[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:what\s+about\s+(?:the\s+)?weather|check\s+(?:the\s+)?weather)\b", q_lower)
         )
         if weather_match:
             loc_extracted = None
@@ -2186,10 +2409,14 @@ class LocalLLM:
                     flags=re.IGNORECASE,
                 ).strip(" ,.?!'")
                 if raw_loc and raw_loc not in ["me", "here", "my area", "outside"]:
-                    if raw_loc in ["there", "that city", "it"] and self.last_context.get("city"):
+                    if raw_loc in ["there", "that city", "that place", "it"] and self.last_context.get("city"):
                         loc_extracted = self.last_context["city"]
                     else:
                         loc_extracted = raw_loc
+
+            if not loc_extracted:
+                if re.search(r"\b(?:there|that\s+place|that\s+city)\b", q_lower) and self.last_context.get("city"):
+                    loc_extracted = self.last_context["city"]
 
             date_label = "today"
             if "tomorrow" in q_lower:
@@ -2237,7 +2464,7 @@ class LocalLLM:
         # 8.15 HERMES SKILL FORGE: AUTONOMOUS SKILL CREATION
         # -------------------------------------------------------------
         skill_create_match = (
-            re.search(r"^(?:please\s+)?(?:create|learn|build|teach\s+yourself)\s+(?:a\s+)?(?:new\s+)?skill\s*(?:called|named)?\s*(.+)$", q_lower)
+            re.search(r"^(?:please\s+|can\s+you\s+)?(?:create|learn|build|teach\s+yourself)\s+(?:a\s+)?(?:new\s+)?(?:skill\s*(?:called|named)?|how\s+to|to)\s*(.+)$", q_lower)
             or re.search(r"\bsave\s+(?:that\s+|this\s+)?workflow\s+as\s+(?:a\s+)?skill\s*(?:called|named)?\s*(.+)$", q_lower)
         )
         if skill_create_match:
@@ -2472,6 +2699,10 @@ class LocalLLM:
                     f"<user_context>\n{mem_ctx}\n</user_context>\n"
                     f"{self.persona.get_system_prompt_addon()}\n"
                     "Respond conversationally in 1-2 spoken sentences.\n"
+                    "CRITICAL MEMORY & CONTEXT RULES:\n"
+                    "- NEVER quote, parrot, or copy past assistant answers from <user_context>.\n"
+                    "- DO NOT mention past locations, weather, UV index, or past topics unless the user is explicitly asking about them.\n"
+                    "- If the user makes casual remarks, gaming chatter, or speaks in another language, respond directly, politely, and briefly in 1 sentence. Do NOT hallucinate past conversations.\n"
                     "ABSOLUTE RULE: NEVER tell the user to 'search online yourself', 'check a weather website', or 'I don't have real-time access'. You are equipped with live weather, web search, and desktop tools.\n"
                     "CRITICAL: NEVER claim you have created a folder, opened a folder, or launched an application if you are in 'chat' mode. Only report actions when a tool actually executed them."
                 )
@@ -2487,7 +2718,23 @@ class LocalLLM:
                 if intercepted is not None:
                     self._record_turn(prompt, intercepted.get("voice_response", ""))
                     return self._process_response(intercepted, prompt, dry_run=False)
+
+                # Anti-hallucination & anti-echo deduplication guard
+                last_asst_voice = self.session_state.get("last_voice_response", "")
+                lower_reply = clean_reply.lower()
+                prompt_lower = prompt.lower()
+                if (
+                    (last_asst_voice and clean_reply.strip().lower() == last_asst_voice.strip().lower())
+                    or ("kuantan" in lower_reply and "kuantan" not in prompt_lower)
+                    or ("paku teh" in lower_reply and "paku teh" not in prompt_lower)
+                    or ("uv" in lower_reply and "uv" not in prompt_lower)
+                    or ("no need to pretend" in lower_reply)
+                ):
+                    clean_reply = "Understood. Let me know if you need any assistance, or enjoy your game!"
+
                 plan_res["voice_response"] = clean_reply or "Understood. How can I assist you?"
+                self.session_state["last_voice_response"] = plan_res["voice_response"]
+                self._record_turn(prompt, plan_res["voice_response"])
             else:
                 plan_res["voice_response"] = "Dry-run response."
             return self._process_response(plan_res, prompt, dry_run=dry_run)
