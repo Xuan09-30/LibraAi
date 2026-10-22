@@ -15,7 +15,7 @@ import scipy.signal
 
 from fastapi import (
     FastAPI, Request, Response, HTTPException, Depends,
-    File, UploadFile, Query, Path, Body, WebSocket, WebSocketDisconnect
+    File, UploadFile, Query, Path, Body, WebSocket, WebSocketDisconnect, Form
 )
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -79,12 +79,27 @@ def load_web_config(config_path: str = "config.json") -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 def convert_to_16k_mono_pcm(audio_bytes: bytes) -> np.ndarray:
     """
-    Converts arbitrary incoming audio bytes (WAV, WebM, OGG, FLAC) to
+    Converts arbitrary incoming audio bytes (WebM Opus, OGG, WAV, MP3, FLAC) to
     a 16kHz mono float32 numpy array normalized to [-1.0, 1.0] for faster-whisper.
     """
     if not audio_bytes:
         return np.zeros(0, dtype=np.float32)
 
+    # 1. Primary decoder: PyAV (FFmpeg) handles WebM/Opus recorded by mobile Chrome seamlessly
+    try:
+        import av
+        with av.open(io.BytesIO(audio_bytes)) as container:
+            resampler = av.AudioResampler(format="fltp", layout="mono", rate=16000)
+            frames = []
+            for frame in container.decode(audio=0):
+                for rf in resampler.resample(frame):
+                    frames.append(rf.to_ndarray()[0])
+            if frames:
+                return np.clip(np.concatenate(frames), -1.0, 1.0)
+    except Exception as e:
+        logger.debug(f"PyAV audio decoding fallback: {e}")
+
+    # 2. Secondary decoder: soundfile (for standard WAV/FLAC)
     try:
         data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
         if data.ndim > 1:
@@ -96,7 +111,7 @@ def convert_to_16k_mono_pcm(audio_bytes: bytes) -> np.ndarray:
     except Exception:
         pass
 
-    # Fallback: treat as raw 16-bit PCM (16000 Hz)
+    # 3. Fallback: treat as raw 16-bit PCM (16000 Hz)
     try:
         pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         return np.clip(pcm, -1.0, 1.0)
@@ -123,6 +138,9 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="Active chat thread session ID")
     client_scope: str = Field("remote_web", description="Client execution scope")
     synthesize_audio: bool = Field(False, description="Whether to synthesize Kokoro TTS audio")
+    attached_file_path: Optional[str] = Field(None, description="Server path to uploaded image/document")
+    attached_file_name: Optional[str] = Field(None, description="Original filename of attachment")
+    attached_file_type: Optional[str] = Field(None, description="Attachment type: image or document")
 
 
 class NewSessionRequest(BaseModel):
@@ -188,12 +206,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                     detail=f"Forbidden: Identity '{clean_email}' is not authorized to access Project Libra."
                 )
 
-        # 2. Tailscale WireGuard Mesh Network IP (100.64.0.0/10) or Tailscale Serve loopback proxy
-        client_host = request.client.host if request.client else ""
-        if client_host.startswith("100.") or client_host in ("127.0.0.1", "::1", "localhost"):
-            return {"authenticated": True, "method": "tailscale_network", "client_ip": client_host}
-
-        # 3. Token-based authentication
+        # 2. Token-based authentication
         auth_header = request.headers.get("authorization", "")
         token = ""
         if auth_header.startswith("Bearer "):
@@ -239,6 +252,67 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         if os.path.exists(sw):
             return FileResponse(sw, media_type="application/javascript")
         raise HTTPException(status_code=404, detail="Service worker not found")
+
+    # -----------------------------------------------------------------------
+    # MULTIMODAL FILE UPLOADS & ASSETS API (Images, PDFs, Documents)
+    # -----------------------------------------------------------------------
+    upload_dir = os.path.join(PROJECT_ROOT, "assets", "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+
+    @app.post("/api/upload")
+    async def upload_file(
+        file: UploadFile = File(...),
+        session_id: Optional[str] = Form(None),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        """Accepts image, PDF, or document uploads from web & mobile clients."""
+        import uuid
+        os.makedirs(upload_dir, exist_ok=True)
+        raw_name = file.filename or "uploaded_file"
+        clean_filename = os.path.basename(raw_name)
+        file_ext = os.path.splitext(clean_filename)[1].lower()
+        file_id = uuid.uuid4().hex[:10]
+        saved_name = f"{file_id}_{clean_filename}"
+        saved_path = os.path.join(upload_dir, saved_name)
+
+        content = await file.read()
+        with open(saved_path, "wb") as f:
+            f.write(content)
+
+        image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".svg"}
+        file_type = "image" if file_ext in image_exts else "document"
+
+        return {
+            "status": "success",
+            "file_id": file_id,
+            "filename": clean_filename,
+            "file_path": saved_path,
+            "file_type": file_type,
+            "file_size": len(content),
+            "preview_url": f"/api/files/{saved_name}"
+        }
+
+    @app.get("/api/files/{filename}")
+    async def get_uploaded_file(filename: str):
+        safe_name = os.path.basename(filename)
+        target_path = os.path.join(upload_dir, safe_name)
+        if not os.path.isfile(target_path):
+            raise HTTPException(status_code=404, detail="File not found")
+        # Infer MIME
+        import mimetypes
+        mime_type, _ = mimetypes.guess_type(target_path)
+        return FileResponse(target_path, media_type=mime_type or "application/octet-stream")
+
+    @app.get("/api/assets/{category}/{filename}")
+    async def get_asset_file(category: str, filename: str):
+        safe_cat = os.path.basename(category)
+        safe_file = os.path.basename(filename)
+        target = os.path.join(PROJECT_ROOT, "assets", safe_cat, safe_file)
+        if not os.path.isfile(target):
+            raise HTTPException(status_code=404, detail="Asset not found")
+        import mimetypes
+        mime_type, _ = mimetypes.guess_type(target)
+        return FileResponse(target, media_type=mime_type or "application/octet-stream")
 
     # -----------------------------------------------------------------------
     # MULTI-CHAT SESSIONS API (Phase 10 Gemini-Style Threads)
@@ -376,13 +450,132 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             else:
                 sid = "default"
 
-        # 2. Execute with sandboxing
-        result = supervisor.process_command(req.prompt, client_scope=scope, dry_run=False, session_id=sid)
+        # 2. Check for multimodal attachment (Image or Document)
+        attached_file_info = None
+        gen_image_url = None
+
+        if req.attached_file_path and os.path.isfile(req.attached_file_path):
+            file_ext = os.path.splitext(req.attached_file_path)[1].lower()
+            image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".svg"}
+            is_image = (req.attached_file_type == "image") or (file_ext in image_exts)
+
+            attached_file_info = {
+                "filename": req.attached_file_name or os.path.basename(req.attached_file_path),
+                "file_type": "image" if is_image else "document",
+                "preview_url": f"/api/files/{os.path.basename(req.attached_file_path)}"
+            }
+
+            if is_image:
+                # Multimodal Vision Analysis via qwen2.5vl:7b
+                try:
+                    with open(req.attached_file_path, "rb") as img_f:
+                        b64_img = base64.b64encode(img_f.read()).decode("utf-8")
+
+                    vision_prompt = req.prompt.strip() if req.prompt.strip() else "Analyze this image in detail. Describe what you see, highlight any key visual details, diagrams, or text, and answer how you can assist the user with it."
+                    ollama_base = cfg.get("ollama_base_url", "http://localhost:11434")
+                    v_payload = {
+                        "model": "qwen2.5vl:7b",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": vision_prompt,
+                                "images": [b64_img]
+                            }
+                        ],
+                        "stream": False,
+                        "options": {"temperature": 0.4}
+                    }
+                    import urllib.request
+                    req_v = urllib.request.Request(
+                        f"{ollama_base}/api/chat",
+                        data=json.dumps(v_payload).encode("utf-8"),
+                        headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(req_v, timeout=60) as resp:
+                        v_data = json.loads(resp.read().decode("utf-8"))
+
+                    v_reply = v_data.get("message", {}).get("content", "").strip() or "I examined the image."
+                    in_tok = int(v_data.get("prompt_eval_count", 0))
+                    out_tok = int(v_data.get("eval_count", 0))
+                    eval_dur = float(v_data.get("eval_duration", 1) / 1e9)
+                    tok_sec = round(out_tok / max(eval_dur, 0.001), 2)
+
+                    result = {
+                        "status": "success",
+                        "voice_response": v_reply,
+                        "action": "vision_analysis",
+                        "token_metrics": {
+                            "input_tokens": in_tok,
+                            "output_tokens": out_tok,
+                            "total_tokens": in_tok + out_tok,
+                            "tokens_per_sec": tok_sec,
+                            "model": "qwen2.5vl:7b",
+                            "saved_tokens": 0
+                        }
+                    }
+                    if memory and hasattr(memory, "add_message"):
+                        memory.add_message(
+                            session_id=sid,
+                            role="user",
+                            content=f"[Attached Image: {attached_file_info['filename']}] {req.prompt.strip()}",
+                            model_used="qwen2.5vl:7b"
+                        )
+                        memory.add_message(
+                            session_id=sid,
+                            role="assistant",
+                            content=v_reply,
+                            output_tokens=out_tok,
+                            model_used="qwen2.5vl:7b"
+                        )
+                except Exception as img_err:
+                    logger.error(f"Image vision analysis error: {img_err}")
+                    result = supervisor.process_command(f"[Attached Image: {attached_file_info['filename']}] {req.prompt}", client_scope=scope, dry_run=False, session_id=sid)
+            else:
+                # Document Extraction & Analysis (PDF, Word, Code, Text, CSV)
+                extracted_text = ""
+                try:
+                    if file_ext == ".pdf":
+                        try:
+                            import fitz
+                            doc = fitz.open(req.attached_file_path)
+                            extracted_text = "\n".join([page.get_text() for page in doc])
+                        except Exception:
+                            from pypdf import PdfReader
+                            reader = PdfReader(req.attached_file_path)
+                            extracted_text = "\n".join([p.extract_text() or "" for p in reader.pages])
+                    elif file_ext in [".docx", ".doc"]:
+                        import docx
+                        doc = docx.Document(req.attached_file_path)
+                        extracted_text = "\n".join([p.text for p in doc.paragraphs])
+                    else:
+                        with open(req.attached_file_path, "r", encoding="utf-8", errors="ignore") as f:
+                            extracted_text = f.read()
+                except Exception as doc_err:
+                    logger.error(f"Document extraction error: {doc_err}")
+
+                if len(extracted_text) > 12000:
+                    extracted_text = extracted_text[:12000] + f"\n\n[... Truncated for token safety. Document has {len(extracted_text)} total characters ...]"
+
+                doc_prompt = (
+                    f"The user has uploaded the document '{attached_file_info['filename']}'.\n"
+                    f"=== DOCUMENT CONTENT ===\n{extracted_text}\n=== END DOCUMENT ===\n\n"
+                    f"User instruction: {req.prompt.strip() or 'Please analyze this document, summarize the key findings, and explain how it helps me.'}"
+                )
+                result = supervisor.process_command(doc_prompt, client_scope=scope, dry_run=False, session_id=sid)
+        else:
+            # Standard Text Execution
+            result = supervisor.process_command(req.prompt, client_scope=scope, dry_run=False, session_id=sid)
+
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
         reply_text = result.get("voice_response") or "Command processed."
         action = result.get("action")
         raw_tm = result.get("token_metrics") or getattr(supervisor.llm, "last_token_metrics", {}) or {}
+
+        if result.get("plot_path") and os.path.isfile(result["plot_path"]):
+            gen_image_url = f"/api/assets/plots/{os.path.basename(result['plot_path'])}"
+        elif result.get("image_path") and os.path.isfile(result["image_path"]):
+            gen_image_url = f"/api/assets/plots/{os.path.basename(result['image_path'])}"
 
         turn_in = int(raw_tm.get("input_tokens", 0) or 0)
         turn_out = int(raw_tm.get("output_tokens", 0) or 0)
@@ -436,14 +629,17 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             },
             "audio_base64": audio_b64,
             "hud_card": result.get("hud_card"),
-            "scratchpad": result.get("scratchpad")
+            "scratchpad": result.get("scratchpad"),
+            "attached_file": attached_file_info,
+            "generated_image_url": gen_image_url
         }
 
     @app.post("/api/voice")
     async def post_voice(
+        request: Request,
         audio: UploadFile = File(...),
-        session_id: Optional[str] = Query(None),
-        client_scope: str = Query("remote_web"),
+        session_id: Optional[str] = Form(None),
+        client_scope: str = Form("remote_web"),
         auth: Dict[str, Any] = Depends(authenticate_request)
     ):
         """
@@ -467,6 +663,14 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             })
 
         stt = getattr(supervisor.llm, "stt", None)
+        if not stt:
+            try:
+                from core.stt import SpeechToText
+                stt = SpeechToText()
+                supervisor.llm.stt = stt
+            except Exception as e:
+                logger.warning(f"Could not lazy-load SpeechToText: {e}")
+
         transcribed_text = ""
         if stt and hasattr(stt, "transcribe"):
             try:
@@ -484,22 +688,47 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             })
 
         memory = getattr(supervisor.llm, "memory", None)
-        sid = session_id
+        sid = session_id or request.query_params.get("session_id")
+        scope = client_scope or request.query_params.get("client_scope", "remote_web")
         if not sid:
             if memory and hasattr(memory, "create_session"):
-                sid = memory.create_session(title="New Chat", client_scope=client_scope)
+                sid = memory.create_session(title="New Chat", client_scope=scope)
             else:
                 sid = "default"
 
-        res = supervisor.process_command(transcribed_text, client_scope=client_scope, dry_run=False, session_id=sid)
+        res = supervisor.process_command(transcribed_text, client_scope=scope, dry_run=False, session_id=sid)
         reply_text = res.get("voice_response") or "Understood."
         action = res.get("action")
         raw_tm = res.get("token_metrics") or getattr(supervisor.llm, "last_token_metrics", {}) or {}
 
+        turn_in = int(raw_tm.get("input_tokens", 0) or 0)
+        turn_out = int(raw_tm.get("output_tokens", 0) or 0)
+        tok_speed = float(raw_tm.get("tokens_per_sec", 0.0) or 0.0)
+        saved_tok = int(raw_tm.get("saved_tokens", 0) or 0)
+
+        sess_title = "New Chat"
+        sess_total = turn_in + turn_out
+        life_total = sess_total
+        if memory and hasattr(memory, "get_session"):
+            sm = memory.get_session(sid)
+            if sm:
+                sess_title = sm.get("title", "New Chat")
+                sess_total = sm.get("total_tokens", sess_total)
+            ts = memory.get_token_summary(session_id=sid)
+            life_total = ts.get("lifetime", {}).get("total_tokens", sess_total)
+
         audio_b64 = None
         try:
             tts = getattr(supervisor.llm, "tts", None)
-            if tts and hasattr(tts, "synthesize_stream"):
+            if not tts:
+                try:
+                    from core.kokoro_tts import KokoroTTS
+                    tts = KokoroTTS(voice="af_heart", device="cuda")
+                    supervisor.llm.tts = tts
+                except Exception as e:
+                    logger.warning(f"Could not lazy-load KokoroTTS: {e}")
+
+            if tts and hasattr(tts, "synthesize_stream") and reply_text:
                 pcm_chunks = list(tts.synthesize_stream(reply_text))
                 if pcm_chunks:
                     wav_bytes = pcm_to_wav_bytes(b"".join(pcm_chunks), sample_rate=24000)
@@ -509,12 +738,6 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
-        sess_title = "New Chat"
-        if memory and hasattr(memory, "get_session"):
-            sm = memory.get_session(sid)
-            if sm:
-                sess_title = sm.get("title", "New Chat")
-
         return JSONResponse({
             "status": "success",
             "transcribed_text": transcribed_text,
@@ -523,14 +746,17 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             "session_id": sid,
             "session_title": sess_title,
             "latency_ms": elapsed_ms,
-            "client_scope": client_scope,
+            "client_scope": scope,
             "token_metrics": {
-                "turn_in": int(raw_tm.get("input_tokens", 0) or 0),
-                "turn_out": int(raw_tm.get("output_tokens", 0) or 0),
-                "turn_total": int(raw_tm.get("total_tokens", 0) or 0),
-                "tok_per_sec": float(raw_tm.get("tokens_per_sec", 0.0) or 0.0),
-                "saved_tokens": int(raw_tm.get("saved_tokens", 0) or 0),
-                "model": raw_tm.get("model", "qwen3:8b")
+                "turn_in": turn_in,
+                "turn_out": turn_out,
+                "turn_total": turn_in + turn_out,
+                "tok_per_sec": tok_speed,
+                "session_total": sess_total,
+                "lifetime_total": life_total,
+                "saved_tokens": saved_tok,
+                "model": raw_tm.get("model", "qwen3:8b"),
+                "fast_path": raw_tm.get("fast_path", False)
             },
             "audio_base64": audio_b64
         })
@@ -640,13 +866,15 @@ def ensure_tailscale_serve(port: int = 8765) -> Dict[str, str]:
         "status": "offline"
     }
     try:
+        flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+
         # 1. Query Tailscale IPv4
-        res_ip = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3)
+        res_ip = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3, **flags)
         if res_ip.returncode == 0 and res_ip.stdout.strip():
             info["tailscale_ip"] = res_ip.stdout.strip().split("\n")[0].strip()
 
         # 2. Query Tailscale JSON status for MagicDNS domain
-        res_status = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=3)
+        res_status = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=3, **flags)
         if res_status.returncode == 0 and res_status.stdout.strip():
             ts_data = json.loads(res_status.stdout)
             cert_domains = ts_data.get("CertDomains") or []
@@ -656,11 +884,18 @@ def ensure_tailscale_serve(port: int = 8765) -> Dict[str, str]:
                 info["magicdns_domain"] = ts_data["Self"]["DNSName"].rstrip(".")
 
         # 3. Check or configure Tailscale Serve proxy
-        res_serve = subprocess.run(["tailscale", "serve", "status"], capture_output=True, text=True, timeout=3)
+        res_serve = subprocess.run(["tailscale", "serve", "status"], capture_output=True, text=True, timeout=3, **flags)
         if str(port) not in res_serve.stdout:
-            subprocess.run(["tailscale", "serve", "--bg", str(port)], capture_output=True, text=True, timeout=5)
+            subprocess.run(["tailscale", "serve", "--bg", str(port)], capture_output=True, text=True, timeout=5, **flags)
+            res_serve = subprocess.run(["tailscale", "serve", "status"], capture_output=True, text=True, timeout=3, **flags)
 
-        if info["magicdns_domain"]:
+        import re
+        match_domain = re.search(r"https://([a-zA-Z0-9.-]+)", res_serve.stdout)
+        if match_domain:
+            info["magicdns_domain"] = match_domain.group(1)
+            info["serve_url"] = f"https://{info['magicdns_domain']}/"
+            info["status"] = "online"
+        elif info["magicdns_domain"]:
             info["serve_url"] = f"https://{info['magicdns_domain']}/"
             info["status"] = "online"
         elif info["tailscale_ip"]:

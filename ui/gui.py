@@ -1649,11 +1649,8 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         except Exception:
             pass
 
-        self.show_notification(
-            "Reloading Libra...",
-            f"Source change detected in {filename}. Refreshing to new version."
-        )
-        self.append_log("SYSTEM", f"Auto-refreshing Libra — Updated code detected in {filename}.")
+        # Silent background reload: no disruptive popup notifications or balloon toasts
+        self.append_log("SYSTEM", f"Auto-refreshing Libra in background - Updated code detected in {filename}.")
 
         was_visible = self.isVisible()
 
@@ -1713,6 +1710,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
                 cmd.append(arg)
 
         cmd.extend([
+            "--hidden",
             f"--reload-count={new_count}",
             f"--reloaded-from={filename}",
             f"--reloaded-at={t_str}"
@@ -1789,7 +1787,10 @@ if __name__ == "__main__":
 
     ipc_server.newConnection.connect(handle_incoming_ipc)
 
-    if "--hidden" not in sys.argv:
+    is_reload_restart = any(arg.startswith("--reload-count") for arg in sys.argv)
+    is_hidden_requested = "--hidden" in sys.argv or is_reload_restart
+
+    if not is_hidden_requested:
         window.center_on_screen()
         window.show_interface()
         # Guarantee window visibility front & center even if Windows 11 desktop is still loading

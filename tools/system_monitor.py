@@ -58,14 +58,18 @@ class SystemMonitor:
             except Exception as e:
                 print(f"[SystemMonitor psutil Warning]: {e}")
 
-        # 2. GPU metrics via nvidia-smi with 2.0s timeout
+        # 2. GPU metrics via nvidia-smi with 2.0s timeout (CREATE_NO_WINDOW prevents flashing CMD popup)
         try:
+            extra_flags = {}
+            if sys.platform == "win32":
+                extra_flags["creationflags"] = subprocess.CREATE_NO_WINDOW
             res = subprocess.run(
                 ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu", "--format=csv,noheader,nounits"],
                 capture_output=True,
                 text=True,
                 timeout=2.0,
-                shell=False
+                shell=False,
+                **extra_flags
             )
             if res.returncode == 0 and res.stdout.strip():
                 parts = [p.strip() for p in res.stdout.strip().split(",")]
@@ -136,12 +140,16 @@ class SystemMonitor:
 
         cmd = ALLOWLISTED_DIAGNOSTICS[command_key]
         try:
+            extra_flags = {}
+            if sys.platform == "win32":
+                extra_flags["creationflags"] = subprocess.CREATE_NO_WINDOW
             res = subprocess.run(
                 cmd,
                 shell=False,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout
+                timeout=self.timeout,
+                **extra_flags
             )
             output = (res.stdout or res.stderr or "").strip()
             return output[:1000]
