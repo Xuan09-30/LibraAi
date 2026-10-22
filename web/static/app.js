@@ -42,8 +42,24 @@
   const drawerToggleBtn = document.getElementById('drawer-toggle-btn');
   const closeDrawerBtn = document.getElementById('close-drawer-btn');
   const newChatBtn = document.getElementById('new-chat-btn');
+  const headerNewChatBtn = document.getElementById('header-new-chat-btn');
   const sessionListContainer = document.getElementById('session-list');
   const activeThreadTitleEl = document.getElementById('active-thread-title');
+
+  const deleteModal = document.getElementById('delete-modal');
+  const closeDeleteModalBtn = document.getElementById('close-delete-modal');
+  const cancelDeleteBtn = document.getElementById('cancel-delete-btn');
+  const confirmDeleteBtn = document.getElementById('confirm-delete-btn');
+  const deleteModalPrompt = document.getElementById('delete-modal-prompt');
+
+  const renameModal = document.getElementById('rename-modal');
+  const closeRenameModalBtn = document.getElementById('close-rename-modal');
+  const cancelRenameBtn = document.getElementById('cancel-rename-btn');
+  const confirmRenameBtn = document.getElementById('confirm-rename-btn');
+  const renameInput = document.getElementById('rename-input');
+
+  let pendingDeleteSessionId = null;
+  let pendingRenameSessionId = null;
 
   const tokenHudBtn = document.getElementById('token-hud-btn');
   const tokenHudText = document.getElementById('token-hud-text');
@@ -59,7 +75,20 @@
   const promptInput = document.getElementById('prompt-input');
   const sendBtn = document.getElementById('send-btn');
   const micBtn = document.getElementById('mic-btn');
+  const attachBtn = document.getElementById('attach-btn');
+  const fileInput = document.getElementById('file-input');
+  const attachmentTray = document.getElementById('attachment-tray');
+  const attachmentThumb = document.getElementById('attachment-thumb');
+  const attachmentName = document.getElementById('attachment-name');
+  const attachmentStatus = document.getElementById('attachment-status');
+  const removeAttachmentBtn = document.getElementById('remove-attachment-btn');
+
+  const imageLightbox = document.getElementById('image-lightbox');
+  const lightboxImg = document.getElementById('lightbox-img');
+  const closeLightboxBtn = document.getElementById('close-lightbox-btn');
   const remoteAudio = document.getElementById('remote-audio');
+
+  let pendingAttachment = null;
 
   const authModal = document.getElementById('auth-modal');
   const tokenInput = document.getElementById('token-input');
@@ -318,19 +347,86 @@
   });
 
   // --------------------------------------------------------------------------
-  // 6. CHAT RENDERING
+  // 6. CHAT RENDERING & LIGHTBOX
   // --------------------------------------------------------------------------
+  function openLightbox(src) {
+    if (imageLightbox && lightboxImg && src) {
+      lightboxImg.src = src;
+      imageLightbox.style.display = 'flex';
+    }
+  }
+
+  function closeLightbox() {
+    if (imageLightbox) {
+      imageLightbox.style.display = 'none';
+      if (lightboxImg) lightboxImg.src = '';
+    }
+  }
+
+  if (closeLightboxBtn) closeLightboxBtn.addEventListener('click', closeLightbox);
+  if (imageLightbox) {
+    imageLightbox.addEventListener('click', (e) => {
+      if (e.target === imageLightbox) closeLightbox();
+    });
+  }
+
   function appendMessage(text, isUser, meta = {}) {
     const msgDiv = document.createElement('div');
     msgDiv.className = 'msg ' + (isUser ? 'msg-user' : 'msg-libra');
 
     const contentDiv = document.createElement('div');
     contentDiv.className = 'msg-content';
-    if (isUser) {
-      contentDiv.textContent = text;
-    } else {
-      contentDiv.innerHTML = formatMarkdown(text);
+
+    // 1. Render attached file (Image or Document)
+    if (meta.attached_file) {
+      const attachDiv = document.createElement('div');
+      attachDiv.className = 'msg-attachment-wrap';
+      if (meta.attached_file.file_type === 'image') {
+        const imgEl = document.createElement('img');
+        imgEl.className = 'msg-img-preview';
+        imgEl.src = meta.attached_file.preview_url || meta.attached_file.dataUrl;
+        imgEl.alt = meta.attached_file.filename || 'Uploaded image';
+        imgEl.title = 'Click to enlarge';
+        imgEl.addEventListener('click', () => openLightbox(imgEl.src));
+        attachDiv.appendChild(imgEl);
+      } else {
+        const docChip = document.createElement('div');
+        docChip.className = 'msg-doc-chip';
+        docChip.innerHTML = `
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="16" y1="13" x2="8" y2="13"/>
+            <line x1="16" y1="17" x2="8" y2="17"/>
+            <polyline points="10 9 9 9 8 9"/>
+          </svg>
+          <span>${escapeHtml(meta.attached_file.filename || 'Document')}</span>
+        `;
+        attachDiv.appendChild(docChip);
+      }
+      contentDiv.appendChild(attachDiv);
     }
+
+    // 2. Render text / markdown content
+    const textNode = document.createElement('div');
+    if (isUser) {
+      textNode.textContent = text;
+    } else {
+      textNode.innerHTML = formatMarkdown(text);
+    }
+    contentDiv.appendChild(textNode);
+
+    // 3. Render generated visual plot (e.g. from DataScienceAgent or Image generation)
+    if (meta.generated_image_url) {
+      const genImg = document.createElement('img');
+      genImg.className = 'msg-generated-plot';
+      genImg.src = meta.generated_image_url;
+      genImg.alt = 'Visual output';
+      genImg.title = 'Click to enlarge';
+      genImg.addEventListener('click', () => openLightbox(genImg.src));
+      contentDiv.appendChild(genImg);
+    }
+
     msgDiv.appendChild(contentDiv);
 
     if (!isUser) {
@@ -363,6 +459,27 @@
         tok.className = 'token-badge';
         tok.textContent = '⚡ FAST-PATH (0 TOK)';
         metaDiv.appendChild(tok);
+      }
+
+      if (meta.audio_base64 && remoteAudio) {
+        const playBtn = document.createElement('button');
+        playBtn.className = 'replay-audio-btn';
+        playBtn.title = 'Replay Kokoro TTS Voice';
+        playBtn.innerHTML = `
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+            <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
+          </svg>
+          <span>Listen</span>
+        `;
+        playBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          setOrbState('speaking', 'SPEAKING // KOKORO-82M');
+          remoteAudio.src = 'data:audio/wav;base64,' + meta.audio_base64;
+          remoteAudio.play().catch(err => console.warn('Audio play error:', err));
+          remoteAudio.onended = () => setOrbState('idle', 'STANDBY // READY');
+        });
+        metaDiv.appendChild(playBtn);
       }
 
       msgDiv.appendChild(metaDiv);
@@ -460,8 +577,9 @@
         </svg>
       `;
       renameBtn.addEventListener('click', (e) => {
+        e.preventDefault();
         e.stopPropagation();
-        renameSession(sess.session_id, sess.title);
+        openRenameModal(sess.session_id, sess.title);
       });
       actionsDiv.appendChild(renameBtn);
 
@@ -476,8 +594,9 @@
         </svg>
       `;
       deleteBtn.addEventListener('click', (e) => {
+        e.preventDefault();
         e.stopPropagation();
-        deleteSession(sess.session_id, sess.title);
+        openDeleteModal(sess.session_id, sess.title);
       });
       actionsDiv.appendChild(deleteBtn);
 
@@ -545,6 +664,10 @@
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ title: 'New Chat', client_scope: 'remote_web' })
       });
+      if (res.status === 401 || res.status === 403) {
+        showAuthModal();
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
         const newSid = data.session_id;
@@ -558,40 +681,39 @@
   }
 
   if (newChatBtn) newChatBtn.addEventListener('click', createNewSession);
+  if (headerNewChatBtn) headerNewChatBtn.addEventListener('click', createNewSession);
 
-  async function renameSession(sessionId, currentTitle) {
-    const updated = prompt('Enter new thread title:', currentTitle || 'New Chat');
-    if (!updated || !updated.trim() || updated.trim() === currentTitle) return;
-
-    try {
-      const res = await fetch(`/api/sessions/${sessionId}`, {
-        method: 'PATCH',
-        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({ title: updated.trim() })
-      });
-      if (res.ok) {
-        if (sessionId === activeSessionId) {
-          activeSessionTitle = updated.trim();
-          if (activeThreadTitleEl) activeThreadTitleEl.textContent = activeSessionTitle;
-        }
-        await fetchSessions();
-      }
-    } catch (err) {
-      console.warn('Error renaming session:', err);
+  // In-DOM Delete Confirmation Modal (Replaces unsupported window.confirm on Mobile)
+  function openDeleteModal(sessionId, title) {
+    pendingDeleteSessionId = sessionId;
+    if (deleteModalPrompt) {
+      deleteModalPrompt.textContent = `Are you sure you want to delete "${title || 'this thread'}"? This will permanently erase the chat history.`;
     }
+    if (deleteModal) deleteModal.style.display = 'flex';
   }
 
-  async function deleteSession(sessionId, title) {
-    if (!confirm(`Delete conversation "${title || 'this thread'}"?`)) return;
+  function closeDeleteModal() {
+    pendingDeleteSessionId = null;
+    if (deleteModal) deleteModal.style.display = 'none';
+  }
+
+  async function executeDeleteSession() {
+    if (!pendingDeleteSessionId) return;
+    const targetId = pendingDeleteSessionId;
+    closeDeleteModal();
 
     try {
-      const res = await fetch(`/api/sessions/${sessionId}`, {
+      const res = await fetch(`/api/sessions/${targetId}`, {
         method: 'DELETE',
         headers: getAuthHeaders({ 'Content-Type': 'application/json' })
       });
+      if (res.status === 401 || res.status === 403) {
+        showAuthModal();
+        return;
+      }
       if (res.ok) {
         await fetchSessions();
-        if (sessionId === activeSessionId) {
+        if (targetId === activeSessionId) {
           const nextSession = sessionsList.length > 0 ? sessionsList[0].session_id : null;
           if (nextSession) {
             await switchSession(nextSession);
@@ -603,6 +725,84 @@
     } catch (err) {
       console.warn('Error deleting session:', err);
     }
+  }
+
+  if (closeDeleteModalBtn) closeDeleteModalBtn.addEventListener('click', closeDeleteModal);
+  if (cancelDeleteBtn) cancelDeleteBtn.addEventListener('click', closeDeleteModal);
+  if (confirmDeleteBtn) confirmDeleteBtn.addEventListener('click', executeDeleteSession);
+  if (deleteModal) {
+    deleteModal.addEventListener('click', (e) => {
+      if (e.target === deleteModal) closeDeleteModal();
+    });
+  }
+
+  // In-DOM Rename Modal (Replaces unsupported window.prompt on Mobile)
+  function openRenameModal(sessionId, title) {
+    pendingRenameSessionId = sessionId;
+    if (renameInput) {
+      renameInput.value = title || 'New Chat';
+    }
+    if (renameModal) renameModal.style.display = 'flex';
+    setTimeout(() => {
+      if (renameInput) {
+        renameInput.focus();
+        renameInput.select();
+      }
+    }, 100);
+  }
+
+  function closeRenameModal() {
+    pendingRenameSessionId = null;
+    if (renameModal) renameModal.style.display = 'none';
+  }
+
+  async function executeRenameSession() {
+    if (!pendingRenameSessionId || !renameInput) return;
+    const updated = renameInput.value.trim();
+    const targetId = pendingRenameSessionId;
+    closeRenameModal();
+
+    if (!updated) return;
+
+    try {
+      const res = await fetch(`/api/sessions/${targetId}`, {
+        method: 'PATCH',
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ title: updated })
+      });
+      if (res.status === 401 || res.status === 403) {
+        showAuthModal();
+        return;
+      }
+      if (res.ok) {
+        if (targetId === activeSessionId) {
+          activeSessionTitle = updated;
+          if (activeThreadTitleEl) activeThreadTitleEl.textContent = activeSessionTitle;
+        }
+        await fetchSessions();
+      }
+    } catch (err) {
+      console.warn('Error renaming session:', err);
+    }
+  }
+
+  if (closeRenameModalBtn) closeRenameModalBtn.addEventListener('click', closeRenameModal);
+  if (cancelRenameBtn) cancelRenameBtn.addEventListener('click', closeRenameModal);
+  if (confirmRenameBtn) confirmRenameBtn.addEventListener('click', executeRenameSession);
+  if (renameInput) {
+    renameInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        executeRenameSession();
+      } else if (e.key === 'Escape') {
+        closeRenameModal();
+      }
+    });
+  }
+  if (renameModal) {
+    renameModal.addEventListener('click', (e) => {
+      if (e.target === renameModal) closeRenameModal();
+    });
   }
 
   // --------------------------------------------------------------------------
@@ -729,24 +929,149 @@
   // --------------------------------------------------------------------------
   // 10. CHAT PROMPT SUBMISSION & KOKORO TTS PLAYBACK
   // --------------------------------------------------------------------------
+  function unlockAudio() {
+    if (remoteAudio) {
+      // Priming user gesture: triggers play/pause immediately within the synchronous click/touch handler
+      remoteAudio.play().then(() => remoteAudio.pause()).catch(() => {});
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // ATTACHMENT MANAGEMENT (IMAGES, PDFS & DOCUMENTS)
+  // --------------------------------------------------------------------------
+  function handleFileSelected(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+
+    if (file.size > 35 * 1024 * 1024) {
+      alert('File size exceeds 35 MB limit.');
+      if (fileInput) fileInput.value = '';
+      return;
+    }
+
+    const isImage = file.type.startsWith('image/');
+    pendingAttachment = {
+      file: file,
+      name: file.name,
+      size: file.size,
+      fileType: isImage ? 'image' : 'document'
+    };
+
+    if (attachmentName) attachmentName.textContent = file.name;
+    if (attachmentStatus) {
+      const sizeStr = file.size > 1024 * 1024
+        ? (file.size / (1024 * 1024)).toFixed(1) + ' MB'
+        : Math.round(file.size / 1024) + ' KB';
+      attachmentStatus.textContent = `${isImage ? 'Photo' : 'Document'} (${sizeStr}) • Ready to analyze`;
+    }
+
+    if (attachmentThumb) {
+      attachmentThumb.innerHTML = '';
+      if (isImage) {
+        const reader = new FileReader();
+        reader.onload = (re) => {
+          attachmentThumb.innerHTML = `<img src="${re.target.result}" alt="Thumb">`;
+        };
+        reader.readAsDataURL(file);
+      } else {
+        attachmentThumb.innerHTML = `
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+          </svg>
+        `;
+      }
+    }
+
+    if (attachmentTray) attachmentTray.style.display = 'flex';
+  }
+
+  function clearAttachment() {
+    pendingAttachment = null;
+    if (fileInput) fileInput.value = '';
+    if (attachmentTray) attachmentTray.style.display = 'none';
+    if (attachmentThumb) attachmentThumb.innerHTML = '';
+  }
+
+  if (attachBtn && fileInput) {
+    attachBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', handleFileSelected);
+  }
+  if (removeAttachmentBtn) {
+    removeAttachmentBtn.addEventListener('click', clearAttachment);
+  }
+
+  // Drag and drop files onto the chat interface
+  window.addEventListener('dragover', (e) => e.preventDefault());
+  window.addEventListener('drop', (e) => {
+    e.preventDefault();
+    if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      handleFileSelected({ target: { files: e.dataTransfer.files } });
+    }
+  });
+
+  // Clipboard paste support (e.g. pasting copied screenshot directly)
+  window.addEventListener('paste', (e) => {
+    if (e.clipboardData && e.clipboardData.files && e.clipboardData.files.length > 0) {
+      handleFileSelected({ target: { files: e.clipboardData.files } });
+    }
+  });
+
   async function sendPrompt(text) {
-    if (!text || !text.trim()) return;
-    const cleanPrompt = text.trim();
+    if ((!text || !text.trim()) && !pendingAttachment) return;
+    unlockAudio();
+    const cleanPrompt = (text || '').trim();
     if (promptInput) promptInput.value = '';
 
-    appendMessage(cleanPrompt, true);
+    const currentAttach = pendingAttachment;
+    clearAttachment();
+
+    let uploadedFileInfo = null;
+    if (currentAttach) {
+      setOrbState('thinking', 'UPLOADING // MULTIMODAL');
+      try {
+        const formData = new FormData();
+        formData.append('file', currentAttach.file);
+        formData.append('session_id', activeSessionId);
+        const headers = {};
+        if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+
+        const upRes = await fetch('/api/upload', {
+          method: 'POST',
+          headers: headers,
+          body: formData
+        });
+        if (upRes.ok) {
+          uploadedFileInfo = await upRes.json();
+        }
+      } catch (upErr) {
+        console.warn('Upload error:', upErr);
+      }
+    }
+
+    const userDisplayText = cleanPrompt || (uploadedFileInfo ? `Analyze attached ${uploadedFileInfo.file_type}: ${uploadedFileInfo.filename}` : 'Analyze file');
+    appendMessage(userDisplayText, true, {
+      attached_file: uploadedFileInfo
+    });
     setOrbState('thinking', 'THINKING // LLM REASONING');
 
     try {
+      const payload = {
+        prompt: cleanPrompt || 'Please examine and analyze this attached file in detail, summarizing key insights.',
+        session_id: activeSessionId,
+        client_scope: 'remote_web',
+        synthesize_audio: true
+      };
+      if (uploadedFileInfo) {
+        payload.attached_file_path = uploadedFileInfo.file_path;
+        payload.attached_file_name = uploadedFileInfo.filename;
+        payload.attached_file_type = uploadedFileInfo.file_type;
+      }
+
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify({
-          prompt: cleanPrompt,
-          session_id: activeSessionId,
-          client_scope: 'remote_web',
-          synthesize_audio: true
-        })
+        body: JSON.stringify(payload)
       });
 
       if (res.status === 401 || res.status === 403) {
@@ -761,7 +1086,9 @@
       appendMessage(reply, false, {
         action: data.action,
         latency_ms: data.latency_ms,
-        token_metrics: data.token_metrics
+        token_metrics: data.token_metrics,
+        audio_base64: data.audio_base64,
+        generated_image_url: data.generated_image_url
       });
 
       // Update telemetry & session listing (in case title auto-generated)
@@ -772,7 +1099,10 @@
       if (data.audio_base64 && remoteAudio) {
         setOrbState('speaking', 'SPEAKING // KOKORO-82M');
         remoteAudio.src = 'data:audio/wav;base64,' + data.audio_base64;
-        remoteAudio.play().catch(err => console.warn('Audio play note:', err));
+        remoteAudio.play().catch(err => {
+          console.warn('Autoplay prevented by browser policy (use Listen button):', err);
+          setOrbState('idle', 'STANDBY // READY');
+        });
         remoteAudio.onended = () => setOrbState('idle', 'STANDBY // READY');
       } else {
         setOrbState('idle', 'STANDBY // READY');
@@ -785,13 +1115,17 @@
 
   if (sendBtn) {
     sendBtn.addEventListener('click', () => {
+      unlockAudio();
       if (promptInput) sendPrompt(promptInput.value);
     });
   }
 
   if (promptInput) {
     promptInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') sendPrompt(promptInput.value);
+      if (e.key === 'Enter') {
+        unlockAudio();
+        sendPrompt(promptInput.value);
+      }
     });
   }
 
@@ -800,6 +1134,7 @@
   // --------------------------------------------------------------------------
   async function startRecording() {
     try {
+      unlockAudio();
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       audioChunks = [];
       const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
@@ -829,6 +1164,7 @@
 
   function stopRecording() {
     if (mediaRecorder && isRecording) {
+      unlockAudio();
       mediaRecorder.stop();
       isRecording = false;
       if (micBtn) micBtn.classList.remove('recording');
@@ -838,6 +1174,7 @@
 
   if (micBtn) {
     micBtn.addEventListener('click', () => {
+      unlockAudio();
       if (!isRecording) startRecording();
       else stopRecording();
     });
@@ -854,7 +1191,8 @@
       const headers = {};
       if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
 
-      const res = await fetch('/api/voice', {
+      const url = `/api/voice?session_id=${encodeURIComponent(activeSessionId)}&client_scope=remote_web`;
+      const res = await fetch(url, {
         method: 'POST',
         headers: headers,
         body: formData
@@ -874,7 +1212,8 @@
       appendMessage(reply, false, {
         action: data.action,
         latency_ms: data.latency_ms,
-        token_metrics: data.token_metrics
+        token_metrics: data.token_metrics,
+        audio_base64: data.audio_base64
       });
 
       fetchTokenSummary();
@@ -883,7 +1222,10 @@
       if (data.audio_base64 && remoteAudio) {
         setOrbState('speaking', 'SPEAKING // KOKORO-82M');
         remoteAudio.src = 'data:audio/wav;base64,' + data.audio_base64;
-        remoteAudio.play().catch(e => console.warn(e));
+        remoteAudio.play().catch(e => {
+          console.warn('Voice autoplay prevented by browser (use Listen button):', e);
+          setOrbState('idle', 'STANDBY // READY');
+        });
         remoteAudio.onended = () => setOrbState('idle', 'STANDBY // READY');
       } else {
         setOrbState('idle', 'STANDBY // READY');
