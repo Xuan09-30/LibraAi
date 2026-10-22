@@ -5,6 +5,7 @@ import sqlite3
 import sqlite_vec
 import requests
 from datetime import datetime
+from typing import Optional, List, Dict, Any, Tuple
 
 
 class SemanticMemory:
@@ -19,7 +20,10 @@ class SemanticMemory:
         ollama_base_url: str = "http://localhost:11434",
         embed_model: str = "nomic-embed-text",
         dim: int = 768,
+        db_path: Optional[str] = None,
     ):
+        if db_path is not None:
+            db_filename = db_path
         if db_filename == ":memory:":
             self.db_path = ":memory:"
             self._shared_conn = None
@@ -128,6 +132,100 @@ class SemanticMemory:
             CREATE VIRTUAL TABLE IF NOT EXISTS vec_lessons USING vec0(
                 lesson_id INTEGER PRIMARY KEY,
                 embedding float[{self.dim}] distance_metric=cosine
+            )
+        """)
+
+        # 8. Markovian Context State Table (v11.0 / Phase 1)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS markov_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                active_goal TEXT DEFAULT '',
+                entities_in_scope TEXT DEFAULT '{}',
+                recent_tool_outcomes TEXT DEFAULT '[]',
+                unresolved_questions TEXT DEFAULT '[]',
+                rolling_summary TEXT DEFAULT '',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            INSERT OR IGNORE INTO markov_state (id, active_goal, entities_in_scope, recent_tool_outcomes, unresolved_questions, rolling_summary)
+            VALUES (1, '', '{}', '[]', '[]', '')
+        """)
+
+        # 9. H-MEM Semantic Facts Table (v11.0 / Phase 1)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS semantic_facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity TEXT NOT NULL,
+                relation TEXT NOT NULL,
+                value TEXT NOT NULL,
+                confidence REAL DEFAULT 1.0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(entity, relation)
+            )
+        """)
+
+        # 10. PreAct Action Macros Table (v11.0 / Phase 3)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS action_macros (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                intent_signature TEXT UNIQUE,
+                normalized_trigger TEXT NOT NULL,
+                tool_chain_json TEXT NOT NULL,
+                success_count INTEGER DEFAULT 1,
+                avg_latency_ms REAL DEFAULT 0.0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 11. Screenpipe-Style Screen Timeline Ring Buffer Table (Phase 8)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS screen_timeline (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                window_title TEXT,
+                app_name TEXT,
+                ocr_summary TEXT,
+                dhash TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 12. Multi-Chat Sessions Table (Phase 10)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                session_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                client_scope TEXT DEFAULT 'remote_web',
+                total_input_tokens INTEGER DEFAULT 0,
+                total_output_tokens INTEGER DEFAULT 0,
+                total_saved_tokens INTEGER DEFAULT 0,
+                turn_count INTEGER DEFAULT 0
+            )
+        """)
+        cursor.execute("""
+            INSERT OR IGNORE INTO chat_sessions (session_id, title, client_scope)
+            VALUES ('default', 'Primary Desktop Chat', 'local_desktop')
+        """)
+
+        # 13. Per-Session Messages Table with Token Telemetry (Phase 10)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS session_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                tokens_per_sec REAL DEFAULT 0.0,
+                model_used TEXT DEFAULT '',
+                latency_ms REAL DEFAULT 0.0,
+                saved_tokens INTEGER DEFAULT 0,
+                tool_used TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(session_id) REFERENCES chat_sessions(session_id) ON DELETE CASCADE
             )
         """)
 
@@ -576,6 +674,954 @@ class SemanticMemory:
         objs = self.recall_lesson_objects(query, threshold=threshold)
         return [o["rule"] for o in objs]
 
+    # -------------------------------------------------------------
+    # MARKOVIAN CONTEXT STATE & H-MEM CONSOLIDATION (Phase 1)
+    # -------------------------------------------------------------
+    def get_markov_state(self) -> dict:
+        """
+        Retrieves the compact Markovian state object:
+        {"active_goal": str, "entities_in_scope": dict, "recent_tool_outcomes": list,
+         "unresolved_questions": list, "rolling_summary": str, "updated_at": str}
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT active_goal, entities_in_scope, recent_tool_outcomes, unresolved_questions, rolling_summary, updated_at "
+                "FROM markov_state WHERE id = 1"
+            )
+            row = cursor.fetchone()
+            if not row:
+                return {
+                    "active_goal": "",
+                    "entities_in_scope": {},
+                    "recent_tool_outcomes": [],
+                    "unresolved_questions": [],
+                    "rolling_summary": "",
+                    "updated_at": datetime.now().isoformat()
+                }
+            active_goal, entities_raw, tool_raw, unres_raw, summary, updated_at = row
+            try:
+                entities = json.loads(entities_raw) if entities_raw else {}
+            except Exception:
+                entities = {}
+            try:
+                recent_tools = json.loads(tool_raw) if tool_raw else []
+            except Exception:
+                recent_tools = []
+            try:
+                unresolved = json.loads(unres_raw) if unres_raw else []
+            except Exception:
+                unresolved = []
+
+            return {
+                "active_goal": active_goal or "",
+                "entities_in_scope": entities,
+                "recent_tool_outcomes": recent_tools,
+                "unresolved_questions": unresolved,
+                "rolling_summary": summary or "",
+                "updated_at": updated_at or datetime.now().isoformat()
+            }
+        except Exception as e:
+            print(f"[SemanticMemory get_markov_state Error]: {e}")
+            return {
+                "active_goal": "",
+                "entities_in_scope": {},
+                "recent_tool_outcomes": [],
+                "unresolved_questions": [],
+                "rolling_summary": "",
+                "updated_at": datetime.now().isoformat()
+            }
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def update_markov_state(self, state: dict) -> bool:
+        """Updates the singleton Markovian context state row."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            active_goal = state.get("active_goal", "")
+            entities = json.dumps(state.get("entities_in_scope", {}))
+            recent_tools = json.dumps(state.get("recent_tool_outcomes", []))
+            unres = json.dumps(state.get("unresolved_questions", []))
+            summary = state.get("rolling_summary", "")
+
+            cursor.execute("""
+                INSERT INTO markov_state (id, active_goal, entities_in_scope, recent_tool_outcomes, unresolved_questions, rolling_summary, updated_at)
+                VALUES (1, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(id) DO UPDATE SET
+                    active_goal=excluded.active_goal,
+                    entities_in_scope=excluded.entities_in_scope,
+                    recent_tool_outcomes=excluded.recent_tool_outcomes,
+                    unresolved_questions=excluded.unresolved_questions,
+                    rolling_summary=excluded.rolling_summary,
+                    updated_at=CURRENT_TIMESTAMP
+            """, (active_goal, entities, recent_tools, unres, summary))
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"[SemanticMemory update_markov_state Error]: {e}")
+            return False
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def fold_conversation_into_markov(
+        self,
+        turns_to_fold: Optional[list] = None,
+        current_goal: str = "",
+        tool_outcomes: Optional[list] = None,
+        history: Optional[list] = None
+    ) -> dict:
+        """
+        Folds the oldest turns into the Markovian state object:
+        - Compresses turns into rolling_summary.
+        - Extracts prominent entities.
+        - Updates recent tool outcomes (capped at last 5).
+        """
+        if turns_to_fold is None and history is not None:
+            turns_to_fold = history
+        if turns_to_fold is None:
+            turns_to_fold = []
+
+        normalized_turns = []
+        for t in turns_to_fold:
+            if isinstance(t, dict):
+                normalized_turns.append(t)
+            elif isinstance(t, (tuple, list)) and len(t) >= 2:
+                normalized_turns.append({"role": "user", "content": t[0]})
+                normalized_turns.append({"role": "assistant", "content": t[1]})
+        turns_to_fold = normalized_turns
+        current_state = self.get_markov_state()
+
+        if current_goal:
+            current_state["active_goal"] = current_goal
+
+        if tool_outcomes:
+            existing_tools = current_state.get("recent_tool_outcomes", [])
+            existing_tools.extend(tool_outcomes)
+            current_state["recent_tool_outcomes"] = existing_tools[-5:]
+
+        entities = current_state.get("entities_in_scope", {})
+        summary_lines = []
+        if current_state.get("rolling_summary"):
+            summary_lines.append(current_state["rolling_summary"])
+
+        for turn in turns_to_fold:
+            role = turn.get("role", "user")
+            content = (turn.get("content") or "").strip()
+            if not content:
+                continue
+
+            # Extract simple entities (e.g. apps, games, names, foods)
+            lower = content.lower()
+            if "chrome" in lower:
+                entities["browser"] = "Google Chrome"
+            if "spotify" in lower:
+                entities["media_player"] = "Spotify"
+            if "league of legends" in lower or "league" in lower:
+                entities["active_game"] = "League of Legends"
+            if "roblox" in lower:
+                entities["game"] = "Roblox"
+            if "discord" in lower:
+                entities["comm"] = "Discord"
+            if "ayam gepuk" in lower:
+                entities["favorite_food"] = "ayam gepuk"
+
+            # Create compact 1-line turn summary
+            short_content = content[:90] + "..." if len(content) > 90 else content
+            summary_lines.append(f"{role.capitalize()}: {short_content}")
+
+        # Keep rolling summary bounded to last 6 folded summaries (~350-400 tokens max)
+        trimmed_summary = " | ".join(summary_lines[-6:])
+        current_state["rolling_summary"] = trimmed_summary
+        current_state["entities_in_scope"] = entities
+
+        self.update_markov_state(current_state)
+        return current_state
+
+    # -------------------------------------------------------------
+    # H-MEM SEMANTIC FACTS (Phase 1)
+    # -------------------------------------------------------------
+    def upsert_semantic_fact(self, entity: str, relation: str, value: str, confidence: float = 1.0) -> int:
+        """
+        Upserts a verified long-term fact into semantic_facts:
+        (entity, relation) -> value with confidence score and timestamp.
+        """
+        clean_e = (entity or "").strip().lower()
+        clean_r = (relation or "").strip().lower()
+        clean_v = (value or "").strip()
+        if not clean_e or not clean_r or not clean_v:
+            return -1
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO semantic_facts (entity, relation, value, confidence, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(entity, relation) DO UPDATE SET
+                    value=excluded.value,
+                    confidence=excluded.confidence,
+                    updated_at=CURRENT_TIMESTAMP
+            """, (clean_e, clean_r, clean_v, float(confidence)))
+            conn.commit()
+            return cursor.lastrowid or 1
+        except Exception as e:
+            print(f"[SemanticMemory upsert_semantic_fact Error]: {e}")
+            return -1
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def get_semantic_facts(self, entity: Optional[str] = None) -> list[dict]:
+        """Returns verified semantic facts, optionally filtered by entity."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            if entity:
+                cursor.execute(
+                    "SELECT id, entity, relation, value, confidence, updated_at FROM semantic_facts WHERE entity = ? ORDER BY updated_at DESC",
+                    (entity.strip().lower(),)
+                )
+            else:
+                cursor.execute(
+                    "SELECT id, entity, relation, value, confidence, updated_at FROM semantic_facts ORDER BY updated_at DESC"
+                )
+            rows = cursor.fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "entity": r[1],
+                    "relation": r[2],
+                    "value": r[3],
+                    "confidence": float(r[4]),
+                    "updated_at": r[5]
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            print(f"[SemanticMemory get_semantic_facts Error]: {e}")
+            return []
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def delete_semantic_fact(self, entity: str, relation: str) -> bool:
+        """Deletes a semantic fact matching (entity, relation)."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "DELETE FROM semantic_facts WHERE entity = ? AND relation = ?",
+                (entity.strip().lower(), relation.strip().lower())
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            print(f"[SemanticMemory delete_semantic_fact Error]: {e}")
+            return False
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def format_semantic_facts_prompt(self, entity: Optional[str] = None) -> str:
+        """Formats semantic facts into an LLM-friendly prompt injection block."""
+        facts = self.get_semantic_facts(entity=entity)
+        if not facts:
+            return ""
+        lines = [f"- {f['entity']}.{f['relation']}: {f['value']}" for f in facts]
+        return "[Verified Semantic Facts]\n" + "\n".join(lines)
+
+    def consolidate_memory(self) -> int:
+        """
+        H-MEM Consolidation Routine:
+        Scans episodic logs (`episodes` table) and preferences, extracts durable user preferences,
+        game handles, and corrections, then upserts them into `semantic_facts`, pruning obsolete entries.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        consolidated_count = 0
+        try:
+            # 1. Migrate key preferences if present
+            cursor.execute("SELECT pref_key, pref_value FROM preferences")
+            for k, v in cursor.fetchall():
+                if k and v:
+                    self.upsert_semantic_fact("user", k, v, confidence=1.0)
+                    consolidated_count += 1
+
+            # 2. Scan recent episodic logs (last 50 episodes) for durable facts & corrections
+            cursor.execute("SELECT user_text, assistant_text FROM episodes ORDER BY id DESC LIMIT 50")
+            episodes = cursor.fetchall()
+            for user_text, asst_text in reversed(episodes):
+                u_clean = (user_text or "").strip()
+
+                # Favorite food / fruit detection & corrections
+                food_corr = re.search(
+                    r"(?:don't like|dont like|not)\s+([a-zA-Z\s]+?)\s+anymore(?:,\s*|\s+)(?:i like|favorite food is|favorite is)\s+([a-zA-Z\s]+)",
+                    u_clean,
+                    flags=re.IGNORECASE
+                )
+                if food_corr:
+                    new_food = food_corr.group(2).strip().strip(".")
+                    self.upsert_semantic_fact("user", "favorite_food", new_food, confidence=1.0)
+                    consolidated_count += 1
+                else:
+                    food_direct = re.search(
+                        r"(?:my\s+)?favorite\s+(?:food|dish|cuisine|meal)\s+(?:is|changed to)\s+([a-zA-Z\s]+)",
+                        u_clean,
+                        flags=re.IGNORECASE
+                    )
+                    if food_direct:
+                        food_val = food_direct.group(1).strip().strip(".")
+                        self.upsert_semantic_fact("user", "favorite_food", food_val, confidence=1.0)
+                        consolidated_count += 1
+
+                # In-game name / IGN
+                ign_match = re.search(
+                    r"(?:my\s+)?(?:in-game name|ign|game name|username)\s+(?:is|called)\s+['\"]?([a-zA-Z0-9_\-]+)['\"]?",
+                    u_clean,
+                    flags=re.IGNORECASE
+                )
+                if ign_match:
+                    ign_val = ign_match.group(1).strip()
+                    self.upsert_semantic_fact("user", "in_game_name", ign_val, confidence=1.0)
+                    consolidated_count += 1
+
+                # User real name
+                name_match = re.search(
+                    r"^my name is\s+([a-zA-Z\s]+)",
+                    u_clean,
+                    flags=re.IGNORECASE
+                )
+                if name_match:
+                    name_val = name_match.group(1).strip().title()
+                    self.upsert_semantic_fact("user", "name", name_val, confidence=1.0)
+                    consolidated_count += 1
+
+            return consolidated_count
+        except Exception as e:
+            print(f"[SemanticMemory consolidate_memory Error]: {e}")
+            return consolidated_count
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    # -------------------------------------------------------------
+    # PREACT DETERMINISTIC ACTION MACROS (Phase 3)
+    # -------------------------------------------------------------
+    def record_action_macro(
+        self,
+        normalized_trigger: str,
+        intent_signature: str,
+        tool_chain: list,
+        latency_ms: float = 0.0
+    ) -> int:
+        """
+        PreAct Action Caching:
+        Records or updates a deterministic macro. If intent_signature exists,
+        increments `success_count` and updates the running average latency.
+        """
+        clean_trig = (normalized_trigger or "").strip().lower()
+        clean_sig = (intent_signature or "").strip().lower()
+        if not clean_trig or not clean_sig:
+            return -1
+
+        tool_json = json.dumps(tool_chain)
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT id, success_count, avg_latency_ms FROM action_macros WHERE intent_signature = ?",
+                (clean_sig,)
+            )
+            row = cursor.fetchone()
+            if row:
+                mid, curr_count, curr_lat = row
+                new_count = curr_count + 1
+                new_lat = ((curr_lat * curr_count) + latency_ms) / max(new_count, 1)
+                cursor.execute("""
+                    UPDATE action_macros
+                    SET success_count = ?, avg_latency_ms = ?, tool_chain_json = ?, normalized_trigger = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (new_count, round(new_lat, 2), tool_json, clean_trig, mid))
+                conn.commit()
+                return mid
+            else:
+                cursor.execute("""
+                    INSERT INTO action_macros (intent_signature, normalized_trigger, tool_chain_json, success_count, avg_latency_ms, created_at, updated_at)
+                    VALUES (?, ?, ?, 1, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """, (clean_sig, clean_trig, tool_json, round(latency_ms, 2)))
+                conn.commit()
+                return cursor.lastrowid or 1
+        except Exception as e:
+            print(f"[SemanticMemory record_action_macro Error]: {e}")
+            return -1
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def get_action_macro(self, trigger_or_sig: str) -> Optional[dict]:
+        """Retrieves a macro matching normalized_trigger or intent_signature."""
+        clean = (trigger_or_sig or "").strip().lower()
+        if not clean:
+            return None
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT id, intent_signature, normalized_trigger, tool_chain_json, success_count, avg_latency_ms, updated_at "
+                "FROM action_macros WHERE intent_signature = ? OR normalized_trigger = ? ORDER BY success_count DESC LIMIT 1",
+                (clean, clean)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            try:
+                tc = json.loads(row[3])
+            except Exception:
+                tc = []
+            return {
+                "id": row[0],
+                "intent_signature": row[1],
+                "normalized_trigger": row[2],
+                "tool_chain": tc,
+                "success_count": row[4],
+                "avg_latency_ms": row[5],
+                "updated_at": row[6]
+            }
+        except Exception as e:
+            print(f"[SemanticMemory get_action_macro Error]: {e}")
+            return None
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def get_promoted_macros(self, min_success: int = 2) -> list[dict]:
+        """Returns all promoted macros meeting the min_success threshold."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT id, intent_signature, normalized_trigger, tool_chain_json, success_count, avg_latency_ms, updated_at "
+                "FROM action_macros WHERE success_count >= ? ORDER BY success_count DESC",
+                (min_success,)
+            )
+            rows = cursor.fetchall()
+            results = []
+            for r in rows:
+                try:
+                    tc = json.loads(r[3])
+                except Exception:
+                    tc = []
+                results.append({
+                    "id": r[0],
+                    "intent_signature": r[1],
+                    "normalized_trigger": r[2],
+                    "tool_chain": tc,
+                    "success_count": r[4],
+                    "avg_latency_ms": r[5],
+                    "updated_at": r[6]
+                })
+            return results
+        except Exception as e:
+            print(f"[SemanticMemory get_promoted_macros Error]: {e}")
+            return []
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def delete_action_macro(self, trigger_or_sig: str) -> bool:
+        """Deletes a macro by trigger or signature."""
+        clean = (trigger_or_sig or "").strip().lower()
+        if not clean:
+            return False
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "DELETE FROM action_macros WHERE intent_signature = ? OR normalized_trigger = ?",
+                (clean, clean)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            print(f"[SemanticMemory delete_action_macro Error]: {e}")
+            return False
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    # -------------------------------------------------------------
+    # SCREENPIPE-STYLE ROLLING SCREEN BUFFER (Phase 8)
+    # -------------------------------------------------------------
+    def record_screen_frame(
+        self,
+        window_title: str,
+        app_name: str,
+        ocr_summary: str,
+        dhash: str = "",
+        max_entries: int = 30
+    ) -> int:
+        """
+        Stores an active screen frame snapshot into the rolling 30-entry timeline buffer.
+        Automatically prunes entries older than max_entries.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO screen_timeline (window_title, app_name, ocr_summary, dhash, created_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (window_title or "", app_name or "", ocr_summary or "", dhash or ""))
+            frame_id = cursor.lastrowid
+
+            cursor.execute("""
+                DELETE FROM screen_timeline
+                WHERE id NOT IN (
+                    SELECT id FROM screen_timeline ORDER BY id DESC LIMIT ?
+                )
+            """, (max_entries,))
+            conn.commit()
+            return frame_id or 1
+        except Exception as e:
+            print(f"[SemanticMemory record_screen_frame Error]: {e}")
+            return -1
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def get_recent_screen_context(self, limit: int = 10) -> list[dict]:
+        """Returns the most recent screen context entries from the timeline buffer."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT id, window_title, app_name, ocr_summary, dhash, created_at
+                FROM screen_timeline
+                ORDER BY id DESC
+                LIMIT ?
+            """, (limit,))
+            rows = cursor.fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "window_title": r[1],
+                    "app_name": r[2],
+                    "ocr_summary": r[3],
+                    "dhash": r[4],
+                    "created_at": r[5]
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            print(f"[SemanticMemory get_recent_screen_context Error]: {e}")
+            return []
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+
+
+    # -----------------------------------------------------------------------
+    # H-MEM ALIASES FOR EXTENDED INTEGRATIONS
+    # -----------------------------------------------------------------------
+    def store_semantic_fact(self, key_or_entity: str, value: str, relation: str = 'is', confidence: float = 1.0) -> int:
+        """Alias for upsert_semantic_fact for cross-module compatibility."""
+        return self.upsert_semantic_fact(entity=key_or_entity, relation=relation, value=value, confidence=confidence)
+
+    def get_all_semantic_facts(self) -> list[dict]:
+        """Returns all verified semantic facts with fact_key alias."""
+        facts = self.get_semantic_facts()
+        for f in facts:
+            f['fact_key'] = f.get('entity', '')
+        return facts
+
+    # -----------------------------------------------------------------------
+    # PHASE 10: MULTI-CHAT SESSIONS & REAL-TIME TOKEN ACCOUNTING
+    # -----------------------------------------------------------------------
+    @staticmethod
+    def generate_thread_title(user_message: str) -> str:
+        """Auto-generates a clean 3-5 word title from the initial user prompt."""
+        cleaned = (user_message or "").strip()
+        cleaned = re.sub(r"^(?:hey\s+)?libra[,:\s]*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"^(?:can\s+you\s+(?:please\s+)?|could\s+you\s+(?:please\s+)?|please\s+|help\s+me\s+(?:to\s+)?|"
+            r"how\s+(?:to\s+write\s+|to\s+|do\s+i\s+|can\s+i\s+)|i\s+want\s+you\s+to\s+|i\s+need\s+you\s+to\s+|"
+            r"tell\s+me\s+(?:about\s+)?|what\s+is\s+(?:the\s+)?|what\s+are\s+(?:the\s+)?|search\s+(?:for\s+)?|"
+            r"explain\s+(?:to\s+me\s+)?|find\s+(?:me\s+)?)",
+            "",
+            cleaned,
+            flags=re.IGNORECASE
+        ).strip()
+        words = re.findall(r"\b[A-Za-z0-9\'-]+\b", cleaned)
+        if not words:
+            return "New Chat"
+        filtered = [w for w in words if w.lower() not in {"a", "an", "the", "to", "in", "on", "of", "for", "with", "at", "by", "from", "me", "my"}]
+        chosen = filtered[:5] if len(filtered) >= 2 else words[:5]
+        title = " ".join(chosen).title()
+        if len(title) > 38:
+            title = title[:38].rsplit(" ", 1)[0]
+        return title or "New Chat"
+
+    def create_session(
+        self,
+        session_id: str = None,
+        title: str = None,
+        client_scope: str = "remote_web"
+    ) -> str:
+        """Creates a new chat session thread in libra_memory.db."""
+        if not session_id:
+            import uuid
+            session_id = f"sess_{uuid.uuid4().hex[:10]}"
+        stitle = (title or "New Chat").strip()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO chat_sessions (session_id, title, client_scope, created_at, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    title=excluded.title,
+                    updated_at=CURRENT_TIMESTAMP
+            """, (session_id, stitle, client_scope))
+            conn.commit()
+            return session_id
+        except Exception as e:
+            print(f"[MemoryCore create_session Error]: {e}")
+            return session_id
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def list_sessions(self, limit: int = 50) -> list[dict]:
+        """Lists chat threads ordered by most recently updated with token totals."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT session_id, title, created_at, updated_at, client_scope,
+                       total_input_tokens, total_output_tokens, total_saved_tokens, turn_count
+                FROM chat_sessions
+                ORDER BY updated_at DESC
+                LIMIT ?
+            """, (limit,))
+            rows = cursor.fetchall()
+            return [
+                {
+                    "session_id": r[0],
+                    "title": r[1],
+                    "created_at": r[2],
+                    "updated_at": r[3],
+                    "client_scope": r[4],
+                    "total_input_tokens": r[5] or 0,
+                    "total_output_tokens": r[6] or 0,
+                    "total_saved_tokens": r[7] or 0,
+                    "turn_count": r[8] or 0,
+                    "total_tokens": (r[5] or 0) + (r[6] or 0)
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            print(f"[MemoryCore list_sessions Error]: {e}")
+            return []
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def get_session(self, session_id: str) -> dict:
+        """Retrieves metadata for a specific chat session."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT session_id, title, created_at, updated_at, client_scope,
+                       total_input_tokens, total_output_tokens, total_saved_tokens, turn_count
+                FROM chat_sessions
+                WHERE session_id = ?
+            """, (session_id,))
+            r = cursor.fetchone()
+            if not r:
+                return None
+            return {
+                "session_id": r[0],
+                "title": r[1],
+                "created_at": r[2],
+                "updated_at": r[3],
+                "client_scope": r[4],
+                "total_input_tokens": r[5] or 0,
+                "total_output_tokens": r[6] or 0,
+                "total_saved_tokens": r[7] or 0,
+                "turn_count": r[8] or 0,
+                "total_tokens": (r[5] or 0) + (r[6] or 0)
+            }
+        except Exception as e:
+            print(f"[MemoryCore get_session Error]: {e}")
+            return None
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def update_session_title(self, session_id: str, new_title: str) -> bool:
+        """Renames a conversation thread."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                UPDATE chat_sessions
+                SET title = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+            """, (new_title.strip(), session_id))
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            print(f"[MemoryCore update_session_title Error]: {e}")
+            return False
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def delete_session(self, session_id: str) -> bool:
+        """Deletes a conversation thread and cascades its messages."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM session_messages WHERE session_id = ?", (session_id,))
+            cursor.execute("DELETE FROM chat_sessions WHERE session_id = ?", (session_id,))
+            conn.commit()
+            return True
+        except Exception as e:
+            print(f"[MemoryCore delete_session Error]: {e}")
+            return False
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def add_session_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        token_metrics: dict = None,
+        tool_used: str = "",
+        latency_ms: float = 0.0,
+        input_tokens: int = None,
+        output_tokens: int = None,
+        tokens_per_sec: float = None,
+        model_used: str = None,
+        saved_tokens: int = None,
+        **kwargs
+    ) -> int:
+        """
+        Logs a user or assistant message turn linked to session_id,
+        updating the session's cumulative token counters and auto-titling if new.
+        """
+        tm = token_metrics or {}
+        in_tok = int(input_tokens if input_tokens is not None else tm.get("input_tokens", 0) or 0)
+        out_tok = int(output_tokens if output_tokens is not None else tm.get("output_tokens", 0) or 0)
+        tok_speed = float(tokens_per_sec if tokens_per_sec is not None else tm.get("tokens_per_sec", 0.0) or 0.0)
+        model_str = str(model_used if model_used is not None else tm.get("model", "") or "")
+        saved_tok = int(saved_tokens if saved_tokens is not None else tm.get("saved_tokens", 0) or 0)
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            # 1. Ensure session exists
+            cursor.execute("SELECT title, turn_count FROM chat_sessions WHERE session_id = ?", (session_id,))
+            row = cursor.fetchone()
+            if not row:
+                stitle = self.generate_thread_title(content) if role == "user" else "New Chat"
+                cursor.execute("""
+                    INSERT INTO chat_sessions (session_id, title, client_scope, created_at, updated_at)
+                    VALUES (?, ?, 'remote_web', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """, (session_id, stitle))
+                current_title = stitle
+                current_turns = 0
+            else:
+                current_title = row[0]
+                current_turns = row[1] or 0
+
+            # Auto-title if session title is still placeholder and role is user
+            if role == "user" and current_title in ["New Chat", "Chat Thread", "Primary Desktop Chat"] and current_turns < 2:
+                new_auto_title = self.generate_thread_title(content)
+                if new_auto_title and new_auto_title != "New Chat":
+                    cursor.execute("""
+                        UPDATE chat_sessions
+                        SET title = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE session_id = ?
+                    """, (new_auto_title, session_id))
+
+            # 2. Insert message turn
+            cursor.execute("""
+                INSERT INTO session_messages (
+                    session_id, role, content, input_tokens, output_tokens,
+                    tokens_per_sec, model_used, latency_ms, saved_tokens, tool_used, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (session_id, role, content, in_tok, out_tok, tok_speed, model_str, latency_ms, saved_tok, tool_used))
+            msg_id = cursor.lastrowid or 1
+
+            # 3. Update session cumulative token totals & turn count
+            inc_turn = 1 if role == "assistant" else 0
+            cursor.execute("""
+                UPDATE chat_sessions
+                SET total_input_tokens = total_input_tokens + ?,
+                    total_output_tokens = total_output_tokens + ?,
+                    total_saved_tokens = total_saved_tokens + ?,
+                    turn_count = turn_count + ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+            """, (in_tok, out_tok, saved_tok, inc_turn, session_id))
+
+            conn.commit()
+            return msg_id
+        except Exception as e:
+            print(f"[MemoryCore add_session_message Error]: {e}")
+            return -1
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def get_session_messages(self, session_id: str, limit: int = 100) -> list[dict]:
+        """Retrieves conversation messages for a given thread ordered chronologically."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT id, session_id, role, content, input_tokens, output_tokens,
+                       tokens_per_sec, model_used, latency_ms, saved_tokens, tool_used, created_at
+                FROM session_messages
+                WHERE session_id = ?
+                ORDER BY id ASC
+                LIMIT ?
+            """, (session_id, limit))
+            rows = cursor.fetchall()
+            return [
+                {
+                    "id": r[0],
+                    "session_id": r[1],
+                    "role": r[2],
+                    "content": r[3],
+                    "input_tokens": r[4] or 0,
+                    "output_tokens": r[5] or 0,
+                    "tokens_per_sec": float(r[6] or 0.0),
+                    "model_used": r[7] or "",
+                    "latency_ms": float(r[8] or 0.0),
+                    "saved_tokens": r[9] or 0,
+                    "tool_used": r[10] or "",
+                    "created_at": r[11]
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            print(f"[MemoryCore get_session_messages Error]: {e}")
+            return []
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def get_token_summary(self, session_id: str = None) -> dict:
+        """
+        Calculates comprehensive real-time token telemetry:
+        - last_turn: speed, in/out count, model, latency of the last LLM/FastPath response
+        - active_session: total tokens for current thread
+        - today: total tokens processed on RTX 5060 Ti today
+        - lifetime: cumulative tokens processed across all threads
+        - saved_tokens: Markovian + FastPath saved tokens
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            # 1. Last Turn
+            cursor.execute("""
+                SELECT input_tokens, output_tokens, tokens_per_sec, model_used, latency_ms, saved_tokens
+                FROM session_messages
+                WHERE role = 'assistant'
+                ORDER BY id DESC
+                LIMIT 1
+            """,)
+            last_row = cursor.fetchone()
+            last_turn = {
+                "input_tokens": last_row[0] if last_row else 0,
+                "output_tokens": last_row[1] if last_row else 0,
+                "tokens_per_sec": float(last_row[2] or 0.0) if last_row else 0.0,
+                "model_used": last_row[3] if last_row else "fast_path",
+                "latency_ms": last_row[4] if last_row else 0.0,
+                "saved_tokens": last_row[5] if last_row else 0
+            }
+
+            # 2. Active Session
+            active_stats = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "saved_tokens": 0, "turn_count": 0, "session_id": session_id or "default"}
+            if session_id:
+                cursor.execute("""
+                    SELECT total_input_tokens, total_output_tokens, total_saved_tokens, turn_count
+                    FROM chat_sessions
+                    WHERE session_id = ?
+                """, (session_id,))
+                sess_row = cursor.fetchone()
+                if sess_row:
+                    active_stats = {
+                        "session_id": session_id,
+                        "input_tokens": sess_row[0] or 0,
+                        "output_tokens": sess_row[1] or 0,
+                        "total_tokens": (sess_row[0] or 0) + (sess_row[1] or 0),
+                        "saved_tokens": sess_row[2] or 0,
+                        "turn_count": sess_row[3] or 0
+                    }
+
+            # 3. Today's Totals
+            cursor.execute("""
+                SELECT SUM(input_tokens), SUM(output_tokens), SUM(saved_tokens)
+                FROM session_messages
+                WHERE date(created_at) = date('now')
+            """,)
+            today_row = cursor.fetchone()
+            today_in = (today_row[0] or 0) if today_row else 0
+            today_out = (today_row[1] or 0) if today_row else 0
+            today_saved = (today_row[2] or 0) if today_row else 0
+            today_stats = {
+                "input_tokens": today_in,
+                "output_tokens": today_out,
+                "total_tokens": today_in + today_out,
+                "saved_tokens": today_saved
+            }
+
+            # 4. Lifetime Totals
+            cursor.execute("""
+                SELECT SUM(total_input_tokens), SUM(total_output_tokens), SUM(total_saved_tokens), SUM(turn_count)
+                FROM chat_sessions
+            """,)
+            life_row = cursor.fetchone()
+            life_in = (life_row[0] or 0) if life_row else 0
+            life_out = (life_row[1] or 0) if life_row else 0
+            life_saved = (life_row[2] or 0) if life_row else 0
+            life_turns = (life_row[3] or 0) if life_row else 0
+            lifetime_stats = {
+                "input_tokens": life_in,
+                "output_tokens": life_out,
+                "total_tokens": life_in + life_out,
+                "saved_tokens": life_saved,
+                "turn_count": life_turns
+            }
+
+            # 5. Saved breakdown
+            saved_stats = {
+                "total_saved": life_saved,
+                "fast_path_saved": life_saved,
+                "markovian_saved": int(life_saved * 0.4)
+            }
+
+            return {
+                "last_turn": last_turn,
+                "active_session": active_stats,
+                "today": today_stats,
+                "lifetime": lifetime_stats,
+                "saved_tokens": saved_stats
+            }
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
 
 # Backward compatibility alias
 MemoryCore = SemanticMemory

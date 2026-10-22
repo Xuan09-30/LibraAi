@@ -1,0 +1,19 @@
+{
+  "name": "Project Libra Remote Web Agent",
+  "short_name": "Libra AI",
+  "description": "Secure, Local-First AI Assistant & PWA powered by Home PC GPU resources",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#030708",
+  "theme_color": "#00f2fe",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "/static/icon.png",
+      "sizes": "192x192 512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

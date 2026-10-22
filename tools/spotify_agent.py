@@ -215,6 +215,42 @@ class SpotifyAgent:
             "voice_response": voice
         }
 
+    def pause(self, dry_run: bool = False) -> Dict[str, Any]:
+        """Pauses media playback globally."""
+        success = self._send_virtual_key(VK_MEDIA_PLAY_PAUSE, dry_run=dry_run)
+        return {
+            "status": "success" if success else "error",
+            "action": "pause",
+            "voice_response": "Paused playback."
+        }
+
+    def resume(self, dry_run: bool = False) -> Dict[str, Any]:
+        """Resumes media playback globally."""
+        success = self._send_virtual_key(VK_MEDIA_PLAY_PAUSE, dry_run=dry_run)
+        return {
+            "status": "success" if success else "error",
+            "action": "resume",
+            "voice_response": "Resumed playback."
+        }
+
+    def play(self, dry_run: bool = False) -> Dict[str, Any]:
+        """Starts or resumes media playback globally."""
+        success = self._send_virtual_key(VK_MEDIA_PLAY_PAUSE, dry_run=dry_run)
+        return {
+            "status": "success" if success else "error",
+            "action": "play",
+            "voice_response": "Playing."
+        }
+
+    def stop(self, dry_run: bool = False) -> Dict[str, Any]:
+        """Stops media playback globally."""
+        success = self._send_virtual_key(VK_MEDIA_STOP, dry_run=dry_run)
+        return {
+            "status": "success" if success else "error",
+            "action": "stop",
+            "voice_response": "Stopped playback."
+        }
+
     def next_track(self, dry_run: bool = False) -> Dict[str, Any]:
         """Skips to the next track."""
         success = self._send_virtual_key(VK_MEDIA_NEXT_TRACK, dry_run=dry_run)

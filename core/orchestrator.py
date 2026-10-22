@@ -1,11 +1,79 @@
 import os
 import re
+import time
 from typing import List, Dict, Any, Optional
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 from core.llm import LocalLLM
 from core.text_cleaner import normalize_for_tts
+from core.telemetry import profiler
+
+
+def normalize_trigger(text: str) -> str:
+    """Normalizes conversational prompts for deterministic PreAct macro lookup."""
+    t = (text or "").lower().strip()
+    t = re.sub(r"^(?:hey\s+)?libra[,:\s]*", "", t)
+    t = re.sub(r"^(?:can\s+you\s+(?:help\s+me\s+to\s+|please\s+)?|please\s+|help\s+me\s+(?:to\s+)?|i\s+want\s+you\s+to\s+|i\s+want\s+to\s+|could\s+you\s+)", "", t)
+    t = re.sub(r"[\.\?!]+$", "", t).strip()
+    return t
+
+
+BLOCKED_REMOTE_ACTIONS = {
+    "gui_action",
+    "open_app",
+    "close_app",
+    "shutdown",
+    "analyze_screen",
+    "open_folder",
+    "open_file",
+    "create_folder",
+    "create_file",
+    "write_file",
+    "select_profile",
+    "media_action",
+    "virus_scan",
+}
+
+REMOTE_SANDBOX_PATTERNS = [
+    r"\b(?:launch|open|start|run|close|kill|shut\s*down)\s+(?:the\s+)?(?:app|application|game|program|software|chrome|steam|notepad|calc|pc|computer|system)\b",
+    r"\b(?:click|double\s+click|right\s+click|press|tap)\s+(?:on\s+)?(?:the\s+)?(?:screen|button|icon|window|profile)\b",
+    r"\b(?:look\s+at|what\s+is\s+on|see\s+on|capture|check)\s+my\s+screen\b",
+    r"\b(?:open|show|reveal)\s+(?:that\s+|the\s+)?(?:folder|directory|file)\b",
+    r"\b(?:mute|unmute|volume\s+up|volume\s+down|pause\s+the\s+music|stop\s+music)\b",
+]
+
+CANONICAL_FASTPATH_INTENTS = {
+    "volume_down": {
+        "action": "media_action", "args": {"sub_action": "volume_down"}, "voice": "Turned down volume.",
+        "phrases": ["lower volume", "crank tunes down", "crank the tunes down", "volume down", "turn sound down", "decrease volume", "too loud", "lower the music", "quiet down", "lower the volume"]
+    },
+    "volume_up": {
+        "action": "media_action", "args": {"sub_action": "volume_up"}, "voice": "Turned up volume.",
+        "phrases": ["crank volume up", "turn it up", "louder", "increase volume", "volume up", "boost volume", "crank it up", "make it louder"]
+    },
+    "mute": {
+        "action": "media_action", "args": {"sub_action": "mute"}, "voice": "Muted audio.",
+        "phrases": ["mute audio", "silence", "mute sound", "kill volume", "mute the computer", "shut sound off"]
+    },
+    "pause_media": {
+        "action": "media_action", "args": {"sub_action": "pause"}, "voice": "Paused playback.",
+        "phrases": ["pause music", "pause spotify", "stop playing", "hold playback", "pause song", "freeze music"]
+    },
+    "resume_media": {
+        "action": "media_action", "args": {"sub_action": "resume"}, "voice": "Resumed playback.",
+        "phrases": ["resume music", "continue playing", "play song", "unpause", "resume playback", "start playing again"]
+    },
+    "system_vitals": {
+        "action": "system_status", "args": {}, "voice": "Checking system vitals.",
+        "phrases": [
+            "system status", "hardware diagnostics", "pc health", "cpu and ram status",
+            "gpu load", "how is my pc doing", "check computer stats", "check system vitals",
+            "system vitals", "how hot is my gpu running right now", "how hot is my gpu",
+            "gpu temperature", "check pc vitals", "gpu status"
+        ]
+    }
+}
 
 
 ACTION_CLAUSE_PATTERNS = [
@@ -117,17 +185,230 @@ class SupervisorHub:
 
         return [prompt]
 
-    def plan_or_execute(self, prompt: str, dry_run: bool = False) -> Dict[str, Any]:
+    def _execute_cached_tool(self, action: str, args: dict, dry_run: bool = False) -> Dict[str, Any]:
+        """Dispatches an already-compiled tool action directly to the runtime module."""
+        if action == "open_app":
+            target = args.get("app_id") or args.get("target", "")
+            res = self.llm.dispatcher.launch_app(target, dry_run=dry_run)
+            if isinstance(res, tuple):
+                success, msg = res
+                return {"action": "open_app", "target": target, "status": "success" if success else "error", "voice_response": msg}
+            return res if isinstance(res, dict) else {"action": "open_app", "status": "success", "voice_response": str(res)}
+        elif action == "close_app":
+            target = args.get("app_id") or args.get("target", "")
+            res = self.llm.dispatcher.terminate_app(target, dry_run=dry_run)
+            if isinstance(res, tuple):
+                success, msg = res
+                return {"action": "close_app", "target": target, "status": "success" if success else "error", "voice_response": msg}
+            return res if isinstance(res, dict) else {"action": "close_app", "status": "success", "voice_response": str(res)}
+        elif action == "gui_action":
+            sub_action = args.get("sub_action")
+            if sub_action == "select_profile":
+                return self.llm.gui_control.select_chrome_profile_ui(args.get("index", 0), dry_run=dry_run)
+            elif sub_action == "click_mark":
+                return self.llm.gui_control.click(x=args.get("x"), y=args.get("y"), dry_run=dry_run)
+        elif action == "media_action":
+            sub_action = args.get("sub_action")
+            if hasattr(self.llm, "media_ctrl"):
+                if sub_action == "volume_down":
+                    return self.llm.media_ctrl.volume_down(dry_run=dry_run)
+                elif sub_action == "volume_up":
+                    return self.llm.media_ctrl.volume_up(dry_run=dry_run)
+                elif sub_action == "mute":
+                    return self.llm.media_ctrl.mute(dry_run=dry_run)
+                elif sub_action == "pause":
+                    return self.llm.media_ctrl.pause(dry_run=dry_run)
+                elif sub_action == "resume":
+                    return self.llm.media_ctrl.resume(dry_run=dry_run)
+                elif sub_action == "stop":
+                    return self.llm.media_ctrl.stop(dry_run=dry_run)
+                elif sub_action == "play":
+                    return self.llm.media_ctrl.play(dry_run=dry_run)
+                elif sub_action == "next_track":
+                    return self.llm.media_ctrl.next_track(dry_run=dry_run)
+                elif sub_action == "prev_track":
+                    return self.llm.media_ctrl.prev_track(dry_run=dry_run)
+        elif action == "system_status":
+            if hasattr(self.llm, "monitor"):
+                metrics = self.llm.monitor.get_system_metrics()
+                return {"action": "system_status", "status": "success", "voice_response": f"Current system status: {metrics['summary']}", "metrics": metrics}
+        step_prompt = args.get("prompt") or action
+        res = self.llm.plan(step_prompt, dry_run=dry_run)
+        if isinstance(res, tuple):
+            success, msg = res
+            return {"action": action, "status": "success" if success else "error", "voice_response": msg}
+        return res
+
+    def _match_semantic_fastpath(self, prompt: str) -> Optional[Dict[str, Any]]:
         """
-        Executes the prompt through either fast-path single dispatch or multi-step coordination
-        backed by AgentScratchpad.
+        Embedding-Assisted / Lexical Semantic Fast-Path (Phase 9).
+        Matches colloquial and varied user expressions against canonical intent exemplars.
+        Returns the fast-path tool execution spec in <5ms.
         """
+        norm = normalize_trigger(prompt)
+        p_tokens = set(re.findall(r"\w+", norm))
+        if not p_tokens:
+            return None
+
+        best_match = None
+        highest_score = 0.0
+
+        for key, spec in CANONICAL_FASTPATH_INTENTS.items():
+            for phrase in spec["phrases"]:
+                phr_tokens = set(re.findall(r"\w+", phrase))
+                overlap = len(p_tokens & phr_tokens)
+                if not phr_tokens:
+                    continue
+                score = overlap / float(len(phr_tokens))
+                if phrase in norm or norm in phrase:
+                    score = max(score, 0.95)
+                if score > highest_score and score >= 0.75:
+                    highest_score = score
+                    best_match = {
+                        "action": spec["action"],
+                        "args": dict(spec["args"]),
+                        "voice_response": spec["voice"],
+                        "semantic_fastpath": True,
+                        "intent_key": key,
+                        "confidence": round(highest_score, 2)
+                    }
+
+        return best_match
+
+    def plan_or_execute(self, prompt: str, dry_run: bool = False, client_scope: str = "local_desktop", session_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Executes the prompt through PreAct deterministic macro caching (<5ms fast-path),
+        fast-path single dispatch, or multi-step coordination backed by AgentScratchpad.
+        When client_scope == "remote_web", enforces strict sandboxing restricting desktop OS tools.
+        """
+        if client_scope == "remote_web":
+            for pat in REMOTE_SANDBOX_PATTERNS:
+                if re.search(pat, prompt, re.IGNORECASE):
+                    if not re.search(r"open\s+(?:my\s+)?(?:google|chrome|browser)\s+and\s+search", prompt, re.IGNORECASE):
+                        return {
+                            "action": "sandboxed_blocked",
+                            "status": "blocked",
+                            "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                            "client_scope": client_scope
+                        }
+
+        if session_id and hasattr(self.llm, "active_session_id"):
+            self.llm.active_session_id = session_id
+
+        norm_trigger = normalize_trigger(prompt)
+        intent_signature = f"macro:{norm_trigger}"
+        t_start = time.perf_counter()
+
+        # PREACT DETERMINISTIC ACTION MACRO FAST-PATH (<5ms)
+        if hasattr(self.llm, "memory") and hasattr(self.llm.memory, "get_action_macro"):
+            cached_macro = self.llm.memory.get_action_macro(norm_trigger)
+            if cached_macro and cached_macro.get("success_count", 0) >= 2:
+                tool_chain = cached_macro.get("tool_chain", [])
+                if tool_chain:
+                    profiler.record_preact_cache_hit(
+                        trigger=norm_trigger,
+                        intent_signature=intent_signature,
+                        latency_saved_ms=cached_macro.get("avg_latency_ms", 120.0)
+                    )
+                    step_results: List[Dict[str, Any]] = []
+                    voice_responses: List[str] = []
+
+                    for step_item in tool_chain:
+                        act = step_item.get("action", "")
+                        args = step_item.get("args", {})
+                        res = self._execute_cached_tool(act, args, dry_run=dry_run)
+                        step_results.append(res)
+                        v = res.get("voice_response")
+                        if v and v != "Dry-run response.":
+                            voice_responses.append(v)
+
+                    elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+                    if not dry_run:
+                        self.llm.memory.record_action_macro(
+                            norm_trigger,
+                            intent_signature,
+                            tool_chain,
+                            latency_ms=elapsed_ms
+                        )
+
+                    combined_voice = " ".join(voice_responses) if voice_responses else f"Completed {norm_trigger}."
+                    macro_act = tool_chain[0].get("action") if len(tool_chain) == 1 else "macro_chain"
+                    if client_scope == "remote_web" and (macro_act in BLOCKED_REMOTE_ACTIONS or any(s.get("action") in BLOCKED_REMOTE_ACTIONS for s in tool_chain)):
+                        return {
+                            "action": "sandboxed_blocked",
+                            "status": "blocked",
+                            "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                            "client_scope": client_scope
+                        }
+                    fast_tm = {
+                        "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                        "tokens_per_sec": 0.0, "saved_tokens": 350,
+                        "model": "preact_macro", "fast_path": True
+                    }
+                    if hasattr(self.llm, "last_token_metrics"):
+                        self.llm.last_token_metrics = dict(fast_tm)
+                    return {
+                        "action": macro_act,
+                        "compound": len(tool_chain) > 1,
+                        "steps": [norm_trigger],
+                        "actions": [s.get("action") for s in tool_chain],
+                        "step_results": step_results,
+                        "voice_response": normalize_for_tts(combined_voice),
+                        "preact_cached": True,
+                        "token_metrics": fast_tm,
+                        "latency_ms": round(elapsed_ms, 2)
+                    }
+
+        # SEMANTIC FAST-PATH ROUTING (Phase 9) (<5ms)
+        sem_fast = self._match_semantic_fastpath(prompt)
+        if sem_fast:
+            if client_scope == "remote_web" and sem_fast["action"] in BLOCKED_REMOTE_ACTIONS:
+                return {
+                    "action": "sandboxed_blocked",
+                    "status": "blocked",
+                    "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                    "client_scope": client_scope
+                }
+            profiler.record_metric("semantic_fastpath_hit", 1.0)
+            res = self._execute_cached_tool(sem_fast["action"], sem_fast["args"], dry_run=dry_run)
+            res["semantic_fastpath"] = True
+            fast_tm = {
+                "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                "tokens_per_sec": 0.0, "saved_tokens": 350,
+                "model": "semantic_fastpath", "fast_path": True
+            }
+            res["token_metrics"] = fast_tm
+            if hasattr(self.llm, "last_token_metrics"):
+                self.llm.last_token_metrics = dict(fast_tm)
+            if sem_fast.get("voice_response") and not res.get("voice_response"):
+                res["voice_response"] = sem_fast["voice_response"]
+            return res
+
         sub_steps = self.split_compound_intent(prompt)
 
         # FAST PATH (<5ms): Single intent query
         if len(sub_steps) == 1:
             res = self.llm.plan(prompt, dry_run=dry_run)
             res["compound"] = False
+            elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+            act = res.get("action")
+            if client_scope == "remote_web" and act in BLOCKED_REMOTE_ACTIONS:
+                return {
+                    "action": "sandboxed_blocked",
+                    "status": "blocked",
+                    "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                    "client_scope": client_scope,
+                    "blocked_action": act
+                }
+            if not dry_run and act and act not in ["chat", "clarify", "error"] and res.get("status") != "error":
+                tool_chain = [{"action": act, "args": res.get("args", {})}]
+                if hasattr(self.llm, "memory") and hasattr(self.llm.memory, "record_action_macro"):
+                    self.llm.memory.record_action_macro(
+                        norm_trigger,
+                        intent_signature,
+                        tool_chain,
+                        latency_ms=elapsed_ms
+                    )
             return res
 
         # MULTI-STEP COMPOUND PIPELINE (Max 4 steps via AgentScratchpad)
@@ -161,19 +442,64 @@ class SupervisorHub:
         else:
             combined_voice = self.scratchpad.compress_for_speech()
 
+        elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+        if not dry_run:
+            successful_chain = [
+                {"action": r.get("action"), "args": r.get("args", {})}
+                for r in step_results
+                if r.get("action") and r.get("action") not in ["chat", "clarify", "error"] and r.get("status") != "error"
+            ]
+            if successful_chain and len(successful_chain) == len(step_results):
+                if hasattr(self.llm, "memory") and hasattr(self.llm.memory, "record_action_macro"):
+                    self.llm.memory.record_action_macro(
+                        norm_trigger,
+                        intent_signature,
+                        successful_chain,
+                        latency_ms=elapsed_ms
+                    )
+
+        if client_scope == "remote_web" and any(a in BLOCKED_REMOTE_ACTIONS for a in actions):
+            return {
+                "action": "sandboxed_blocked",
+                "status": "blocked",
+                "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                "client_scope": client_scope
+            }
+
+        comp_tm = {
+            "input_tokens": sum(int(r.get("token_metrics", {}).get("input_tokens", 0)) for r in step_results),
+            "output_tokens": sum(int(r.get("token_metrics", {}).get("output_tokens", 0)) for r in step_results),
+            "total_tokens": sum(int(r.get("token_metrics", {}).get("total_tokens", 0)) for r in step_results),
+            "saved_tokens": sum(int(r.get("token_metrics", {}).get("saved_tokens", 0)) for r in step_results),
+            "model": step_results[0].get("token_metrics", {}).get("model", "qwen3:8b") if step_results else "qwen3:8b"
+        }
         return {
             "compound": True,
             "steps": sub_steps[:self.MAX_STEPS],
             "actions": actions,
             "step_results": step_results,
             "scratchpad": self.scratchpad.get_state(),
+            "token_metrics": comp_tm,
             "voice_response": combined_voice
         }
 
-    def plan(self, prompt: str) -> Dict[str, Any]:
+    def plan(self, prompt: str, client_scope: str = "local_desktop", session_id: Optional[str] = None) -> Dict[str, Any]:
         """Dry-run planner isolating side-effects."""
-        return self.plan_or_execute(prompt, dry_run=True)
+        return self.plan_or_execute(prompt, dry_run=True, client_scope=client_scope, session_id=session_id)
 
-    def execute(self, prompt: str) -> Dict[str, Any]:
+    def execute(self, prompt: str, client_scope: str = "local_desktop", session_id: Optional[str] = None) -> Dict[str, Any]:
         """Live execution pipeline."""
-        return self.plan_or_execute(prompt, dry_run=False)
+        return self.plan_or_execute(prompt, dry_run=False, client_scope=client_scope, session_id=session_id)
+
+    def process_command(
+        self,
+        user_input: str,
+        client_scope: str = "local_desktop",
+        dry_run: bool = False,
+        session_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Unified entry point for local desktop and remote web clients (Phase 10).
+        Enforces client_scope sandboxing when client_scope == 'remote_web' and routes to session_id.
+        """
+        return self.plan_or_execute(user_input, dry_run=dry_run, client_scope=client_scope, session_id=session_id)

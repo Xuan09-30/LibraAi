@@ -113,6 +113,104 @@ CURATED_FALLBACK_PLACES = {
             "category": "amenity restaurant",
             "snippet": "Upscale Malaysian cuisine serving authentic laksa, nasi bojari, and satay."
         }
+    ],
+    "mcdonalds": [
+        {
+            "name": "McDonald's Kepong DT",
+            "rating": 4.5,
+            "address": "Jalan Kepong, Metro Prima, Kepong, Kuala Lumpur",
+            "latitude": 3.2155,
+            "longitude": 101.6420,
+            "category": "amenity fast_food",
+            "snippet": "24/7 Drive-Thru branch serving crispy Ayam Goreng McD, Big Macs, and McCafe beverages."
+        },
+        {
+            "name": "McDonald's Shell Kepong",
+            "rating": 4.4,
+            "address": "Shell Station, Jalan Kepong, Kuala Lumpur",
+            "latitude": 3.2080,
+            "longitude": 101.6390,
+            "category": "amenity fast_food",
+            "snippet": "Convenient station branch offering quick burgers, fries, and breakfast McValue sets."
+        },
+        {
+            "name": "McDonald's Bandar Menjalara DT",
+            "rating": 4.5,
+            "address": "Bandar Menjalara, Kepong, Kuala Lumpur",
+            "latitude": 3.1945,
+            "longitude": 101.6315,
+            "category": "amenity fast_food",
+            "snippet": "Spacious standalone drive-thru branch with dessert kiosk and ample parking."
+        }
+    ],
+    "fast_food": [
+        {
+            "name": "McDonald's Kepong DT",
+            "rating": 4.5,
+            "address": "Jalan Kepong, Metro Prima, Kepong, Kuala Lumpur",
+            "latitude": 3.2155,
+            "longitude": 101.6420,
+            "category": "amenity fast_food",
+            "snippet": "24/7 Drive-Thru branch serving burgers, fried chicken, and McCafe coffee."
+        },
+        {
+            "name": "KFC Metro Prima Kepong",
+            "rating": 4.3,
+            "address": "Metro Prima, Kepong, Kuala Lumpur",
+            "latitude": 3.2145,
+            "longitude": 101.6395,
+            "category": "amenity fast_food",
+            "snippet": "Popular fried chicken chain serving Original Recipe, Hot & Spicy chicken, and Zinger burgers."
+        },
+        {
+            "name": "McDonald's Bandar Menjalara DT",
+            "rating": 4.5,
+            "address": "Bandar Menjalara, Kepong, Kuala Lumpur",
+            "latitude": 3.1945,
+            "longitude": 101.6315,
+            "category": "amenity fast_food",
+            "snippet": "Spacious drive-thru branch with McCafe and 24-hour service."
+        }
+    ],
+    "kfc": [
+        {
+            "name": "KFC Metro Prima Kepong",
+            "rating": 4.3,
+            "address": "Metro Prima, Kepong, Kuala Lumpur",
+            "latitude": 3.2145,
+            "longitude": 101.6395,
+            "category": "amenity fast_food",
+            "snippet": "Fast food outlet serving famous pressure-cooked Original Recipe and Hot & Spicy chicken."
+        },
+        {
+            "name": "KFC Bandar Menjalara",
+            "rating": 4.2,
+            "address": "Jalan Menjalara Idaman 1, Bandar Menjalara, Kuala Lumpur",
+            "latitude": 3.1950,
+            "longitude": 101.6320,
+            "category": "amenity fast_food",
+            "snippet": "Local branch offering family buckets, potato gravy, and combo meals."
+        }
+    ],
+    "starbucks": [
+        {
+            "name": "Starbucks AEON Mall Metro Prima",
+            "rating": 4.6,
+            "address": "AEON Mall Metro Prima, Kepong, Kuala Lumpur",
+            "latitude": 3.2142,
+            "longitude": 101.6388,
+            "category": "amenity cafe",
+            "snippet": "Comfortable mall cafe serving handcrafted espresso, Frappuccinos, and pastries."
+        },
+        {
+            "name": "Starbucks Bandar Menjalara",
+            "rating": 4.5,
+            "address": "Medan Putra Business Centre, Bandar Menjalara, Kuala Lumpur",
+            "latitude": 3.1938,
+            "longitude": 101.6308,
+            "category": "amenity cafe",
+            "snippet": "Cozy neighborhood Starbucks with outdoor seating and Nitro Cold Brew on tap."
+        }
     ]
 }
 
@@ -176,6 +274,14 @@ class PlacesDiscoveryEngine:
         t = t.strip(" .?!")
 
         # Map common query variants to OSM search terms
+        if "mcdonald" in t or "mcd" in t:
+            return "mcdonalds"
+        if "kfc" in t or "kentucky" in t:
+            return "kfc"
+        if "starbucks" in t:
+            return "starbucks"
+        if "fast food" in t or "fastfood" in t or "burger" in t:
+            return "fast_food"
         if "place" in t and ("eat" in t or "food" in t):
             return "restaurant"
         if "coffee" in t or "cafe" in t or "cafes" in t:

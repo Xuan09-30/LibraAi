@@ -2,20 +2,97 @@ import os
 import sys
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+os.chdir(PROJECT_ROOT)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-# In pythonw.exe, stdout and stderr are None, causing HF Hub/tqdm to crash. Redirect to log file.
-if sys.stdout is None or sys.stderr is None:
-    log_dir = os.path.join(PROJECT_ROOT, "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    _runtime_log = open(os.path.join(log_dir, "libra_runtime.log"), "a", encoding="utf-8", buffering=1)
-    if sys.stdout is None:
-        sys.stdout = _runtime_log
-    if sys.stderr is None:
-        sys.stderr = _runtime_log
+log_dir = os.path.join(PROJECT_ROOT, "logs")
+os.makedirs(log_dir, exist_ok=True)
+_runtime_log = open(os.path.join(log_dir, "libra_runtime.log"), "a", encoding="utf-8", buffering=1)
+
+class StreamTee:
+    def __init__(self, primary, file_stream):
+        self.primary = primary
+        self.file_stream = file_stream
+    def write(self, data):
+        try:
+            if self.primary:
+                self.primary.write(data)
+                self.primary.flush()
+        except Exception:
+            pass
+        try:
+            self.file_stream.write(data)
+            self.file_stream.flush()
+        except Exception:
+            pass
+    def flush(self):
+        try:
+            if self.primary:
+                self.primary.flush()
+        except Exception:
+            pass
+        try:
+            self.file_stream.flush()
+        except Exception:
+            pass
+
+sys.stdout = StreamTee(sys.stdout, _runtime_log)
+sys.stderr = StreamTee(sys.stderr, _runtime_log)
 
 import time
+
+def _handle_uncaught_exception(exc_type, exc_value, exc_traceback):
+    import traceback
+    err_text = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+    print(f"\n[CRITICAL UNCAUGHT EXCEPTION {time.strftime('%Y-%m-%d %H:%M:%S')}]:\n{err_text}", file=sys.stderr)
+    try:
+        _runtime_log.flush()
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = _handle_uncaught_exception
+
+# =====================================================================
+# ATOMIC WINDOWS SINGLE-INSTANCE GUARD (ZERO IMPORT LATENCY)
+# =====================================================================
+import ctypes
+from ctypes import wintypes
+
+_is_reload = any(arg.startswith("--reload-") or arg.startswith("--reloaded-") for arg in sys.argv)
+_libra_mutex_handle = None
+
+if not _is_reload:
+    ERROR_ALREADY_EXISTS = 183
+    MUTEX_NAME = "Local\\ProjectLibra_MasterInstance_Mutex_chenx"
+
+    _kernel32 = ctypes.windll.kernel32
+    _kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    _kernel32.CreateMutexW.restype = wintypes.HANDLE
+
+    _libra_mutex_handle = _kernel32.CreateMutexW(None, True, MUTEX_NAME)
+    _last_err = _kernel32.GetLastError()
+
+    if _last_err == ERROR_ALREADY_EXISTS or _libra_mutex_handle == 0:
+        # A primary instance is already initializing or active!
+        print(f"[{time.strftime('%H:%M:%S')}] [SingleInstanceGuard] Duplicate instance detected. Signaling primary instance and terminating immediately.")
+        try:
+            from PyQt6.QtCore import QCoreApplication
+            from PyQt6.QtNetwork import QLocalSocket
+            _temp_app = QCoreApplication(sys.argv)
+            _sock = QLocalSocket()
+            for _ in range(15):
+                _sock.connectToServer("libra_instance_ipc")
+                if _sock.waitForConnected(200):
+                    _sock.write(b"show\n")
+                    _sock.waitForBytesWritten(1000)
+                    _sock.disconnectFromServer()
+                    break
+                time.sleep(0.2)
+        except Exception:
+            pass
+        sys.exit(0)
 import math
 import random
 import threading
@@ -29,6 +106,7 @@ import torch
 import keyboard
 import queue
 import wave
+import subprocess
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -51,8 +129,10 @@ from core.llm import LocalLLM
 from core.orchestrator import SupervisorHub
 from core.telemetry import profiler
 from core.text_cleaner import normalize_for_tts
-from core.audio_capture import scale_pcm_amplitude, get_windows_master_volume, get_dynamic_chime_pcm
+from core.audio_capture import scale_pcm_amplitude, get_windows_master_volume, get_dynamic_chime_pcm, AudioDucker
 from tools.security_scanner import SecurityScanner
+from core.code_reloader import CodeReloader
+from core.version import LIBRA_VERSION, get_full_version_string
 
 warnings.filterwarnings("ignore")
 
@@ -124,6 +204,7 @@ class VoiceAssistantWorker(QThread):
         self.running = True
         self.interrupted = threading.Event()
         self.input_stream = None  # Holds the PyAudio input handle to clear Pylance closure warning
+        self.pa = None
         self.text_input_queue = queue.Queue()
         self.proactive_speech_queue = queue.Queue()
         self.mute_tts = False
@@ -131,16 +212,27 @@ class VoiceAssistantWorker(QThread):
         self.attached_file_path = None
         self.raw_chime_pcm = raw_chime_pcm
         self.chime_pcm = raw_chime_pcm
+        self.audio_ducker = AudioDucker()
 
     def stop(self):
         self.running = False
         self.interrupted.set()
+        try:
+            if hasattr(self, "audio_ducker"):
+                self.audio_ducker.restore_background_audio()
+        except Exception:
+            pass
         if self.llm:
             try:
                 if hasattr(self.llm, "scheduler") and self.llm.scheduler:
                     self.llm.scheduler.stop_watchdog()
                 if hasattr(self.llm, "folder_watchdog") and self.llm.folder_watchdog:
                     self.llm.folder_watchdog.stop()
+            except Exception:
+                pass
+        if hasattr(self, "web_thread") and self.web_thread and hasattr(self.web_thread, "server"):
+            try:
+                self.web_thread.server.should_exit = True
             except Exception:
                 pass
 
@@ -178,18 +270,51 @@ class VoiceAssistantWorker(QThread):
         supervisor = SupervisorHub(llm=llm)
         self.telemetry_update.emit("LLM_CORE", "QWEN3-INSTRUCT [SUPERVISOR]")
 
+        # Attach hardware engines to llm so remote web agent can access GPU Whisper and Kokoro
+        llm.tts = tts
+        llm.stt = stt
+
+        # Launch Remote Web Agent & Mobile PWA server in daemon thread (Phase 10)
+        try:
+            from web.server import start_web_server_thread
+            self.web_thread = start_web_server_thread(hub=supervisor)
+            ts_info = getattr(self.web_thread, "tailscale_info", {})
+            pwa_label = ts_info.get("magicdns_domain") or "100.126.60.93:8765"
+            self.telemetry_update.emit("WEB_AGENT", f"ONLINE [{pwa_label}]")
+        except Exception as web_err:
+            print(f"[Web Agent Startup Warning]: {web_err}")
+
         vad_detector = SileroVADDetector(sample_rate=16000, silence_cutoff_sec=0.8)
         self.telemetry_update.emit("VAD_DETECTOR", "SILERO ONNX [0.8s CUTOFF]")
 
-        # 1. Initialize persistent PyAudio input stream with 512 samples / 32ms frame size
-        pa = pyaudio.PyAudio()
-        self.input_stream = pa.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=16000,
-            input=True,
-            frames_per_buffer=512
-        )
+        # 1. Initialize persistent PyAudio input stream with retry for Windows audio boot
+        self.pa = None
+        self.input_stream = None
+        for attempt in range(5):
+            try:
+                self.pa = pyaudio.PyAudio()
+                self.input_stream = self.pa.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=16000,
+                    input=True,
+                    frames_per_buffer=512
+                )
+                self.telemetry_update.emit("AUDIO_STATUS", "MICROPHONE ACTIVE")
+                break
+            except Exception as audio_err:
+                print(f"[Audio Device Wait] Attempt {attempt+1}/5 waiting for audio device: {audio_err}")
+                if self.pa:
+                    try:
+                        self.pa.terminate()
+                    except Exception:
+                        pass
+                    self.pa = None
+                time.sleep(1.5)
+        if not self.input_stream:
+            print("[Audio Notice]: No default microphone input device ready. Falling back to Text/GUI mode.")
+            self.telemetry_update.emit("AUDIO_STATUS", "NO MIC DETECTED [TEXT MODE ACTIVE]")
+            self.log_received.emit("SYSTEM", "Notice: No microphone input device detected. Libra is running in Text Mode in the background. Plug in a microphone anytime to enable wake word.")
 
         if not self.raw_chime_pcm:
             chime_path = os.path.join(project_root, "assets", "sounds", "chime.wav")
@@ -238,6 +363,11 @@ class VoiceAssistantWorker(QThread):
             self.interrupted.clear()
             self.status_changed.emit("SPEAKING... [CTRL+SPACE TO STOP]")
             self.visualizer_state.emit(True)
+            try:
+                if hasattr(self, "audio_ducker"):
+                    self.audio_ducker.duck_background_audio(target_level=0.15)
+            except Exception:
+                pass
 
             audio_queue = queue.Queue()
             INTERRUPT_HOTKEY = "ctrl+space"
@@ -248,6 +378,11 @@ class VoiceAssistantWorker(QThread):
             def trigger_barge_in():
                 print(f"\n[Barge-In]: '{INTERRUPT_HOTKEY}' triggered! Cutting speech.")
                 self.interrupted.set()
+                try:
+                    if hasattr(self, "audio_ducker"):
+                        self.audio_ducker.restore_background_audio()
+                except Exception:
+                    pass
                 # Flush pending audio queue
                 while not audio_queue.empty():
                     try:
@@ -376,10 +511,11 @@ class VoiceAssistantWorker(QThread):
                                 elif "libra" in m_lower:
                                     libra_score = max(libra_score, score)
 
-                            # Voice barge-in during active TTS playback strictly requires explicit STOP command.
-                            # "Hey Libra" is ignored during active speech to prevent assistant audio echo self-interruption.
-                            if stop_score >= 0.70:
-                                print(f"\n[Voice Barge-In]: Detected STOP command during playback! (stop={stop_score:.2f}, rms={rms:.3f}). Cutting speech.")
+                            # Voice barge-in during active TTS playback:
+                            # Triggers on explicit "STOP" or "HEY LIBRA" with lowered adaptive threshold
+                            if stop_score >= 0.40 or libra_score >= 0.45:
+                                trig_label = "STOP command" if stop_score >= 0.40 else "HEY LIBRA wake word"
+                                print(f"\n[Voice Barge-In]: Detected {trig_label} during playback! (stop={stop_score:.2f}, libra={libra_score:.2f}, rms={rms:.3f}). Cutting speech.")
                                 trigger_barge_in()
                                 break
                 except Exception:
@@ -400,6 +536,12 @@ class VoiceAssistantWorker(QThread):
                 if self.input_stream:
                     while self.input_stream.get_read_available() > 0:
                         self.input_stream.read(self.input_stream.get_read_available(), exception_on_overflow=False)
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self, "audio_ducker"):
+                    self.audio_ducker.restore_background_audio()
             except Exception:
                 pass
 
@@ -473,6 +615,11 @@ class VoiceAssistantWorker(QThread):
                     followup_turn_count = 0
 
                 if not in_followup_mode:
+                    try:
+                        if hasattr(self, "audio_ducker"):
+                            self.audio_ducker.restore_background_audio()
+                    except Exception:
+                        pass
                     self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
                     self.visualizer_state.emit(False)
                     oww_model.reset()
@@ -496,7 +643,49 @@ class VoiceAssistantWorker(QThread):
                             if user_text:
                                 break
 
-                        audio_data = self.input_stream.read(512, exception_on_overflow=False)
+                        if self.input_stream is None:
+                            time.sleep(0.1)
+                            now = time.time()
+                            if now - getattr(self, "_last_mic_poll", 0.0) > 2.0:
+                                self._last_mic_poll = now
+                                test_pa = pyaudio.PyAudio()
+                                try:
+                                    stream = test_pa.open(
+                                        format=pyaudio.paInt16,
+                                        channels=1,
+                                        rate=16000,
+                                        input=True,
+                                        frames_per_buffer=512
+                                    )
+                                    self.pa = test_pa
+                                    self.input_stream = stream
+                                    self.status_changed.emit("SYSTEM READY // AWAITING VOCAL PROMPT")
+                                    self.telemetry_update.emit("AUDIO_STATUS", "MICROPHONE ACTIVE")
+                                    self.notification_signal.emit("Microphone Connected", "Libra voice listening is now online! Say 'Hey Libra' anytime.")
+                                    self.log_received.emit("SYSTEM", "Microphone connected successfully. Voice listening online.")
+                                except Exception:
+                                    try:
+                                        test_pa.terminate()
+                                    except Exception:
+                                        pass
+                            continue
+
+                        try:
+                            audio_data = self.input_stream.read(512, exception_on_overflow=False)
+                        except Exception as read_err:
+                            print(f"[Mic Read Error]: {read_err}")
+                            if self.input_stream:
+                                try:
+                                    self.input_stream.stop_stream()
+                                    self.input_stream.close()
+                                except Exception:
+                                    pass
+                            self.input_stream = None
+                            self.status_changed.emit("MICROPHONE DISCONNECTED // TEXT MODE")
+                            self.telemetry_update.emit("AUDIO_STATUS", "NO MIC DETECTED [TEXT MODE ACTIVE]")
+                            self.notification_signal.emit("Microphone Disconnected", "Microphone unplugged or lost. Switched to Text Mode.")
+                            self.log_received.emit("SYSTEM", "Microphone disconnected. Waiting for microphone reconnection...")
+                            continue
 
                         # Calculate live microphone RMS amplitude and emit for Three.js WebGL orb
                         audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
@@ -519,6 +708,11 @@ class VoiceAssistantWorker(QThread):
                                             continue
                                         thresh = ww_booster.get_threshold(vad_prob=vad_prob)
                                         print(f"\n[Worker] Wake word triggered! Score: {score:.3f} (thresh: {thresh:.2f}, vad: {vad_prob:.2f})")
+                                        try:
+                                            if hasattr(self, "audio_ducker"):
+                                                self.audio_ducker.duck_background_audio(target_level=0.15)
+                                        except Exception:
+                                            pass
                                         # 0ms Auditory Acknowledgment: Push pre-cached chime straight to PyAudio output
                                         if self.raw_chime_pcm:
                                             scaled_chime = get_dynamic_chime_pcm(self.raw_chime_pcm, base_gain=0.35)
@@ -781,10 +975,16 @@ class VoiceAssistantWorker(QThread):
                 self.input_stream.close()
             except Exception:
                 pass
-        pa.terminate()
+        if getattr(self, "pa", None):
+            try:
+                self.pa.terminate()
+            except Exception:
+                pass
 
 
 class FuturisticVoiceAssistantUI(QMainWindow):
+    reload_requested = pyqtSignal(str)
+
     def __init__(self, start_worker: bool = True):
         super().__init__()
         self.security_scanner = SecurityScanner()
@@ -802,9 +1002,41 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             except Exception:
                 pass
         self.setAcceptDrops(True)
+        self.code_reloader = None
+        self.ipc_server = None
+        self.reload_requested.connect(self.restart_application)
+
+        self.reload_count = 0
+        self.reloaded_from = ""
+        self.reloaded_at = ""
+        for arg in sys.argv[1:]:
+            if arg.startswith("--reload-count="):
+                try:
+                    self.reload_count = int(arg.split("=", 1)[1])
+                except ValueError:
+                    pass
+            elif arg.startswith("--reloaded-from="):
+                self.reloaded_from = arg.split("=", 1)[1]
+            elif arg.startswith("--reloaded-at="):
+                self.reloaded_at = arg.split("=", 1)[1]
+
+        if self.reload_count == 0:
+            state_file = os.path.join(PROJECT_ROOT, "logs", "reloader_state.json")
+            if os.path.exists(state_file):
+                try:
+                    with open(state_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if time.time() - data.get("timestamp", 0) < 15:
+                        self.reload_count = data.get("reload_count", 0)
+                        self.reloaded_from = data.get("last_trigger_file", "")
+                        self.reloaded_at = data.get("last_reload_time", "")
+                except Exception:
+                    pass
+
         self.init_ui()
         _ = self.winId()
         self.init_tray_icon()
+        self.init_code_reloader()
         if start_worker:
             self.init_worker()
 
@@ -825,7 +1057,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         title_label = QLabel("LIBRA AI // NEURAL TERMINAL")
         title_label.setFont(QFont("Consolas", 14, QFont.Weight.Bold))
         title_label.setStyleSheet("color: #00ffcc; letter-spacing: 3px;")
-        sub_label = QLabel("QUANTUM REASONING CORE // ARCHITECTURE V7.0")
+        sub_label = QLabel(f"QUANTUM REASONING CORE // ARCHITECTURE V{LIBRA_VERSION}")
         sub_label.setFont(QFont("Consolas", 8))
         sub_label.setStyleSheet("color: #0088aa; letter-spacing: 1.5px;")
         title_box.addWidget(title_label)
@@ -904,7 +1136,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         sidebar.addWidget(sidebar_title)
 
         self.telemetry_labels = {}
-        for key in ["WAKEWORD", "STT_ENGINE", "STT_LATENCY", "LLM_CORE", "LLM_LATENCY", "TTS_ENGINE", "VAD_DETECTOR"]:
+        for key in ["WAKEWORD", "STT_ENGINE", "STT_LATENCY", "LLM_CORE", "LLM_LATENCY", "TTS_ENGINE", "VAD_DETECTOR", "WEB_AGENT"]:
             k_lbl = QLabel(key.replace("_", " "))
             k_lbl.setFont(QFont("Consolas", 7))
             k_lbl.setStyleSheet("color: #475569;")
@@ -997,10 +1229,84 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
         main_layout.addLayout(bottom_bar)
 
+        # 6. Ultra-Compact Footer: Small Version Number & Live Code Reloader Status
+        footer_layout = QHBoxLayout()
+        footer_layout.setContentsMargins(4, 2, 4, 0)
+        footer_layout.setSpacing(10)
+
+        self.version_label = QLabel()
+        self.version_label.setFont(QFont("Consolas", 8))
+        self.version_label.setTextFormat(Qt.TextFormat.RichText)
+        self.version_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        footer_layout.addWidget(self.version_label)
+
+        footer_layout.addStretch()
+
+        self.reloader_meta_label = QLabel("WATCHDOG: CODE RELOADER ACTIVE")
+        self.reloader_meta_label.setFont(QFont("Consolas", 8))
+        self.reloader_meta_label.setStyleSheet("color: #334155; letter-spacing: 1px;")
+        self.reloader_meta_label.setToolTip(
+            "Live source code observer powered by watchdog.\n"
+            "Any saved modifications to .py or .html files validate AST syntax\n"
+            "and automatically hot-reload Project Libra."
+        )
+        footer_layout.addWidget(self.reloader_meta_label)
+
+        main_layout.addLayout(footer_layout)
+
+        self.update_version_display()
+
         timer = QTimer(self)
         timer.timeout.connect(self.update_clock)
         timer.start(1000)
         self.update_clock()
+
+    def update_version_display(self, status_override: str = None):
+        if not hasattr(self, "version_label") or self.version_label is None:
+            return
+
+        full_ver = get_full_version_string(self.reload_count)
+
+        if status_override:
+            html_text = (
+                f"<span style='color: #64748b; font-weight: bold;'>LIBRA {full_ver}</span> "
+                f"<span style='color: #1e293b;'>|</span> "
+                f"<span style='color: #f59e0b; font-weight: bold;'>● {html.escape(status_override)}</span>"
+            )
+            tooltip = f"Project Libra {full_ver}\nStatus: {status_override}"
+        elif self.reload_count > 0:
+            src = f" from {self.reloaded_from}" if self.reloaded_from else ""
+            t_str = f" at {self.reloaded_at}" if self.reloaded_at else ""
+            html_text = (
+                f"<span style='color: #00ffcc; font-weight: bold;'>LIBRA {full_ver}</span> "
+                f"<span style='color: #1e293b;'>|</span> "
+                f"<span style='color: #10b981;'>● RELOADED</span> "
+                f"<span style='color: #94a3b8;'>[{t_str.strip()}{src}]</span> "
+                f"<span style='color: #1e293b;'>|</span> "
+                f"<span style='color: #38bdf8;'>HOT-RELOAD: SYNCD</span>"
+            )
+            tooltip = (
+                f"Project Libra {full_ver}\n"
+                f"Reload Revision: #{self.reload_count}\n"
+                f"Triggered by: {self.reloaded_from or 'source code'}\n"
+                f"Reload Time: {self.reloaded_at}\n"
+                f"Live Code Reloader: Active"
+            )
+        else:
+            html_text = (
+                f"<span style='color: #00ffcc; font-weight: bold;'>LIBRA {full_ver}</span> "
+                f"<span style='color: #1e293b;'>|</span> "
+                f"<span style='color: #10b981;'>● LIVE RELOAD ACTIVE</span> "
+                f"<span style='color: #64748b;'>[READY]</span>"
+            )
+            tooltip = (
+                f"Project Libra {full_ver}\n"
+                f"Initial Process Launch\n"
+                f"Live Code Reloader: Active"
+            )
+
+        self.version_label.setText(html_text)
+        self.version_label.setToolTip(tooltip)
 
     def submit_typed_text(self):
         text = self.input_box.text().strip()
@@ -1232,10 +1538,67 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
             self.toggle_interface()
 
+    def center_on_screen(self):
+        try:
+            screen = QApplication.primaryScreen()
+            if screen:
+                geo = screen.availableGeometry()
+                w = self.width() if self.width() > 100 else 1180
+                h = self.height() if self.height() > 100 else 780
+                x = max(geo.x(), geo.x() + (geo.width() - w) // 2)
+                y = max(geo.y(), geo.y() + (geo.height() - h) // 2)
+                self.move(x, y)
+        except Exception:
+            pass
+
     def show_interface(self):
+        # 1. Qt level restore & activate
+        if self.isMinimized():
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
+        self.show()
         self.showNormal()
         self.raise_()
         self.activateWindow()
+
+        # 2. Force Windows 11 DWM to present the window front and center
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            hwnd = int(self.winId())
+
+            # SW_RESTORE = 9
+            user32.ShowWindow(hwnd, 9)
+
+            fg_hwnd = user32.GetForegroundWindow()
+            cur_thread = kernel32.GetCurrentThreadId()
+            fg_thread = user32.GetWindowThreadProcessId(fg_hwnd, None) if fg_hwnd else 0
+
+            attached = False
+            if fg_thread and fg_thread != cur_thread:
+                attached = bool(user32.AttachThreadInput(cur_thread, fg_thread, True))
+
+            try:
+                # VK_MENU (Alt key) pulse to acquire foreground lock
+                user32.keybd_event(0x12, 0, 0, 0)
+                user32.keybd_event(0x12, 0, 2, 0)
+
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+            finally:
+                if attached:
+                    user32.AttachThreadInput(cur_thread, fg_thread, False)
+
+            # Z-order pulse: TOPMOST -> NOTOPMOST forces DWM z-order update
+            HWND_TOPMOST = -1
+            HWND_NOTOPMOST = -2
+            SWP_NOMOVE = 0x0002
+            SWP_NOSIZE = 0x0001
+            SWP_SHOWWINDOW = 0x0040
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+            user32.SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW)
+        except Exception:
+            pass
 
     def hide_interface(self):
         self.hide()
@@ -1258,7 +1621,119 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         elif action == "hide_ui" or "hide_ui" in actions:
             self.hide_interface()
 
+    def init_code_reloader(self):
+        try:
+            self.code_reloader = CodeReloader(
+                PROJECT_ROOT,
+                reload_callback=self._on_code_changed,
+                debounce_sec=1.5
+            )
+            self.code_reloader.start()
+        except Exception as e:
+            print(f"[CodeReloader Init Error]: {e}")
+
+    def _on_code_changed(self, filepath: str):
+        filename = os.path.basename(filepath) if filepath else "source code"
+        try:
+            self.update_version_display(status_override=f"RELOADING ({filename})...")
+        except Exception:
+            pass
+        self.reload_requested.emit(filepath)
+
+    def restart_application(self, trigger_file: str = ""):
+        filename = os.path.basename(trigger_file) if trigger_file else "source code"
+        print(f"[CodeReloader] Restarting Libra due to changes in: {trigger_file}")
+
+        try:
+            self.update_version_display(status_override=f"RESTARTING ({filename})...")
+        except Exception:
+            pass
+
+        self.show_notification(
+            "Reloading Libra...",
+            f"Source change detected in {filename}. Refreshing to new version."
+        )
+        self.append_log("SYSTEM", f"Auto-refreshing Libra — Updated code detected in {filename}.")
+
+        was_visible = self.isVisible()
+
+        if self.worker is not None:
+            self.worker.stop()
+            self.worker.wait(1000)
+
+        if self.code_reloader is not None:
+            self.code_reloader.stop()
+
+        if hasattr(self, "ipc_server") and self.ipc_server:
+            try:
+                self.ipc_server.close()
+            except Exception:
+                pass
+        try:
+            from PyQt6.QtNetwork import QLocalServer
+            QLocalServer.removeServer("libra_instance_ipc")
+        except Exception:
+            pass
+
+        global _libra_mutex_handle
+        if _libra_mutex_handle:
+            try:
+                import ctypes
+                ctypes.windll.kernel32.CloseHandle(_libra_mutex_handle)
+                _libra_mutex_handle = None
+            except Exception:
+                pass
+
+        if self.tray_icon:
+            self.tray_icon.hide()
+
+        new_count = self.reload_count + 1
+        t_str = time.strftime("%H:%M:%S")
+
+        state_path = os.path.join(PROJECT_ROOT, "logs", "reloader_state.json")
+        try:
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "reload_count": new_count,
+                    "last_trigger_file": filename,
+                    "last_reload_time": t_str,
+                    "timestamp": time.time()
+                }, f, indent=2)
+        except Exception:
+            pass
+
+        python_exe = os.path.join(PROJECT_ROOT, "venv", "Scripts", "pythonw.exe")
+        if not os.path.isfile(python_exe):
+            python_exe = sys.executable
+        main_script = os.path.join(PROJECT_ROOT, "ui", "gui.py")
+        cmd = [python_exe, main_script]
+
+        for arg in sys.argv[1:]:
+            if arg != "--hidden" and not arg.startswith("--reload-") and not arg.startswith("--reloaded-"):
+                cmd.append(arg)
+
+        cmd.extend([
+            f"--reload-count={new_count}",
+            f"--reloaded-from={filename}",
+            f"--reloaded-at={t_str}"
+        ])
+
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        subprocess.Popen(
+            cmd,
+            cwd=PROJECT_ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=CREATE_NEW_PROCESS_GROUP,
+            close_fds=True
+        )
+
+        QApplication.quit()
+
     def _quit_application(self):
+        if self.code_reloader is not None:
+            self.code_reloader.stop()
         if self.tray_icon:
             self.tray_icon.hide()
         if self.worker is not None:
@@ -1271,6 +1746,8 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             event.ignore()
             self.hide_interface()
         else:
+            if self.code_reloader is not None:
+                self.code_reloader.stop()
             if self.worker is not None:
                 self.worker.stop()
                 self.worker.wait()
@@ -1283,15 +1760,16 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    # 1. Single Instance Check via Qt Local Socket IPC
-    socket = QLocalSocket()
-    socket.connectToServer("libra_instance_ipc")
-    if socket.waitForConnected(400):
-        # Another instance is actively running. If started without --hidden, ask existing instance to show its window.
-        if "--hidden" not in sys.argv:
+    # 1. Single Instance Check via Qt Local Socket IPC (bypass on reload-restarts)
+    is_reload_restart = any(arg.startswith("--reload-count") for arg in sys.argv)
+    if not is_reload_restart:
+        socket = QLocalSocket()
+        socket.connectToServer("libra_instance_ipc")
+        if socket.waitForConnected(400):
+            # Another instance is actively running. Ask existing instance to show its window immediately.
             socket.write(b"show\n")
             socket.waitForBytesWritten(1000)
-        sys.exit(0)
+            sys.exit(0)
 
     # 2. Setup IPC Server to receive 'show' commands from subsequent launches
     ipc_server = QLocalServer()
@@ -1299,6 +1777,7 @@ if __name__ == "__main__":
     ipc_server.listen("libra_instance_ipc")
 
     window = FuturisticVoiceAssistantUI()
+    window.ipc_server = ipc_server
 
     def handle_incoming_ipc():
         conn = ipc_server.nextPendingConnection()
@@ -1311,7 +1790,13 @@ if __name__ == "__main__":
     ipc_server.newConnection.connect(handle_incoming_ipc)
 
     if "--hidden" not in sys.argv:
-        window.show()
+        window.center_on_screen()
+        window.show_interface()
+        # Guarantee window visibility front & center even if Windows 11 desktop is still loading
+        QTimer.singleShot(500, window.show_interface)
+        QTimer.singleShot(1500, window.show_interface)
+        QTimer.singleShot(3500, window.show_interface)
+        QTimer.singleShot(6000, lambda: window.show_interface() if not window.isMinimized() else None)
     else:
         _ = window.winId()
     sys.exit(app.exec())
