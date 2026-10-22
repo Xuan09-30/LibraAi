@@ -1,8 +1,11 @@
 import os
 import re
+import sqlite3
 import logging
 import warnings
+from datetime import datetime
 from urllib.parse import urlparse
+from typing import Optional, Dict, Any, List
 import trafilatura
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -76,9 +79,85 @@ def extract_citation_label(url: str, title: str = "") -> str:
     return "Web Source"
 
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DEFAULT_WEB_CACHE = os.path.join(PROJECT_ROOT, "assets", "libra_web_cache.db")
+
+
 class HardenedResearchEngine:
-    def __init__(self, char_limit_per_source: int = 800):
+    def __init__(self, char_limit_per_source: int = 800, cache_db_path: Optional[str] = None):
         self.char_limit_per_source = char_limit_per_source
+        self.cache_db_path = cache_db_path or DEFAULT_WEB_CACHE
+        if self.cache_db_path != ":memory:":
+            os.makedirs(os.path.dirname(self.cache_db_path), exist_ok=True)
+        self._init_cache_db()
+
+    def _init_cache_db(self):
+        try:
+            conn = sqlite3.connect(self.cache_db_path)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS web_cache (
+                    url TEXT PRIMARY KEY,
+                    title TEXT,
+                    cleaned_markdown TEXT,
+                    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[ResearchEngine Cache Init Warning]: {e}")
+
+    def clean_markdown_extract(self, url: str) -> Optional[Dict[str, str]]:
+        """
+        Clean Markdown Extractor (Phase 5):
+        Checks SQLite web_cache first, then extracts clean article text using Trafilatura
+        stripping boilerplates/scripts, converting to clean markdown, and caching the result.
+        """
+        if not url:
+            return None
+
+        # Check cache
+        try:
+            conn = sqlite3.connect(self.cache_db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT title, cleaned_markdown FROM web_cache WHERE url = ?", (url,))
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                return {"url": url, "title": row[0], "markdown": row[1], "cached": True}
+        except Exception:
+            pass
+
+        # Fetch and extract
+        try:
+            downloaded = trafilatura.fetch_url(url)
+            if downloaded:
+                extracted = trafilatura.extract(
+                    downloaded,
+                    include_comments=False,
+                    include_tables=True,
+                    include_links=False,
+                    favor_precision=True,
+                    output_format="markdown"
+                ) or ""
+                if extracted:
+                    metadata = trafilatura.extract_metadata(downloaded)
+                    title = getattr(metadata, "title", "") or extract_citation_label(url)
+                    try:
+                        conn = sqlite3.connect(self.cache_db_path)
+                        conn.execute("""
+                            INSERT OR REPLACE INTO web_cache (url, title, cleaned_markdown, fetched_at)
+                            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                        """, (url, title, extracted))
+                        conn.commit()
+                        conn.close()
+                    except Exception:
+                        pass
+                    return {"url": url, "title": title, "markdown": extracted, "cached": False}
+        except Exception as e:
+            print(f"[ResearchEngine Extract Warning]: {e}")
+
+        return None
 
     def search_and_extract(self, query: str, max_sources: int = 2) -> dict:
         clean_query = query.strip()
@@ -130,19 +209,13 @@ class HardenedResearchEngine:
                 title_has_keywords = any(tok in title.lower() for tok in query_tokens) if query_tokens else True
                 snippet_has_keywords = any(tok in snippet.lower() for tok in query_tokens) if query_tokens else True
 
-                # 4. Attempt Trafilatura extraction on deep article links
+                # 4. Attempt clean markdown extraction on deep article links (Phase 5)
                 article_text = ""
-                try:
-                    downloaded = trafilatura.fetch_url(url)
-                    if downloaded:
-                        article_text = trafilatura.extract(
-                            downloaded,
-                            include_comments=False,
-                            include_tables=False,
-                            favor_precision=True
-                        ) or ""
-                except Exception:
-                    article_text = ""
+                extracted_obj = self.clean_markdown_extract(url)
+                if extracted_obj:
+                    article_text = extracted_obj.get("markdown", "")
+                    if extracted_obj.get("title"):
+                        title = extracted_obj["title"]
 
                 # 5. Strict relevance validation:
                 article_has_keywords = any(tok in article_text.lower() for tok in query_tokens) if query_tokens else True

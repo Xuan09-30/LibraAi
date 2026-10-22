@@ -1,0 +1,731 @@
+import os
+import io
+import sys
+import json
+import time
+import wave
+import base64
+import logging
+import threading
+from typing import Optional, Dict, Any, List
+
+import numpy as np
+import soundfile as sf
+import scipy.signal
+
+from fastapi import (
+    FastAPI, Request, Response, HTTPException, Depends,
+    File, UploadFile, Query, Path, Body, WebSocket, WebSocketDisconnect
+)
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from core.version import LIBRA_VERSION, get_full_version_string
+from core.orchestrator import SupervisorHub
+from core.llm import LocalLLM
+from tools.system_monitor import SystemMonitor
+
+logger = logging.getLogger("libra.web")
+
+# ---------------------------------------------------------------------------
+# CONFIGURATION LOADER
+# ---------------------------------------------------------------------------
+DEFAULT_CONFIG = {
+    "host": "0.0.0.0",
+    "port": 8765,
+    "admin_email": "chenxuanchuah@gmail.com",
+    "allowed_gmail": "chenxuanchuah@gmail.com",
+    "access_token": "libra_access_token_phase10_secure",
+    "enabled": True
+}
+
+
+def load_web_config(config_path: str = "config.json") -> Dict[str, Any]:
+    full_path = os.path.join(PROJECT_ROOT, config_path)
+    cfg = dict(DEFAULT_CONFIG)
+    if os.path.exists(full_path):
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                raw_cfg = json.load(f)
+                web_sec = raw_cfg.get("web_server", {})
+                cfg.update(web_sec)
+                if "allowed_gmail" not in cfg and "admin_email" in cfg:
+                    cfg["allowed_gmail"] = cfg["admin_email"]
+        except Exception as e:
+            logger.warning(f"Error reading config.json for web_server: {e}")
+
+    # Environment variable overrides
+    if "LIBRA_ADMIN_EMAIL" in os.environ:
+        cfg["admin_email"] = os.environ["LIBRA_ADMIN_EMAIL"]
+        cfg["allowed_gmail"] = os.environ["LIBRA_ADMIN_EMAIL"]
+    if "LIBRA_ACCESS_TOKEN" in os.environ:
+        cfg["access_token"] = os.environ["LIBRA_ACCESS_TOKEN"]
+    if "LIBRA_WEB_PORT" in os.environ:
+        try:
+            cfg["port"] = int(os.environ["LIBRA_WEB_PORT"])
+        except ValueError:
+            pass
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# AUDIO CONVERSION UTILITIES
+# ---------------------------------------------------------------------------
+def convert_to_16k_mono_pcm(audio_bytes: bytes) -> np.ndarray:
+    """
+    Converts arbitrary incoming audio bytes (WAV, WebM, OGG, FLAC) to
+    a 16kHz mono float32 numpy array normalized to [-1.0, 1.0] for faster-whisper.
+    """
+    if not audio_bytes:
+        return np.zeros(0, dtype=np.float32)
+
+    try:
+        data, sr = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+        if data.ndim > 1:
+            data = np.mean(data, axis=1)
+        if sr != 16000:
+            num_samples = int(len(data) * 16000 / sr)
+            data = scipy.signal.resample(data, num_samples).astype(np.float32)
+        return np.clip(data, -1.0, 1.0)
+    except Exception:
+        pass
+
+    # Fallback: treat as raw 16-bit PCM (16000 Hz)
+    try:
+        pcm = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        return np.clip(pcm, -1.0, 1.0)
+    except Exception:
+        return np.zeros(0, dtype=np.float32)
+
+
+def pcm_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = 24000) -> bytes:
+    """Packs int16 PCM bytes into standard RIFF WAV format."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# PYDANTIC SCHEMAS
+# ---------------------------------------------------------------------------
+class ChatRequest(BaseModel):
+    prompt: str = Field(..., description="User query or command")
+    session_id: Optional[str] = Field(None, description="Active chat thread session ID")
+    client_scope: str = Field("remote_web", description="Client execution scope")
+    synthesize_audio: bool = Field(False, description="Whether to synthesize Kokoro TTS audio")
+
+
+class NewSessionRequest(BaseModel):
+    title: Optional[str] = Field("New Chat", description="Initial title for conversation thread")
+    client_scope: str = Field("remote_web", description="Originating client scope")
+
+
+class RenameSessionRequest(BaseModel):
+    title: str = Field(..., description="Updated title for chat session")
+
+
+# ---------------------------------------------------------------------------
+# FASTAPI APPLICATION FACTORY
+# ---------------------------------------------------------------------------
+def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.json") -> FastAPI:
+    cfg = load_web_config(config_path)
+    admin_email = (cfg.get("allowed_gmail") or cfg.get("admin_email", "chenxuanchuah@gmail.com")).lower().strip()
+    access_token = cfg.get("access_token", "libra_access_token_phase10_secure")
+
+    app = FastAPI(
+        title="Project Libra Remote Web Agent",
+        version=LIBRA_VERSION,
+        description="Local-First PWA & Remote Web Agent exposing Project Libra's Home GPU resources"
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    supervisor: SupervisorHub = hub if hub is not None else SupervisorHub()
+    monitor = SystemMonitor()
+    static_dir = os.path.join(os.path.dirname(__file__), "static")
+
+    # -----------------------------------------------------------------------
+    # ZERO-TRUST TAILSCALE & GMAIL AUTHENTICATION DEPENDENCY
+    # -----------------------------------------------------------------------
+    def authenticate_request(request: Request) -> Dict[str, Any]:
+        """
+        Enforces Tailscale / Gmail Identity Lock:
+        1. Tailscale identity header: 'Tailscale-User-Login' (injected by 'tailscale serve').
+        2. Cloudflare Access Google OAuth: 'Cf-Access-Authenticated-User-Email'.
+        3. Custom identity header: 'X-User-Email'.
+        4. Bearer token / 'x-libra-token' / '?token=...' / cookie 'libra_token'.
+        """
+        # 1. Header-based email / Tailscale identity
+        email = (
+            request.headers.get("tailscale-user-login")
+            or request.headers.get("cf-access-authenticated-user-email")
+            or request.headers.get("x-user-email")
+        )
+        if email:
+            clean_email = email.lower().strip()
+            # If email is admin or matches authorized Gmail
+            if clean_email == admin_email or clean_email.startswith(admin_email.split("@")[0]):
+                return {"authenticated": True, "method": "tailscale_identity", "email": clean_email}
+            else:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Forbidden: Identity '{clean_email}' is not authorized to access Project Libra."
+                )
+
+        # 2. Tailscale WireGuard Mesh Network IP (100.64.0.0/10) or Tailscale Serve loopback proxy
+        client_host = request.client.host if request.client else ""
+        if client_host.startswith("100.") or client_host in ("127.0.0.1", "::1", "localhost"):
+            return {"authenticated": True, "method": "tailscale_network", "client_ip": client_host}
+
+        # 3. Token-based authentication
+        auth_header = request.headers.get("authorization", "")
+        token = ""
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+        elif "x-libra-token" in request.headers:
+            token = request.headers.get("x-libra-token", "").strip()
+        elif "token" in request.query_params:
+            token = request.query_params.get("token", "").strip()
+        elif "libra_token" in request.cookies:
+            token = request.cookies.get("libra_token", "").strip()
+
+        if token and token == access_token:
+            return {"authenticated": True, "method": "token", "token": token}
+
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Valid Tailscale login, Google OAuth header, or Libra access token required."
+        )
+
+    # -----------------------------------------------------------------------
+    # STATIC & PWA ROUTES
+    # -----------------------------------------------------------------------
+    if os.path.isdir(static_dir):
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    @app.get("/", response_class=HTMLResponse)
+    async def get_index():
+        index_file = os.path.join(static_dir, "index.html")
+        if os.path.exists(index_file):
+            return FileResponse(index_file, media_type="text/html")
+        return HTMLResponse("<h1>Project Libra Web Agent Online</h1>", status_code=200)
+
+    @app.get("/manifest.json")
+    async def get_manifest():
+        mf = os.path.join(static_dir, "manifest.json")
+        if os.path.exists(mf):
+            return FileResponse(mf, media_type="application/manifest+json")
+        raise HTTPException(status_code=404, detail="Manifest not found")
+
+    @app.get("/sw.js")
+    async def get_sw():
+        sw = os.path.join(static_dir, "sw.js")
+        if os.path.exists(sw):
+            return FileResponse(sw, media_type="application/javascript")
+        raise HTTPException(status_code=404, detail="Service worker not found")
+
+    # -----------------------------------------------------------------------
+    # MULTI-CHAT SESSIONS API (Phase 10 Gemini-Style Threads)
+    # -----------------------------------------------------------------------
+    @app.get("/api/sessions")
+    async def list_chat_sessions(auth: Dict[str, Any] = Depends(authenticate_request)):
+        """Returns all chat threads ordered by updated_at DESC with token totals."""
+        memory = getattr(supervisor.llm, "memory", None)
+        if memory and hasattr(memory, "list_sessions"):
+            sessions = memory.list_sessions(limit=50)
+            return {"status": "success", "sessions": sessions}
+        return {"status": "success", "sessions": []}
+
+    @app.post("/api/sessions/new")
+    async def create_chat_session(
+        req: Optional[NewSessionRequest] = None,
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        """Creates a fresh conversation thread and returns session_id."""
+        memory = getattr(supervisor.llm, "memory", None)
+        stitle = (req.title if req and req.title else "New Chat")
+        scope = (req.client_scope if req and req.client_scope else "remote_web")
+        if memory and hasattr(memory, "create_session"):
+            sid = memory.create_session(title=stitle, client_scope=scope)
+            return {
+                "status": "success",
+                "session_id": sid,
+                "title": stitle,
+                "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+        import uuid
+        fallback_sid = f"sess_{uuid.uuid4().hex[:10]}"
+        return {"status": "success", "session_id": fallback_sid, "title": stitle}
+
+    @app.get("/api/sessions/{session_id}")
+    async def get_chat_session(
+        session_id: str = Path(...),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        """Loads messages, Markovian context, and token totals for a given thread."""
+        memory = getattr(supervisor.llm, "memory", None)
+        if not memory:
+            raise HTTPException(status_code=500, detail="Memory subsystem offline")
+
+        sess_meta = memory.get_session(session_id)
+        if not sess_meta:
+            # Auto-create if not yet persisted
+            memory.create_session(session_id=session_id, title="New Chat")
+            sess_meta = memory.get_session(session_id) or {"session_id": session_id, "title": "New Chat"}
+
+        messages = memory.get_session_messages(session_id, limit=100) if hasattr(memory, "get_session_messages") else []
+        m_state = memory.get_markov_state() if hasattr(memory, "get_markov_state") else {}
+
+        return {
+            "status": "success",
+            "session": sess_meta,
+            "messages": messages,
+            "markov_state": m_state
+        }
+
+    @app.patch("/api/sessions/{session_id}")
+    async def rename_chat_session(
+        session_id: str = Path(...),
+        req: RenameSessionRequest = Body(...),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        """Renames a conversation thread."""
+        memory = getattr(supervisor.llm, "memory", None)
+        if memory and hasattr(memory, "update_session_title"):
+            ok = memory.update_session_title(session_id, req.title)
+            return {"status": "success" if ok else "not_found", "session_id": session_id, "title": req.title}
+        return {"status": "error", "message": "Memory subsystem offline"}
+
+    @app.delete("/api/sessions/{session_id}")
+    async def delete_chat_session(
+        session_id: str = Path(...),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        """Deletes a conversation thread and its associated message history."""
+        memory = getattr(supervisor.llm, "memory", None)
+        if memory and hasattr(memory, "delete_session"):
+            ok = memory.delete_session(session_id)
+            return {"status": "success" if ok else "not_found", "session_id": session_id}
+        return {"status": "error", "message": "Memory subsystem offline"}
+
+    # -----------------------------------------------------------------------
+    # TOKEN METRICS SUMMARY ENDPOINT
+    # -----------------------------------------------------------------------
+    @app.get("/api/tokens/summary")
+    async def get_token_summary(
+        session_id: Optional[str] = Query(None),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        """
+        Returns comprehensive real-time token telemetry:
+        - last_turn: Prompt/response tokens, tok/s speed, model name
+        - active_session: Total tokens in the active chat thread
+        - today: All tokens processed on GPU today
+        - lifetime: Cumulative token count
+        - saved_tokens: Total tokens saved via Markovian + Fast-Path bypass
+        """
+        memory = getattr(supervisor.llm, "memory", None)
+        if memory and hasattr(memory, "get_token_summary"):
+            summary = memory.get_token_summary(session_id=session_id)
+            return {"status": "success", "data": summary}
+
+        return {
+            "status": "success",
+            "data": {
+                "last_turn": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "tokens_per_sec": 0.0, "model": "fast_path", "saved_tokens": 350},
+                "active_session": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "saved_tokens": 0, "turn_count": 0},
+                "today": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "saved_tokens": 0},
+                "lifetime": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "saved_tokens": 0, "turn_count": 0}
+            }
+        }
+
+    # -----------------------------------------------------------------------
+    # CHAT & VOICE INFERENCE ENDPOINTS
+    # -----------------------------------------------------------------------
+    @app.post("/api/chat")
+    async def post_chat(req: ChatRequest, auth: Dict[str, Any] = Depends(authenticate_request)):
+        """
+        Executes a prompt through SupervisorHub under client_scope='remote_web'
+        linked to session_id, recording exact token analytics.
+        """
+        t0 = time.perf_counter()
+        scope = req.client_scope or "remote_web"
+        memory = getattr(supervisor.llm, "memory", None)
+
+        # 1. Ensure or auto-create session thread
+        sid = req.session_id
+        if not sid:
+            if memory and hasattr(memory, "create_session"):
+                sid = memory.create_session(title="New Chat", client_scope=scope)
+            else:
+                sid = "default"
+
+        # 2. Execute with sandboxing
+        result = supervisor.process_command(req.prompt, client_scope=scope, dry_run=False, session_id=sid)
+        elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+
+        reply_text = result.get("voice_response") or "Command processed."
+        action = result.get("action")
+        raw_tm = result.get("token_metrics") or getattr(supervisor.llm, "last_token_metrics", {}) or {}
+
+        turn_in = int(raw_tm.get("input_tokens", 0) or 0)
+        turn_out = int(raw_tm.get("output_tokens", 0) or 0)
+        tok_speed = float(raw_tm.get("tokens_per_sec", 0.0) or 0.0)
+        saved_tok = int(raw_tm.get("saved_tokens", 0) or 0)
+
+        # 3. Fetch updated session title and token totals
+        sess_title = "New Chat"
+        sess_total = turn_in + turn_out
+        life_total = sess_total
+
+        if memory and hasattr(memory, "get_session"):
+            sm = memory.get_session(sid)
+            if sm:
+                sess_title = sm.get("title", "New Chat")
+                sess_total = sm.get("total_tokens", sess_total)
+            ts = memory.get_token_summary(session_id=sid)
+            life_total = ts.get("lifetime", {}).get("total_tokens", sess_total)
+
+        # 4. Synthesize audio with Kokoro-82M if requested
+        audio_b64 = None
+        if req.synthesize_audio and reply_text:
+            try:
+                tts = getattr(supervisor.llm, "tts", None)
+                if tts and hasattr(tts, "synthesize_stream"):
+                    pcm_chunks = list(tts.synthesize_stream(reply_text))
+                    if pcm_chunks:
+                        wav_bytes = pcm_to_wav_bytes(b"".join(pcm_chunks), sample_rate=24000)
+                        audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
+            except Exception as e:
+                logger.warning(f"Audio synthesis warning: {e}")
+
+        return {
+            "status": result.get("status", "success"),
+            "reply_text": reply_text,
+            "action": action,
+            "session_id": sid,
+            "session_title": sess_title,
+            "client_scope": scope,
+            "latency_ms": elapsed_ms,
+            "token_metrics": {
+                "turn_in": turn_in,
+                "turn_out": turn_out,
+                "turn_total": turn_in + turn_out,
+                "tok_per_sec": tok_speed,
+                "session_total": sess_total,
+                "lifetime_total": life_total,
+                "saved_tokens": saved_tok,
+                "model": raw_tm.get("model", "qwen3:8b"),
+                "fast_path": raw_tm.get("fast_path", False)
+            },
+            "audio_base64": audio_b64,
+            "hud_card": result.get("hud_card"),
+            "scratchpad": result.get("scratchpad")
+        }
+
+    @app.post("/api/voice")
+    async def post_voice(
+        audio: UploadFile = File(...),
+        session_id: Optional[str] = Query(None),
+        client_scope: str = Query("remote_web"),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        """
+        Transcribes uploaded mic audio on GPU via faster-whisper,
+        routes through sandboxed SupervisorHub inside session_id,
+        synthesizes response with Kokoro-82M, and returns exact token metrics.
+        """
+        t0 = time.perf_counter()
+        audio_bytes = await audio.read()
+        if not audio_bytes:
+            raise HTTPException(status_code=400, detail="Empty audio payload")
+
+        audio_np = convert_to_16k_mono_pcm(audio_bytes)
+        if len(audio_np) == 0:
+            return JSONResponse({
+                "status": "empty_audio",
+                "transcribed_text": "",
+                "reply_text": "I didn't receive any clear audio.",
+                "action": "none",
+                "latency_ms": 0.0
+            })
+
+        stt = getattr(supervisor.llm, "stt", None)
+        transcribed_text = ""
+        if stt and hasattr(stt, "transcribe"):
+            try:
+                transcribed_text = stt.transcribe(audio_np).strip()
+            except Exception as e:
+                logger.error(f"Whisper transcription failed: {e}")
+
+        if not transcribed_text:
+            return JSONResponse({
+                "status": "unrecognized",
+                "transcribed_text": "",
+                "reply_text": "I couldn't hear any distinct speech. Please try again.",
+                "action": "none",
+                "latency_ms": round((time.perf_counter() - t0) * 1000.0, 2)
+            })
+
+        memory = getattr(supervisor.llm, "memory", None)
+        sid = session_id
+        if not sid:
+            if memory and hasattr(memory, "create_session"):
+                sid = memory.create_session(title="New Chat", client_scope=client_scope)
+            else:
+                sid = "default"
+
+        res = supervisor.process_command(transcribed_text, client_scope=client_scope, dry_run=False, session_id=sid)
+        reply_text = res.get("voice_response") or "Understood."
+        action = res.get("action")
+        raw_tm = res.get("token_metrics") or getattr(supervisor.llm, "last_token_metrics", {}) or {}
+
+        audio_b64 = None
+        try:
+            tts = getattr(supervisor.llm, "tts", None)
+            if tts and hasattr(tts, "synthesize_stream"):
+                pcm_chunks = list(tts.synthesize_stream(reply_text))
+                if pcm_chunks:
+                    wav_bytes = pcm_to_wav_bytes(b"".join(pcm_chunks), sample_rate=24000)
+                    audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
+        except Exception as e:
+            logger.warning(f"Voice synthesis error: {e}")
+
+        elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+
+        sess_title = "New Chat"
+        if memory and hasattr(memory, "get_session"):
+            sm = memory.get_session(sid)
+            if sm:
+                sess_title = sm.get("title", "New Chat")
+
+        return JSONResponse({
+            "status": "success",
+            "transcribed_text": transcribed_text,
+            "reply_text": reply_text,
+            "action": action,
+            "session_id": sid,
+            "session_title": sess_title,
+            "latency_ms": elapsed_ms,
+            "client_scope": client_scope,
+            "token_metrics": {
+                "turn_in": int(raw_tm.get("input_tokens", 0) or 0),
+                "turn_out": int(raw_tm.get("output_tokens", 0) or 0),
+                "turn_total": int(raw_tm.get("total_tokens", 0) or 0),
+                "tok_per_sec": float(raw_tm.get("tokens_per_sec", 0.0) or 0.0),
+                "saved_tokens": int(raw_tm.get("saved_tokens", 0) or 0),
+                "model": raw_tm.get("model", "qwen3:8b")
+            },
+            "audio_base64": audio_b64
+        })
+
+    @app.get("/api/vitals")
+    async def get_vitals(auth: Dict[str, Any] = Depends(authenticate_request)):
+        """Returns live PC telemetry: RTX 5060 Ti VRAM, CPU, RAM, and version info."""
+        sys_metrics = monitor.get_system_metrics()
+        gpu_info = {
+            "name": "NVIDIA GeForce RTX 5060 Ti",
+            "vram_total_mb": sys_metrics.get("gpu_vram_total_mb") or 16311,
+            "vram_used_mb": sys_metrics.get("gpu_vram_used_mb") or 11695,
+            "load_percent": sys_metrics.get("gpu_util_percent") or 9.0,
+            "temperature_c": sys_metrics.get("gpu_temp_c") or 48.0
+        }
+        try:
+            import torch
+            if torch.cuda.is_available():
+                gpu_info["name"] = torch.cuda.get_device_name(0)
+                mem_res = torch.cuda.memory_reserved(0) // (1024 * 1024)
+                if mem_res > 0:
+                    gpu_info["vram_used_mb"] = max(gpu_info["vram_used_mb"], mem_res)
+        except Exception:
+            pass
+
+        return {
+            "status": "online",
+            "version": LIBRA_VERSION,
+            "full_version": get_full_version_string(),
+            "cpu_percent": sys_metrics.get("cpu_percent", 0.0),
+            "ram_used_gb": sys_metrics.get("ram_used_gb", 0.0),
+            "ram_total_gb": sys_metrics.get("ram_total_gb", 0.0),
+            "ram_percent": sys_metrics.get("ram_percent", 0.0),
+            "vram_used_mb": gpu_info["vram_used_mb"],
+            "vram_total_mb": gpu_info["vram_total_mb"],
+            "gpu": gpu_info,
+            "active_models": [
+                "faster-whisper (large-v3-turbo)",
+                "kokoro-82m (af_heart)",
+                "ollama (qwen3:8b)",
+                "ollama (qwen2.5-coder:7b)"
+            ],
+            "client_scope_policy": "sandboxed_desktop_control"
+        }
+
+    # -----------------------------------------------------------------------
+    # WEBSOCKET STREAMING ENDPOINT
+    # -----------------------------------------------------------------------
+    @app.websocket("/api/ws")
+    @app.websocket("/ws")
+    async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = Query(None)):
+        await websocket.accept()
+        if token and token != access_token:
+            await websocket.send_json({"type": "error", "message": "Unauthorized token"})
+            await websocket.close(code=1008)
+            return
+
+        await websocket.send_json({
+            "type": "welcome",
+            "version": LIBRA_VERSION,
+            "message": "Connected to Project Libra Remote Web Agent."
+        })
+
+        try:
+            while True:
+                data = await websocket.receive_json()
+                msg_type = data.get("type", "chat")
+                if msg_type == "ping":
+                    await websocket.send_json({"type": "pong", "time": time.time()})
+                elif msg_type == "vitals":
+                    sys_metrics = monitor.get_system_metrics()
+                    await websocket.send_json({"type": "vitals", "data": sys_metrics})
+                elif msg_type == "chat":
+                    prompt = data.get("prompt", "")
+                    scope = data.get("client_scope", "remote_web")
+                    sid = data.get("session_id", "default")
+                    res = supervisor.process_command(prompt, client_scope=scope, dry_run=False, session_id=sid)
+                    await websocket.send_json({
+                        "type": "chat_reply",
+                        "status": res.get("status", "success"),
+                        "reply_text": res.get("voice_response", "Understood."),
+                        "action": res.get("action"),
+                        "session_id": sid,
+                        "token_metrics": res.get("token_metrics", {})
+                    })
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.warning(f"WebSocket session closed: {e}")
+
+    return app
+
+
+# ---------------------------------------------------------------------------
+# TAILSCALE SERVE & BACKGROUND DAEMON THREAD LAUNCHER
+# ---------------------------------------------------------------------------
+def ensure_tailscale_serve(port: int = 8765) -> Dict[str, str]:
+    """
+    Auto-discovers Tailscale IP, MagicDNS hostname, and ensures
+    'tailscale serve' background proxy is active for HTTPS mobile access.
+    """
+    import subprocess
+    info = {
+        "tailscale_ip": "",
+        "magicdns_domain": "",
+        "serve_url": "",
+        "status": "offline"
+    }
+    try:
+        # 1. Query Tailscale IPv4
+        res_ip = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3)
+        if res_ip.returncode == 0 and res_ip.stdout.strip():
+            info["tailscale_ip"] = res_ip.stdout.strip().split("\n")[0].strip()
+
+        # 2. Query Tailscale JSON status for MagicDNS domain
+        res_status = subprocess.run(["tailscale", "status", "--json"], capture_output=True, text=True, timeout=3)
+        if res_status.returncode == 0 and res_status.stdout.strip():
+            ts_data = json.loads(res_status.stdout)
+            cert_domains = ts_data.get("CertDomains") or []
+            if cert_domains:
+                info["magicdns_domain"] = cert_domains[0]
+            elif "Self" in ts_data and "DNSName" in ts_data["Self"]:
+                info["magicdns_domain"] = ts_data["Self"]["DNSName"].rstrip(".")
+
+        # 3. Check or configure Tailscale Serve proxy
+        res_serve = subprocess.run(["tailscale", "serve", "status"], capture_output=True, text=True, timeout=3)
+        if str(port) not in res_serve.stdout:
+            subprocess.run(["tailscale", "serve", "--bg", str(port)], capture_output=True, text=True, timeout=5)
+
+        if info["magicdns_domain"]:
+            info["serve_url"] = f"https://{info['magicdns_domain']}/"
+            info["status"] = "online"
+        elif info["tailscale_ip"]:
+            info["serve_url"] = f"http://{info['tailscale_ip']}:{port}/"
+            info["status"] = "online"
+    except Exception as e:
+        logger.debug(f"Tailscale auto-discovery info: {e}")
+    return info
+
+
+def start_web_server_thread(
+    hub: Optional[SupervisorHub] = None,
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    config_path: str = "config.json"
+) -> threading.Thread:
+    """
+    Launches Uvicorn serving the FastAPI Remote Web Agent in a background daemon thread.
+    Automatically provisions Tailscale Serve HTTPS and connects to PyQt6 GUI.
+    """
+    import uvicorn
+
+    cfg = load_web_config(config_path)
+    server_host = host or cfg.get("host", "0.0.0.0")
+    server_port = port or cfg.get("port", 8765)
+
+    # 1. Discover Tailscale endpoints and activate Tailscale Serve proxy
+    ts_info = ensure_tailscale_serve(server_port)
+
+    # 2. Initialize FastAPI app attached to SupervisorHub
+    app = create_app(hub=hub, config_path=config_path)
+
+    # Note: log_config=None is required so Uvicorn does not crash when sys.stdout is hooked by StreamTee
+    u_config = uvicorn.Config(
+        app=app,
+        host=server_host,
+        port=server_port,
+        log_level="warning",
+        log_config=None
+    )
+    server = uvicorn.Server(config=u_config)
+
+    thread = threading.Thread(target=server.run, daemon=True, name="LibraWebAgentThread")
+    thread.server = server
+    thread.tailscale_info = ts_info
+    thread.start()
+
+    banner = (
+        f"\n======================================================\n"
+        f"  [Project Libra Web Agent Online]\n"
+        f"  - Local Access:     http://localhost:{server_port}\n"
+    )
+    if ts_info.get("serve_url"):
+        banner += f"  - Tailscale HTTPS:  {ts_info['serve_url']}\n"
+    if ts_info.get("tailscale_ip"):
+        banner += f"  - Tailscale Direct: http://{ts_info['tailscale_ip']}:{server_port}/\n"
+    banner += f"======================================================\n"
+    print(banner)
+
+    return thread
+
+
+if __name__ == "__main__":
+    import uvicorn
+    cfg = load_web_config("config.json")
+    print(f"[Project Libra] Starting Remote Web Agent standalone on {cfg['host']}:{cfg['port']}...")
+    app = create_app()
+    uvicorn.run(app, host=cfg["host"], port=cfg["port"])

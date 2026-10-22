@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <title>Project Libra // Remote Web Agent</title>
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#030708">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="icon" type="image/png" href="/static/icon.png">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/three.min.js"></script>
+</head>
+<body>
+  <div id="app-layout">
+    <!-- BACKDROP SCRIM FOR MOBILE DRAWER -->
+    <div id="drawer-backdrop"></div>
+
+    <!-- GEMINI-STYLE LEFT DRAWER (SIDEBAR) -->
+    <aside id="drawer">
+      <div class="drawer-header">
+        <div class="drawer-branding">
+          <span class="brand-title">LIBRA AI</span>
+          <button id="close-drawer-btn" class="close-drawer-btn" title="Close Drawer">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="18" y1="6" x2="6" y2="18"/>
+              <line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
+        <button id="new-chat-btn" class="new-chat-btn">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <line x1="12" y1="5" x2="12" y2="19"/>
+            <line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          <span>New Chat</span>
+        </button>
+      </div>
+
+      <!-- SESSION THREAD LIST -->
+      <div id="session-list" class="session-list-section">
+        <!-- Injected dynamically by app.js -->
+      </div>
+
+      <div class="drawer-footer">
+        <span>V10.2.0</span>
+        <span class="scope-pill">REMOTE WEB</span>
+      </div>
+    </aside>
+
+    <!-- MAIN CHAT STAGE -->
+    <div id="main-stage">
+      <!-- TOP HEADER -->
+      <header>
+        <div class="header-left">
+          <button id="drawer-toggle-btn" class="drawer-toggle-btn" title="Toggle Threads">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="3" y1="12" x2="21" y2="12"/>
+              <line x1="3" y1="6" x2="21" y2="6"/>
+              <line x1="3" y1="18" x2="21" y2="18"/>
+            </svg>
+          </button>
+          <span id="active-thread-title" class="active-thread-title">Main Chat</span>
+          <span class="scope-pill">ONLINE</span>
+        </div>
+
+        <div class="header-right">
+          <!-- TOKEN TELEMETRY HUD BUTTON -->
+          <button id="token-hud-btn" class="token-hud-btn" title="View Real-Time GPU Token Telemetry">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+            </svg>
+            <span id="token-hud-text">TOKENS: 0</span>
+          </button>
+
+          <!-- HARDWARE VITALS -->
+          <div class="vitals-pill" id="vitals-container">
+            <div class="vitals-dot"></div>
+            <span id="vitals-text">RTX 5060 Ti | CONNECTING...</span>
+          </div>
+        </div>
+      </header>
+
+      <!-- 3D CYBERNETIC ORB DISPLAY -->
+      <section id="orb-section">
+        <canvas id="orb-canvas"></canvas>
+        <div class="orb-status-text" id="orb-status">STANDBY // READY</div>
+      </section>
+
+      <!-- CHAT MESSAGE STAGE -->
+      <main id="chat-container">
+        <!-- Dynamically populated by switchSession() -->
+      </main>
+
+      <!-- AUDIO ELEMENT FOR KOKORO TTS PLAYBACK -->
+      <audio id="remote-audio" preload="auto"></audio>
+
+      <!-- INPUT BAR -->
+      <footer id="input-bar">
+        <button id="mic-btn" title="Tap to Record Voice">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+            <line x1="12" y1="19" x2="12" y2="23"/>
+            <line x1="8" y1="23" x2="16" y2="23"/>
+          </svg>
+        </button>
+        <input type="text" id="prompt-input" placeholder="Type a message or tap mic..." autocomplete="off">
+        <button id="send-btn" title="Send Message">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <line x1="22" y1="2" x2="11" y2="13"/>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+          </svg>
+        </button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       MODAL: TOKEN TELEMETRY HUD BREAKDOWN (PHASE 10)
+       ======================================================================== -->
+  <div id="token-modal" class="modal-overlay">
+    <div class="modal-content">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
+          </svg>
+          <span>GPU TOKEN TELEMETRY</span>
+        </div>
+        <button id="close-token-modal" class="modal-close-btn" title="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="modal-body">
+        <div class="token-grid">
+          <!-- CARD 1: LAST TURN SPEED -->
+          <div class="token-card highlight">
+            <div class="token-card-header">LAST TURN SPEED</div>
+            <div id="tok-last-speed" class="token-card-value">0.0 t/s</div>
+            <div id="tok-last-counts" class="token-card-sub">In: 0 | Out: 0</div>
+            <div id="tok-last-model" class="token-card-sub" style="color: var(--neon-cyan);">qwen3:8b</div>
+          </div>
+
+          <!-- CARD 2: ACTIVE THREAD TOTAL -->
+          <div class="token-card">
+            <div class="token-card-header">ACTIVE THREAD</div>
+            <div id="tok-sess-total" class="token-card-value">0</div>
+            <div id="tok-sess-breakdown" class="token-card-sub">Prompt: 0 | Eval: 0</div>
+            <div id="tok-sess-turns" class="token-card-sub">Turns: 0</div>
+          </div>
+
+          <!-- CARD 3: TODAY'S TOTAL -->
+          <div class="token-card">
+            <div class="token-card-header">TODAY (GPU)</div>
+            <div id="tok-today-total" class="token-card-value">0</div>
+            <div id="tok-today-breakdown" class="token-card-sub">In: 0 | Out: 0</div>
+          </div>
+
+          <!-- CARD 4: LIFETIME SAVED TOKENS (MARKOVIAN + FAST-PATH) -->
+          <div class="token-card savings">
+            <div class="token-card-header">TOKENS SAVED (MARKOVIAN + FAST-PATH)</div>
+            <div id="tok-saved-total" class="token-card-value">⚡ 0</div>
+            <div id="tok-saved-desc" class="token-card-sub">
+              Bypassed via Markovian H-MEM context window &amp; Fast-Path PreAct macros
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       MODAL: AUTHENTICATION (TAILSCALE / ACCESS TOKEN)
+       ======================================================================== -->
+  <div id="auth-modal" class="modal-overlay">
+    <div class="modal-content">
+      <div class="auth-title">AUTHENTICATION REQUIRED</div>
+      <p class="auth-desc">
+        Connect to your Home PC using your authorized Tailscale identity or enter your Libra Access Token.
+      </p>
+      <input type="password" id="token-input" class="auth-input" placeholder="Enter Access Token...">
+      <button id="save-token-btn" class="auth-btn">CONNECT</button>
+    </div>
+  </div>
+
+  <!-- MAIN SCRIPT -->
+  <script src="/static/app.js"></script>
+</body>
+</html>

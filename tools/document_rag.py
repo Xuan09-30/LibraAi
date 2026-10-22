@@ -37,6 +37,14 @@ import requests
 from tools.file_manager import FileManager
 from tools.security_scanner import SecurityScanner
 
+try:
+    from flashrank import Ranker, RerankRequest
+    FLASHRANK_AVAILABLE = True
+except ImportError:
+    Ranker = None
+    RerankRequest = None
+    FLASHRANK_AVAILABLE = False
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
@@ -55,13 +63,22 @@ class DocumentRAGEngine:
         file_mgr: Optional[FileManager] = None,
         ollama_base_url: str = "http://localhost:11434",
         embed_model: str = "nomic-embed-text",
-        dim: int = 768
+        dim: int = 768,
+        db_path: Optional[str] = None
     ):
+        if db_path is not None:
+            db_filename = db_path
         self.file_mgr = file_mgr if file_mgr is not None else FileManager()
         self.security_scanner = SecurityScanner(file_mgr=self.file_mgr)
         self.ollama_base_url = ollama_base_url.rstrip("/")
         self.embed_model = embed_model
         self.dim = dim
+        self.ranker = None
+        if FLASHRANK_AVAILABLE:
+            try:
+                self.ranker = Ranker(model_name="ms-marco-MiniLM-L-12-v2", cache_dir=os.path.join(PROJECT_ROOT, "assets", "flashrank_cache"))
+            except Exception:
+                self.ranker = None
 
         if db_filename == ":memory:":
             self.db_path = ":memory:"
@@ -133,6 +150,19 @@ class DocumentRAGEngine:
                 """)
             except Exception as e:
                 print(f"[DocumentRAG vec0 Virtual Table Init Warning]: {e}")
+
+        # FTS5 Full-Text Search Table for Hybrid RAG (Phase 4)
+        try:
+            cursor.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
+                    chunk_id UNINDEXED,
+                    doc_id UNINDEXED,
+                    content,
+                    tokenize = 'porter unicode61'
+                )
+            """)
+        except Exception as e:
+            print(f"[DocumentRAG FTS5 Init Warning]: {e}")
 
         conn.commit()
         if self.db_path != ":memory:":
@@ -276,6 +306,10 @@ class DocumentRAGEngine:
             cursor.execute("SELECT id FROM chunks WHERE doc_id = ?", (doc_id,))
             old_chunk_ids = [r[0] for r in cursor.fetchall()]
             cursor.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+            try:
+                cursor.execute("DELETE FROM fts_chunks WHERE doc_id = ?", (doc_id,))
+            except Exception:
+                pass
             if SQLITE_VEC_AVAILABLE and old_chunk_ids:
                 for cid in old_chunk_ids:
                     try:
@@ -304,13 +338,21 @@ class DocumentRAGEngine:
                 "chunk_count": 0
             }
 
-        # Store chunks and vector embeddings
+        # Store chunks and vector embeddings + FTS5 index
         for idx, chunk_content in enumerate(chunks):
             cursor.execute(
                 "INSERT INTO chunks (doc_id, chunk_idx, content) VALUES (?, ?, ?)",
                 (doc_id, idx, chunk_content)
             )
             chunk_id = cursor.lastrowid
+
+            try:
+                cursor.execute(
+                    "INSERT INTO fts_chunks (chunk_id, doc_id, content) VALUES (?, ?, ?)",
+                    (chunk_id, doc_id, chunk_content)
+                )
+            except Exception:
+                pass
 
             if not dry_run and SQLITE_VEC_AVAILABLE:
                 emb = self.embed_text(chunk_content)
@@ -338,90 +380,146 @@ class DocumentRAGEngine:
 
     def search_relevant_chunks(
         self,
-        doc_id: int,
-        query: str,
+        doc_id: Any = None,
+        query: Optional[str] = None,
         top_k: int = 3,
         dry_run: bool = False
     ) -> List[str]:
-        """Returns top matching chunks for query from the given document."""
+        """
+        Hybrid SQLite RAG (Phase 4):
+        FTS5 BM25 keyword matching + sqlite-vec vector KNN combined via Reciprocal Rank Fusion (RRF),
+        followed by FlashRank cross-encoder reranking (Phase 9).
+        """
+        if isinstance(doc_id, str) and query is None:
+            query = doc_id
+            doc_id = None
+        elif isinstance(doc_id, str) and isinstance(query, (int, type(None))):
+            doc_id, query = query, doc_id
+
+        if not query:
+            return []
+
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        # If dry run or sqlite-vec unavailable, use keyword-based scoring over chunks
-        if dry_run or not SQLITE_VEC_AVAILABLE:
-            cursor.execute("SELECT content FROM chunks WHERE doc_id = ? ORDER BY chunk_idx ASC", (doc_id,))
-            rows = cursor.fetchall()
+        fts_results: List[Tuple[int, str]] = []  # (chunk_id, content)
+        vec_results: List[Tuple[int, str]] = []  # (chunk_id, content)
+
+        # 1. FTS5 BM25 Keyword Search
+        try:
+            tokens = [re.sub(r"[^\w]", "", t) for t in query.split() if len(t) >= 2]
+            if tokens:
+                fts_query = " OR ".join(tokens[:10])
+                if doc_id is not None:
+                    cursor.execute("""
+                        SELECT c.id, c.content
+                        FROM fts_chunks f
+                        JOIN chunks c ON f.chunk_id = c.id
+                        WHERE f.doc_id = ? AND fts_chunks MATCH ?
+                        ORDER BY rank
+                        LIMIT 15
+                    """, (doc_id, fts_query))
+                else:
+                    cursor.execute("""
+                        SELECT c.id, c.content
+                        FROM fts_chunks f
+                        JOIN chunks c ON f.chunk_id = c.id
+                        WHERE fts_chunks MATCH ?
+                        ORDER BY rank
+                        LIMIT 15
+                    """, (fts_query,))
+                fts_results = [(r[0], r[1]) for r in cursor.fetchall()]
+        except Exception:
+            pass
+
+        # 2. Vector Semantic KNN Search
+        if not dry_run and SQLITE_VEC_AVAILABLE:
+            query_emb = self.embed_text(query)
+            if any(query_emb):
+                try:
+                    if doc_id is not None:
+                        cursor.execute("""
+                            SELECT c.id, c.content, v.distance
+                            FROM vec_chunks v
+                            JOIN chunks c ON v.chunk_id = c.id
+                            WHERE c.doc_id = ? AND v.embedding MATCH ? AND k = 15
+                            ORDER BY v.distance ASC
+                        """, (doc_id, sqlite_vec.serialize_float32(query_emb)))
+                    else:
+                        cursor.execute("""
+                            SELECT c.id, c.content, v.distance
+                            FROM vec_chunks v
+                            JOIN chunks c ON v.chunk_id = c.id
+                            WHERE v.embedding MATCH ? AND k = 15
+                            ORDER BY v.distance ASC
+                        """, (sqlite_vec.serialize_float32(query_emb),))
+                    vec_results = [(r[0], r[1]) for r in cursor.fetchall()]
+                except Exception:
+                    pass
+
+        # If neither yielded results, fallback to sequential or lexical chunk scan
+        if not fts_results and not vec_results:
+            if doc_id is not None:
+                cursor.execute("SELECT id, content FROM chunks WHERE doc_id = ? ORDER BY chunk_idx ASC", (doc_id,))
+            else:
+                cursor.execute("SELECT id, content FROM chunks ORDER BY chunk_idx ASC LIMIT 20")
+            all_rows = cursor.fetchall()
             if self.db_path != ":memory:":
                 conn.close()
-            if not rows:
+            if not all_rows:
                 return []
-            all_chunks = [r[0] for r in rows]
 
-            # Fast lexical relevance match
-            query_lower = query.lower()
-            is_overview = any(w in query_lower for w in ["inside", "summary", "summarize", "explain", "overview", "what is this", "what's this", "what is in", "about", "content"])
-            query_terms = set(re.findall(r"\w+", query_lower)) - {"what", "is", "in", "the", "this", "file", "document", "to", "me", "mw", "and", "a", "an", "for"}
+            q_terms = set(re.findall(r"\w+", query.lower())) - {"what", "is", "in", "the", "this", "file", "document", "to", "and", "a"}
             scored = []
-            for ch in all_chunks:
-                ch_terms = set(re.findall(r"\w+", ch.lower()))
-                overlap = len(query_terms.intersection(ch_terms))
+            for cid, ch in all_rows:
+                overlap = len(q_terms.intersection(set(re.findall(r"\w+", ch.lower()))))
                 scored.append((overlap, ch))
             scored.sort(key=lambda x: x[0], reverse=True)
+            return [x[1] for x in scored[:top_k]]
 
-            results = []
-            if is_overview and all_chunks:
-                results.append(all_chunks[0])
-            for item in scored:
-                if item[1] not in results:
-                    results.append(item[1])
-                if len(results) >= top_k:
-                    break
-            return results[:top_k]
-
-        # Vector semantic KNN search via vec_chunks
-        query_emb = self.embed_text(query)
-        if not any(query_emb):
-            cursor.execute("SELECT content FROM chunks WHERE doc_id = ? ORDER BY chunk_idx ASC LIMIT ?", (doc_id, top_k))
-            rows = cursor.fetchall()
-            if self.db_path != ":memory:":
-                conn.close()
-            return [r[0] for r in rows]
-
-        try:
-            cursor.execute(f"""
-                SELECT c.content, v.distance
-                FROM vec_chunks v
-                JOIN chunks c ON v.chunk_id = c.id
-                WHERE c.doc_id = ? AND v.embedding MATCH ? AND k = ?
-                ORDER BY v.distance ASC
-            """, (doc_id, sqlite_vec.serialize_float32(query_emb), top_k))
-            rows = cursor.fetchall()
-            if self.db_path != ":memory:":
-                conn.close()
-            if rows:
-                results = [r[0] for r in rows]
-                # If overview question, ensure first chunk is present
-                query_lower = query.lower()
-                is_overview = any(w in query_lower for w in ["inside", "summary", "summarize", "explain", "overview", "what is this", "what's this", "what is in", "about", "content"])
-                if is_overview:
-                    conn2 = self._get_connection()
-                    c2 = conn2.cursor()
-                    c2.execute("SELECT content FROM chunks WHERE doc_id = ? ORDER BY chunk_idx ASC LIMIT 1", (doc_id,))
-                    first_row = c2.fetchone()
-                    if self.db_path != ":memory:":
-                        conn2.close()
-                    if first_row and first_row[0] not in results:
-                        results = [first_row[0]] + results[:top_k - 1]
-                return results[:top_k]
-        except Exception as e:
-            print(f"[DocumentRAG KNN Error]: {e}")
-
-        # Fallback to initial chunks if vector query fails
-        cursor.execute("SELECT content FROM chunks WHERE doc_id = ? ORDER BY chunk_idx ASC LIMIT ?", (doc_id, top_k))
-        rows = cursor.fetchall()
         if self.db_path != ":memory:":
             conn.close()
-        return [r[0] for r in rows]
+
+        # 3. Reciprocal Rank Fusion (RRF)
+        # Score(d) = sum( 1.0 / (60 + rank_i) )
+        rrf_scores: Dict[int, float] = {}
+        chunk_map: Dict[int, str] = {}
+
+        for rank, (cid, content) in enumerate(fts_results, start=1):
+            rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (60.0 + rank))
+            chunk_map[cid] = content
+
+        for rank, (cid, content) in enumerate(vec_results, start=1):
+            rrf_scores[cid] = rrf_scores.get(cid, 0.0) + (1.0 / (60.0 + rank))
+            chunk_map[cid] = content
+
+        sorted_cids = sorted(rrf_scores.keys(), key=lambda cid: rrf_scores[cid], reverse=True)
+        rrf_passages = [chunk_map[cid] for cid in sorted_cids[:15]]
+
+        # Overview query handling: ensure beginning chunk is included if relevant
+        query_lower = query.lower()
+        is_overview = any(w in query_lower for w in ["inside", "summary", "summarize", "explain", "overview", "what is this", "what's this", "what is in", "about", "content"])
+        if is_overview:
+            conn2 = self._get_connection()
+            c2 = conn2.cursor()
+            c2.execute("SELECT content FROM chunks WHERE doc_id = ? ORDER BY chunk_idx ASC LIMIT 1", (doc_id,))
+            first_row = c2.fetchone()
+            if self.db_path != ":memory:":
+                conn2.close()
+            if first_row and first_row[0] not in rrf_passages:
+                rrf_passages = [first_row[0]] + rrf_passages
+
+        # 4. FlashRank Cross-Encoder Reranker (Phase 9)
+        if FLASHRANK_AVAILABLE and self.ranker is not None and len(rrf_passages) > 1:
+            try:
+                passages_payload = [{"id": i, "text": p} for i, p in enumerate(rrf_passages[:12])]
+                req = RerankRequest(query=query, passages=passages_payload)
+                reranked = self.ranker.rerank(req)
+                return [p["text"] for p in reranked[:top_k]]
+            except Exception as e:
+                print(f"[DocumentRAG FlashRank Warning]: {e}")
+
+        return rrf_passages[:top_k]
 
     def query_document(
         self,

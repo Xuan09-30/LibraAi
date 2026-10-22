@@ -1,7 +1,8 @@
+import os
 import collections
 import threading
 import numpy as np
-from typing import Optional
+from typing import Optional, Dict, Any
 
 try:
     import pyaudio
@@ -9,6 +10,12 @@ try:
 except ImportError:
     pyaudio = None
     PYAUDIO_AVAILABLE = False
+
+try:
+    from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
+    PYCAW_AVAILABLE = True
+except (ImportError, Exception):
+    PYCAW_AVAILABLE = False
 
 
 class WASAPIAudioCapture:
@@ -204,3 +211,90 @@ def get_dynamic_chime_pcm(cached_chime_bytes: bytes, base_gain: float = 0.35) ->
     adjusted_gain = base_gain * (0.5 + 0.5 * (1.0 - master_vol * 0.4))
 
     return scale_pcm_amplitude(cached_chime_bytes, gain=adjusted_gain)
+
+
+class AudioDucker:
+    """
+    Native Windows Core Audio API wrapper (WASAPI per-app session ducking) (Phase 7).
+    When Wake Word triggers or Kokoro TTS speaks, automatically ducks third-party
+    media and game audio sessions (e.g. Spotify, Chrome, Discord, games) to 20%,
+    while keeping Project Libra's own process audio at 100%, and smoothly restoring volumes.
+    """
+
+    def __init__(self):
+        self._saved_volumes: Dict[int, float] = {}
+        self._is_ducked = False
+        self._lock = threading.Lock()
+
+    def duck_background_audio(self, target_level: float = 0.20) -> int:
+        """
+        Ducks non-Libra audio sessions down to target_level (default 20%).
+        Returns the number of ducked application sessions.
+        """
+        if not PYCAW_AVAILABLE:
+            return 0
+
+        current_pid = os.getpid()
+        ducked_count = 0
+
+        with self._lock:
+            try:
+                sessions = AudioUtilities.GetAllSessions()
+                for session in sessions:
+                    proc = session.Process
+                    if not proc or proc.pid == current_pid:
+                        continue
+                    pname = (proc.name() or "").lower()
+                    if pname in ["system", "idle", "audiodg.exe"]:
+                        continue
+
+                    try:
+                        volume = session._ctl.QueryInterface(ISimpleAudioVolume)
+                        curr_vol = float(volume.GetMasterVolume())
+                        if session.ProcessId not in self._saved_volumes:
+                            self._saved_volumes[session.ProcessId] = curr_vol
+                        if curr_vol > target_level:
+                            volume.SetMasterVolume(target_level, None)
+                            ducked_count += 1
+                    except Exception:
+                        continue
+                self._is_ducked = True
+                return ducked_count
+            except Exception as e:
+                print(f"[AudioDucker Warning]: {e}")
+                return 0
+
+    def restore_background_audio(self) -> int:
+        """Restores previously ducked application volumes to their original levels."""
+        if not PYCAW_AVAILABLE:
+            return 0
+
+        restored_count = 0
+        with self._lock:
+            if not self._saved_volumes:
+                self._is_ducked = False
+                return 0
+
+            try:
+                sessions = AudioUtilities.GetAllSessions()
+                for session in sessions:
+                    pid = session.ProcessId
+                    if pid in self._saved_volumes:
+                        orig_vol = self._saved_volumes[pid]
+                        try:
+                            volume = session._ctl.QueryInterface(ISimpleAudioVolume)
+                            volume.SetMasterVolume(orig_vol, None)
+                            restored_count += 1
+                        except Exception:
+                            pass
+                self._saved_volumes.clear()
+                self._is_ducked = False
+                return restored_count
+            except Exception as e:
+                print(f"[AudioDucker Restore Warning]: {e}")
+                self._saved_volumes.clear()
+                self._is_ducked = False
+                return 0
+
+
+audio_ducker = AudioDucker()

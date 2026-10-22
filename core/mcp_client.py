@@ -30,6 +30,7 @@ class LibraMCPClient:
         self.config_path = config_path if config_path else DEFAULT_MCP_CONFIG
         self.servers: Dict[str, Dict[str, Any]] = {}
         self.tool_registry: Dict[str, Dict[str, Any]] = {}
+        self.dynamic_tools: Dict[str, Any] = {}
         self.load_config()
 
     def load_config(self) -> Dict[str, Any]:
@@ -174,3 +175,57 @@ class LibraMCPClient:
                 "tool": tool_name,
                 "error": str(e)
             }
+
+    def register_dynamic_tool(
+        self,
+        name: str,
+        handler: Any,
+        description: str = "",
+        input_schema: Optional[Dict[str, Any]] = None
+    ):
+        """Registers a dynamic Python tool callable directly into the MCP ecosystem."""
+        self.dynamic_tools[name] = {
+            "handler": handler,
+            "description": description,
+            "inputSchema": input_schema or {}
+        }
+        self.tool_registry[f"dynamic.{name}"] = {
+            "server": "dynamic",
+            "name": name,
+            "enabled": True,
+            "description": description,
+            "inputSchema": input_schema or {}
+        }
+
+    def call_tool(
+        self,
+        qualified_tool_name: str,
+        arguments: Optional[Dict[str, Any]] = None,
+        dry_run: bool = False
+    ) -> Dict[str, Any]:
+        """Universal entry point to execute either dynamic tools or configured MCP server tools."""
+        args = arguments or {}
+        if qualified_tool_name in self.dynamic_tools:
+            if dry_run:
+                return {"status": "success", "tool": qualified_tool_name, "dry_run": True}
+            try:
+                res = self.dynamic_tools[qualified_tool_name]["handler"](**args)
+                return {"status": "success", "tool": qualified_tool_name, "result": res}
+            except Exception as e:
+                return {"status": "error", "tool": qualified_tool_name, "error": str(e)}
+
+        if "." in qualified_tool_name:
+            server_name, tool_name = qualified_tool_name.split(".", 1)
+            return self.call_mcp_tool(server_name, tool_name, arguments=args, dry_run=dry_run)
+
+        # Lookup in registry
+        for full_name, tinfo in self.tool_registry.items():
+            if tinfo["name"] == qualified_tool_name:
+                return self.call_mcp_tool(tinfo["server"], tinfo["name"], arguments=args, dry_run=dry_run)
+
+        return {"status": "error", "error": f"Tool '{qualified_tool_name}' not found in MCP registry."}
+
+
+# FastMCP / Dynamic Extension Alias (Phase 6)
+FastMCPClient = LibraMCPClient
+

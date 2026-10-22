@@ -8,6 +8,60 @@ from typing import Optional, Dict, Any, List
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
+class EverythingSearchEngine:
+    """
+    Sub-5ms System-Wide File Discovery via voidtools Everything CLI (es.exe) (Phase 7).
+    Queries NTFS Master File Table (MFT) directly: `es.exe -n 20 -sort date-modified-descending <query>`.
+    Falls back gracefully to fast scandir/pathlib searching when es.exe is absent.
+    """
+    def __init__(self, es_bin: Optional[str] = None):
+        self.es_bin = es_bin
+
+    def search(self, query: str, max_results: int = 20, sort_by_date: bool = True) -> List[str]:
+        clean_q = (query or "").strip()
+        if not clean_q:
+            return []
+
+        if self.es_bin and os.path.isfile(self.es_bin):
+            try:
+                cmd = [self.es_bin, "-n", str(max_results)]
+                if sort_by_date:
+                    cmd.extend(["-sort", "date-modified-descending"])
+                cmd.append(clean_q)
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3)
+                if res.returncode == 0:
+                    lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
+                    valid_paths = [p for p in lines if os.path.exists(p)]
+                    if valid_paths:
+                        return valid_paths[:max_results]
+            except Exception as e:
+                print(f"[EverythingSearchEngine Warning]: {e}")
+
+        # Fallback: fast search in standard User and Workspace root directories
+        results = []
+        user_dirs = [
+            PROJECT_ROOT,
+            os.path.expanduser("~\\Desktop"),
+            os.path.expanduser("~\\Downloads"),
+            os.path.expanduser("~\\Documents")
+        ]
+        q_lower = clean_q.lower()
+        for root_dir in user_dirs:
+            if not os.path.isdir(root_dir):
+                continue
+            try:
+                for root, dirs, files in os.walk(root_dir):
+                    dirs[:] = [d for d in dirs if d not in [".git", "venv", "__pycache__", "node_modules", "assets/memory"]]
+                    for f in files:
+                        if q_lower in f.lower():
+                            results.append(os.path.join(root, f))
+                            if len(results) >= max_results:
+                                return results
+            except Exception:
+                continue
+        return results
+
+
 class FileManager:
     """
     Local filesystem and folder manager.
@@ -45,6 +99,7 @@ class FileManager:
     def __init__(self, es_path: Optional[str] = None):
         self.es_bin = self._find_everything_cli(es_path)
         self.everything_bin = self._find_everything_app()
+        self.everything_engine = EverythingSearchEngine(self.es_bin)
         user_home = os.path.expanduser("~")
 
         self.last_folder_path: Optional[str] = None
@@ -114,6 +169,10 @@ class FileManager:
             if os.path.isfile(c):
                 return c
         return None
+
+    def search_files_fast(self, query: str, max_results: int = 20) -> List[str]:
+        """Sub-5ms system-wide file search via EverythingSearchEngine (Phase 7)."""
+        return self.everything_engine.search(query, max_results=max_results)
 
     def search_path(self, query: str, folders_only: bool = True) -> Optional[str]:
         """

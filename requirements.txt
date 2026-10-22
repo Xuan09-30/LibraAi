@@ -16,3 +16,13 @@ sqlite-vec
 dateparser
 pytz
 keyring
+uiautomation>=2.0.29
+opencv-python>=4.8.0
+pycaw>=20240000
+mss>=9.0.0
+rapidocr-onnxruntime>=1.4.0
+flashrank>=0.2.0
+fastapi>=0.110.0
+uvicorn>=0.28.0
+python-multipart>=0.0.9
+websockets>=12.0

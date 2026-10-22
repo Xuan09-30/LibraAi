@@ -7,5 +7,12 @@
     "web_research": "qwen3:8b",
     "coding": "qwen2.5-coder:7b",
     "chat": "qwen3:8b"
+  },
+  "web_server": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 8765,
+    "admin_email": "chenxuanchuah@gmail.com",
+    "access_token": "libra_access_token_phase10_secure"
   }
 }

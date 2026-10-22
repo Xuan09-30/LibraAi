@@ -61,21 +61,84 @@ class GUIControlAgent:
             return pos.x, pos.y
         return 0, 0
 
+    def silent_ui_click(self, control_name_or_id: str, dry_run: bool = False) -> Dict[str, Any]:
+        """
+        UFO-Style Background UI Automation Dispatch (Phase 9).
+        Attempts to click or invoke a control programmatically via Windows UIAutomation
+        without moving the physical mouse cursor.
+        """
+        if dry_run:
+            return {"status": "success", "action": "silent_ui_click", "target": control_name_or_id, "dry_run": True, "voice_response": f"Prepared silent click on {control_name_or_id}."}
+
+        try:
+            import uiautomation as auto
+            fg = auto.GetForegroundControl()
+            target_clean = control_name_or_id.lower().strip()
+            if fg:
+                for ctrl in fg.GetChildren():
+                    name = (ctrl.Name or "").lower().strip()
+                    auto_id = (ctrl.AutomationId or "").lower().strip()
+                    if (target_clean in name) or (target_clean in auto_id):
+                        try:
+                            pat = ctrl.GetPattern(auto.PatternId.InvokePattern)
+                            if pat:
+                                pat.Invoke()
+                                return {"status": "success", "action": "silent_ui_click", "method": "InvokePattern", "voice_response": f"Triggered {ctrl.Name} in background."}
+                        except Exception:
+                            pass
+                        try:
+                            leg = ctrl.GetPattern(auto.PatternId.LegacyIAccessiblePattern)
+                            if leg:
+                                leg.DoDefaultAction()
+                                return {"status": "success", "action": "silent_ui_click", "method": "LegacyIAccessible", "voice_response": f"Triggered {ctrl.Name} in background."}
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        return {"status": "fallback_needed", "message": "Background invocation unavailable, cursor dispatch required."}
+
     def click(self, x: Optional[int] = None, y: Optional[int] = None, button: str = "left", clicks: int = 1, dry_run: bool = False) -> Dict[str, Any]:
         """Performs single or multiple mouse clicks at (x, y) or current position."""
         if dry_run:
-            return {"status": "success", "action": "click", "dry_run": True, "voice_response": f"Prepared {button} click at {x or 'current'}, {y or 'current'}."}
+            return {"status": "success", "action": "click", "x": x, "y": y, "button": button, "dry_run": True, "verified_change": True, "voice_response": f"Prepared {button} click at {x or 'current'}, {y or 'current'}."}
 
         if not PYAUTOGUI_AVAILABLE:
             return {"status": "error", "message": "pyautogui not installed", "voice_response": "Desktop automation module is unavailable."}
 
         _attach_thread_desktop()
+
+        # Pre-action 8x8 perceptual state snapshot (Phase 9 action verification)
+        pre_pixels = []
+        box = None
+        try:
+            from PIL import ImageGrab
+            if x is not None and y is not None:
+                box = (max(0, x - 16), max(0, y - 16), x + 16, y + 16)
+                img = ImageGrab.grab(bbox=box).convert("L").resize((8, 8))
+                pre_pixels = list(img.getdata())
+        except Exception:
+            pass
+
         try:
             if x is not None and y is not None:
                 pyautogui.click(x=x, y=y, button=button, clicks=clicks)
             else:
                 pyautogui.click(button=button, clicks=clicks)
-            return {"status": "success", "action": "click", "x": x, "y": y, "button": button, "voice_response": "Clicked."}
+
+            verified_change = False
+            if pre_pixels and box:
+                try:
+                    time.sleep(0.06)
+                    from PIL import ImageGrab
+                    img_post = ImageGrab.grab(bbox=box).convert("L").resize((8, 8))
+                    post_pixels = list(img_post.getdata())
+                    diff_count = sum(1 for a, b in zip(pre_pixels, post_pixels) if abs(a - b) > 15)
+                    verified_change = diff_count >= 4
+                except Exception:
+                    pass
+
+            return {"status": "success", "action": "click", "x": x, "y": y, "button": button, "verified_change": verified_change, "voice_response": "Clicked."}
         except Exception as e:
             return {"status": "error", "message": str(e), "voice_response": f"Failed to click: {e}"}
 
@@ -178,3 +241,34 @@ class GUIControlAgent:
             except Exception as e:
                 return {"status": "error", "message": str(e), "voice_response": f"Failed to select profile: {e}"}
         return {"status": "error", "voice_response": "Desktop automation module is unavailable."}
+
+    def click_mark(
+        self,
+        mark_id: int,
+        mark_dict: Dict[int, Dict[str, Any]],
+        button: str = "left",
+        clicks: int = 1,
+        dry_run: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Maps mark_id from Set-of-Mark index directly to native screen coordinates
+        and executes mouse click.
+        """
+        if mark_id not in mark_dict:
+            return {
+                "status": "error",
+                "message": f"Mark [{mark_id}] not found in Set-of-Mark index.",
+                "voice_response": f"I could not locate element {mark_id} on your screen."
+            }
+        target = mark_dict[mark_id]
+        cx = target.get("center_x")
+        cy = target.get("center_y")
+        name = target.get("name") or f"element [{mark_id}]"
+
+        res = self.click(x=cx, y=cy, button=button, clicks=clicks, dry_run=dry_run)
+        res["mark_id"] = mark_id
+        res["target_name"] = name
+        if res.get("status") == "success":
+            res["voice_response"] = f"Clicked {name}."
+        return res
+

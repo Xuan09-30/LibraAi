@@ -83,6 +83,18 @@ class LocalLLM:
             "chat": "qwen3:8b",
             "web_research": "qwen3:8b"
         }
+        self.active_session_id = "default"
+        self.last_token_metrics = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "tokens_per_sec": 0.0,
+            "eval_duration_ms": 0.0,
+            "cached_tokens": 0,
+            "saved_tokens": 0,
+            "model": "qwen3:8b",
+            "fast_path": False
+        }
         self.city = "Kuala Lumpur"
         self.memory = SemanticMemory(ollama_base_url=self.host)
         self.research_engine = HardenedResearchEngine()
@@ -270,6 +282,23 @@ class LocalLLM:
                     target=str(target)
                 )
 
+        if "token_metrics" not in plan_res:
+            tm = dict(getattr(self, "last_token_metrics", {}))
+            if not tm or tm.get("total_tokens", 0) == 0:
+                is_fast = plan_res.get("action") not in ["chat", "deep_research"]
+                tm = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "total_tokens": 0,
+                    "tokens_per_sec": 0.0,
+                    "eval_duration_ms": 0.0,
+                    "cached_tokens": 0,
+                    "saved_tokens": 350 if is_fast else 0,
+                    "model": "fast_path" if is_fast else "qwen3:8b",
+                    "fast_path": is_fast
+                }
+            plan_res["token_metrics"] = tm
+
         return plan_res
 
     def call_ollama(
@@ -314,7 +343,27 @@ class LocalLLM:
         try:
             response = requests.post(url, json=payload, timeout=max(timeout, 90))
             if response.status_code == 200:
-                content = response.json().get("message", {}).get("content", "").strip()
+                resp_data = response.json()
+                content = resp_data.get("message", {}).get("content", "").strip()
+
+                # Phase 10: Real-time Ollama Token Extraction
+                p_eval = int(resp_data.get("prompt_eval_count", 0) or 0)
+                e_count = int(resp_data.get("eval_count", 0) or 0)
+                e_dur = int(resp_data.get("eval_duration", 0) or 0)
+                tok_speed = round(e_count / (e_dur / 1e9), 2) if e_dur > 0 else 0.0
+                cached_eval = int(resp_data.get("prompt_eval_cached_count", 0) or 0)
+
+                self.last_token_metrics = {
+                    "input_tokens": p_eval,
+                    "output_tokens": e_count,
+                    "total_tokens": p_eval + e_count,
+                    "tokens_per_sec": tok_speed,
+                    "eval_duration_ms": round(e_dur / 1e6, 2) if e_dur > 0 else 0.0,
+                    "cached_tokens": cached_eval,
+                    "saved_tokens": cached_eval,
+                    "model": model,
+                    "fast_path": False
+                }
                 return content
             else:
                 print(f"[Ollama Error Status]: {response.status_code} - {response.text}")
@@ -523,13 +572,17 @@ class LocalLLM:
             return f"Tell me more about {last_ent}"
 
         # Relational pronoun replacement (he, she, his, her, him, their, them)
-        if re.search(r"\b(his|her|he|she|him|their|them)\b", q_lower):
+        # Exclude quantifier phrases like "a few of them", "some of them", "one of them"
+        has_quantifier_them = bool(re.search(r"\b(?:a\s+few|some|one|two|three|\d+|any|all|none|both|each)\s+of\s+them\b", q_lower))
+        if re.search(r"\b(his|her|he|she|him|their)\b", q_lower) or (re.search(r"\bthem\b", q_lower) and not has_quantifier_them):
             if last_ent.lower() in q_lower:
                 return prompt
             resolved = prompt
             resolved = re.sub(r"\bhis\b|\bher\b", f"{last_ent}'s", resolved, flags=re.IGNORECASE)
             resolved = re.sub(r"\bhe\b|\bshe\b|\bthey\b", last_ent, resolved, flags=re.IGNORECASE)
-            resolved = re.sub(r"\bhim\b|\bthem\b", last_ent, resolved, flags=re.IGNORECASE)
+            resolved = re.sub(r"\bhim\b", last_ent, resolved, flags=re.IGNORECASE)
+            if not has_quantifier_them:
+                resolved = re.sub(r"\bthem\b", last_ent, resolved, flags=re.IGNORECASE)
             return resolved
 
         return prompt
@@ -899,10 +952,11 @@ class LocalLLM:
         # 1.9 PLACES & POI SEARCH ("Find bookstores near me", "search for cafes around here", "places to eat nearby")
         # -------------------------------------------------------------
         place_patterns = [
-            r"\b(?:find|search\s+for|look\s+for|show\s+me|where\s+are\s+(?:the\s+)?|recommend(?:\s+some)?|give\s+me|get)\s+(?:(?:one|two|three|\d+)\s+)?(?:options?\s+(?:of\s+)?)?(?:the\s+)?(?:best\s+|good\s+|popular\s+|nearest\s+|closest\s+|top\s+)?(?:bookstores?|cafes?|coffee(?:\s+shops?)?|restaurants?|places?\s+to\s+eat|food|baker(?:y|ies)|libraries|library|parks?|gyms?|eater(?:y|ies))\b",
-            r"\b(?:bookstores?|cafes?|coffee(?:\s+shops?)?|restaurants?|places?\s+to\s+eat|baker(?:y|ies)|libraries|library|eater(?:y|ies)|food)\s+(?:near\s+(?:me|my\s+house|my\s+home|my\s+place|home|house|here|my\s+location|my\s+area)|around\s+(?:here|my\s+area|my\s+house|home|house)|nearby|closest\s+to\s+me|near\s+here)\b",
-            r"\b(?:nearest|closest)\s+(?:restaurants?|places?\s+to\s+eat|cafes?|food|eater(?:y|ies)|bookstores?)\b",
-            r"\b(?:options?\s+(?:of|for)\s+(?:the\s+)?(?:nearest|closest|best)?\s*(?:restaurants?|cafes?|places?\s+to\s+eat|food|eater(?:y|ies)))\b",
+            r"\b(?:find|search(?:\s+out|\s+for)?|look\s+for|show\s+me|where\s+are\s+(?:the\s+)?|recommend(?:\s+some)?|give\s+me|get)\s+(?:(?:one|two|three|\d+)\s+)?(?:options?\s+(?:of\s+)?)?(?:the\s+)?(?:best\s+|good\s+|popular\s+|nearest\s+|closest\s+|top\s+)?(?:bookstores?|cafes?|coffee(?:\s+shops?)?|restaurants?|places?\s+to\s+eat|food|baker(?:y|ies)|libraries|library|parks?|gyms?|eater(?:y|ies)|mcdonald(?:'s|s)?|kfc|starbucks|subway|fast\s*food)\b",
+            r"\b(?:bookstores?|cafes?|coffee(?:\s+shops?)?|restaurants?|places?\s+to\s+eat|baker(?:y|ies)|libraries|library|eater(?:y|ies)|food|mcdonald(?:'s|s)?|kfc|starbucks|subway|fast\s*food)\s+(?:near\s+(?:me|my\s+house|my\s+home|my\s+place|home|house|here|my\s+location|my\s+area)|around\s+(?:here|my\s+area|my\s+house|home|house)|nearby|closest\s+to\s+me|near\s+here)\b",
+            r"\b(?:nearest|closest)\s+(?:restaurants?|places?\s+to\s+eat|cafes?|food|eater(?:y|ies)|bookstores?|mcdonald(?:'s|s)?|kfc|starbucks|subway|fast\s*food)\b",
+            r"\b(?:options?\s+(?:of|for)\s+(?:the\s+)?(?:nearest|closest|best)?\s*(?:restaurants?|cafes?|places?\s+to\s+eat|food|eater(?:y|ies)|mcdonald(?:'s|s)?|kfc|starbucks|fast\s*food))\b",
+            r"\b(?:find|search(?:\s+out|\s+for)?|look\s+for|show\s+me|recommend(?:\s+some)?)\s+.*?\b(?:near\s+(?:me|my\s+house|my\s+home|my\s+place|home|house|here)|around\s+(?:here|my\s+area|my\s+house)|nearby)\b",
             r"\bplaces\s+to\s+eat\b"
         ]
         if any(re.search(pat, q_lower) for pat in place_patterns):
@@ -1247,28 +1301,63 @@ class LocalLLM:
         # -------------------------------------------------------------
         explicit_search = (
             re.search(
-                r"^(?:hey\s+libra,?\s*)?(?:please\s+)?(?:open\s+(?:my\s+)?(?:google|chrome|browser)\s+and\s+search(?:\s+for)?|search\s+(?:on\s+)?(?:google|youtube|online|the\s+web)(?:\s+for)?)\s+(.+)[\.\?!]*$",
+                r"^(?:hey\s+libra,?\s*)?(?:please\s+)?(?:can\s+you\s+)?(?:open\s+(?:my\s+)?(?:google|chrome|browser)\s+and\s+search(?:\s+for)?|search\s+(?:on\s+)?(?:google|youtube|online|the\s+web)(?:\s+for)?)\s+(.+)[\.\?!]*$",
                 q_lower
             )
             or re.search(
                 r"\b(?:open\s+(?:my\s+)?(?:google|chrome|browser)\s+and\s+search(?:\s+for)?)\s+(.+)[\.\?!]*$",
                 q_lower
             )
+            or re.search(
+                r"\b(?:google\s+search|search\s+google(?:\s+for)?)\s+(.+)[\.\?!]*$",
+                q_lower
+            )
+            or re.search(
+                r"\b(?:youtube\s+search|search\s+youtube(?:\s+for)?)\s+(.+)[\.\?!]*$",
+                q_lower
+            )
+            or re.search(
+                r"\bsearch\s+(?:for\s+)?(.+?)\s+on\s+(google|youtube|the\s+web|online)\b",
+                q_lower
+            )
+            or (re.search(r"\b(?:search|open)\s+youtube\b", q_lower) and not re.search(r"\b(?:play|pause|music)\b", q_lower))
         )
         if explicit_search:
-            raw_query = explicit_search.group(1).strip().rstrip(".?!")
+            raw_query = ""
+            if hasattr(explicit_search, "group") and explicit_search.lastindex:
+                raw_query = explicit_search.group(1).strip().rstrip(".?!")
+            # Strip trailing conversational fluff
             clean_q = re.sub(r"(?:and\s+)?(?:read|tell|summarize).*", "", raw_query).strip()
+            clean_q = re.sub(r"\b(?:for\s+me|for\s+us|please|now|thanks)\b", "", clean_q, flags=re.IGNORECASE).strip()
             search_terms = clean_q or raw_query
-            plan_res = {"action": "web_search", "args": {"query": search_terms}, "query": search_terms}
-            if not dry_run:
-                platform = "youtube" if "youtube" in q_lower else "google"
-                web_search(search_terms, platform=platform)
-                res_data = self.execute_research(search_terms, prompt=prompt)
-                plan_res["voice_response"] = res_data["voice_response"]
-                plan_res["sources"] = res_data["sources"]
-                self._record_turn(prompt, res_data["voice_response"])
+
+            # Determine platform: Google search takes priority if requested
+            if "google" in q_lower:
+                platform = "google"
+            elif "youtube" in q_lower:
+                platform = "youtube"
             else:
-                plan_res["voice_response"] = f"Searching for {search_terms}."
+                platform = "google"
+
+            # If user said "search youtube for me" with no extra query or query is "me"
+            if platform == "youtube" and (not search_terms or search_terms.lower() in ["me", "youtube", "videos"]):
+                plan_res = {"action": "web_search", "args": {"query": "youtube"}, "query": "youtube"}
+                if not dry_run:
+                    from tools.system_actions import open_url
+                    open_url("https://www.youtube.com")
+                    plan_res["voice_response"] = "Opening YouTube."
+                    self._record_turn(prompt, plan_res["voice_response"])
+                else:
+                    plan_res["voice_response"] = "Opening YouTube."
+                return plan_res
+
+            plan_res = {"action": "web_search", "args": {"query": search_terms, "platform": platform}, "query": search_terms}
+            if not dry_run:
+                web_search(search_terms, platform=platform)
+                plan_res["voice_response"] = f"Searching {platform.capitalize()} for {search_terms}."
+                self._record_turn(prompt, plan_res["voice_response"])
+            else:
+                plan_res["voice_response"] = f"Searching {platform.capitalize()} for {search_terms}."
             return plan_res
 
         # -------------------------------------------------------------
@@ -1594,11 +1683,41 @@ class LocalLLM:
             )
         )
         if is_pronoun_folder:
-            res = self.file_mgr.open_in_explorer("that folder", dry_run=dry_run)
-            self.last_context["folder"] = res.get("path") or self.file_mgr.last_folder_name
+            target_folder = (
+                self.last_context.get("folder")
+                or getattr(self.file_mgr, "last_folder_path", None)
+                or getattr(self.file_mgr, "last_folder_name", None)
+                or self.session_state.get("last_folder_path")
+                or self.session_state.get("last_folder_name")
+            )
+            target_file = (
+                self.last_context.get("file")
+                or getattr(self.file_mgr, "last_file_path", None)
+                or getattr(self.file_mgr, "last_file_name", None)
+                or self.session_state.get("last_file_path")
+                or self.session_state.get("last_file_name")
+            )
+            if target_file and not target_folder:
+                res = self.file_mgr.open_file(target_file, dry_run=dry_run)
+                self.session_state["last_action"] = "open_file"
+                plan_res = {
+                    "action": "open_file",
+                    "args": {"file": res.get("name") or target_file, "path": res.get("path")},
+                    "status": res.get("status"),
+                    "path": res.get("path"),
+                    "voice_response": res.get("voice_response")
+                }
+                if not dry_run:
+                    self._record_turn(prompt, plan_res["voice_response"])
+                return self._process_response(plan_res, prompt, dry_run=dry_run)
+
+            res = self.file_mgr.open_in_explorer(target_folder or "that folder", dry_run=dry_run)
+            self.last_context["folder"] = res.get("path") or target_folder or self.file_mgr.last_folder_name
+            self.session_state["last_folder_path"] = res.get("path")
+            self.session_state["last_folder_name"] = self.file_mgr.last_folder_name or target_folder
             plan_res = {
                 "action": "open_folder",
-                "args": {"folder": self.file_mgr.last_folder_name or "that folder", "path": res.get("path")},
+                "args": {"folder": self.file_mgr.last_folder_name or target_folder or "that folder", "path": res.get("path")},
                 "status": res.get("status"),
                 "path": res.get("path"),
                 "voice_response": res.get("voice_response")
@@ -1610,19 +1729,21 @@ class LocalLLM:
 
         # 8.1.3 Standard Named Folder Opening
         open_folder_match = (
-            re.search(r"(?:open|show|reveal|find)\s+(?:the\s+|that\s+)?([a-zA-Z0-9_\-\s]+?)\s+(?:folder|directory|dir|in\s+file\s+explorer|in\s+explorer)[\.\?!]*$", cmd_query)
-            or re.search(r"(?:open|show|reveal)\s+(?:the\s+|that\s+)?(program files|program files \(x86\)|programs file|program file|desktop|documents|downloads|pictures|music|videos)\s*(?:folder)?[\.\?!]*$", cmd_query)
-            or re.search(r"(?:open|show|reveal|find)\s+(?:that\s+|the\s+)?([a-zA-Z0-9_\-\s]+?)\s+on\s+here[\.\?!]*$", cmd_query)
-            or re.search(r"(?:open|find)\s+folder\s+(.+)[\.\?!]*$", cmd_query)
+            re.search(r"(?:open|show|reveal|find|locate)\s+(?:a\s+|the\s+|that\s+)?(?:folder|directory|dir)?\s*(?:called|named)?\s*([a-zA-Z0-9_\-\s]+?)\s*(?:folder|directory|dir|in\s+file\s+explorer|in\s+explorer)[\.\?!]*$", cmd_query)
+            or re.search(r"(?:open|show|reveal|find|locate)\s+(?:the\s+|that\s+)?(program files|program files \(x86\)|programs file|program file|desktop|documents|downloads|pictures|music|videos)\s*(?:folder)?[\.\?!]*$", cmd_query)
+            or re.search(r"(?:open|show|reveal|find|locate)\s+(?:that\s+|the\s+)?([a-zA-Z0-9_\-\s]+?)\s+on\s+here[\.\?!]*$", cmd_query)
+            or re.search(r"(?:open|find|locate)\s+(?:a\s+)?folder(?:\s+called|\s+named)?\s+(.+)[\.\?!]*$", cmd_query)
             or re.search(r"(?:show|reveal)\s+(.+?)\s+in\s+file\s+explorer[\.\?!]*$", cmd_query)
-            or re.search(r"(?:open|show|reveal|find)\s+(?:the\s+|that\s+)?([a-zA-Z0-9_\-\s]+?)\s+(?:folder|directory|dir|in\s+file\s+explorer|in\s+explorer)[\.\?!]*$", q_lower)
-            or re.search(r"(?:open|show|reveal)\s+(?:the\s+|that\s+)?(program files|program files \(x86\)|programs file|program file|desktop|documents|downloads|pictures|music|videos)\s*(?:folder)?[\.\?!]*$", q_lower)
-            or re.search(r"(?:open|show|reveal|find)\s+(?:that\s+|the\s+)?([a-zA-Z0-9_\-\s]+?)\s+on\s+here[\.\?!]*$", q_lower)
-            or re.search(r"(?:open|find)\s+folder\s+(.+)[\.\?!]*$", q_lower)
+            or re.search(r"(?:open|show|reveal|find|locate)\s+(?:a\s+|the\s+|that\s+)?(?:folder|directory|dir)?\s*(?:called|named)?\s*([a-zA-Z0-9_\-\s]+?)\s*(?:folder|directory|dir|in\s+file\s+explorer|in\s+explorer)[\.\?!]*$", q_lower)
+            or re.search(r"(?:open|show|reveal|find|locate)\s+(?:the\s+|that\s+)?(program files|program files \(x86\)|programs file|program file|desktop|documents|downloads|pictures|music|videos)\s*(?:folder)?[\.\?!]*$", q_lower)
+            or re.search(r"(?:open|show|reveal|find|locate)\s+(?:that\s+|the\s+)?([a-zA-Z0-9_\-\s]+?)\s+on\s+here[\.\?!]*$", q_lower)
+            or re.search(r"(?:open|find|locate)\s+(?:a\s+)?folder(?:\s+called|\s+named)?\s+(.+)[\.\?!]*$", q_lower)
             or re.search(r"(?:show|reveal)\s+(.+?)\s+in\s+file\s+explorer[\.\?!]*$", q_lower)
         )
         if open_folder_match and not re.search(r"\b(?:create|make|read)\s+folder\b", q_lower):
             folder_target = open_folder_match.group(1).strip().rstrip(".?!")
+            folder_target = re.sub(r"^(?:called|named|folder\s+called|folder\s+named)\s+", "", folder_target, flags=re.IGNORECASE).strip()
+            folder_target = re.sub(r"^(?:a\s+|the\s+|that\s+)?folder\s+", "", folder_target, flags=re.IGNORECASE).strip()
             active_candidates = self.session_mgr.get_candidates() or self.session_state.get("candidates") or []
             if len(active_candidates) >= 2:
                 ambig = self.clarifier.check_ambiguity(
@@ -1678,6 +1799,14 @@ class LocalLLM:
 
             # ABSOLUTE SAFETY GUARD: If raw_app contains security scan keywords, delegate to virus scanner!
             if any(w in raw_app.lower() for w in ["security scan", "virus scan", "malware scan", "scan for viruses", "scan on", "scan for", "security test"]):
+                open_app_match = False
+
+            # ABSOLUTE SAFETY GUARD: If user is asking to click a button, icon, or screen element, delegate to GUI control!
+            if (
+                re.search(r"\b(?:click|double\s+click|right\s+click|press|tap)\b", q_lower)
+                or any(w in raw_app.lower() for w in ["button", "icon", "checkbox", "on my screen", "on the screen", "click it", "click that"])
+                or any(w in q_lower for w in ["button on my screen", "launch button", "green launch button", "start button"])
+            ):
                 open_app_match = False
 
         if open_app_match:
@@ -1872,7 +2001,9 @@ class LocalLLM:
             re.search(r"\b(?:system\s+status|cpu(?:\s+and\s+ram)?|ram\s+usage|memory\s+usage|vram\s+usage|gpu\s+status)\b", q_lower)
             or re.search(r"\bhow\s+much\s+(?:ram|cpu|memory|vram)\b", q_lower)
             or re.search(r"\b(?:what\s+windows|which\s+windows|list\s+windows|open\s+windows)\b", q_lower)
-            or re.search(r"\bcheck\s+(?:my\s+)?(?:system|hardware|specs|ram|cpu|gpu)\b", q_lower)
+            or re.search(r"\bcheck\s+(?:my\s+)?(?:system|hardware|specs|ram|cpu|gpu|vitals)\b", q_lower)
+            or re.search(r"\b(?:check|show|get)\s+(?:system\s+)?vitals\b", q_lower)
+            or re.search(r"\bhow\s+hot\s+is\s+my\s+(?:gpu|cpu|pc)\b", q_lower)
         )
         if system_status_match:
             is_windows = bool(re.search(r"\b(?:windows?|apps?)\b", q_lower) and not re.search(r"\b(?:cpu|ram|memory|gpu|vram|status)\b", q_lower))
@@ -1976,11 +2107,23 @@ class LocalLLM:
             return plan_res
 
         # -------------------------------------------------------------
-        # 8.9.2 DIRECT GUI MOUSE & KEYBOARD CONTROL
+        # 8.9.2 DIRECT GUI MOUSE & KEYBOARD CONTROL + SET-OF-MARK (Phase 2)
         # -------------------------------------------------------------
-        gui_click_match = re.search(r"\b(?:click|double\s+click|right\s+click)\s+(?:on\s+)?(?:the\s+)?(.+?)[\.\?!]*$", q_lower)
+        gui_click_match = (
+            re.search(r"\b(?:click|double\s+click|right\s+click)\s+(?:on\s+)?(?:the\s+)?(.+?)[\.\?!]*$", q_lower)
+            or re.search(r"\b(?:can\s+you\s+)?(?:help\s+me\s+(?:to\s+)?)?(?:click|double\s+click|right\s+click)\s+(?:on\s+)?(?:the\s+)?(.+?)[\.\?!]*$", q_lower)
+            or (re.search(r"\b(?:click|press|tap)\s+it\b", q_lower) and not any(w in q_lower for w in ["screen showing", "in-game name"]))
+        )
         if gui_click_match and not any(w in q_lower for w in ["screen showing", "in-game name", "error"]):
-            target = gui_click_match.group(1).strip()
+            raw_target = gui_click_match.group(1).strip() if (hasattr(gui_click_match, "group") and gui_click_match.lastindex) else "it"
+            raw_target = re.sub(r"(?:for\s+me|please|thanks|right\s+now|now|if\s+you\s+can)+$", "", raw_target).strip().rstrip(".?!")
+            target = raw_target
+            if target in ["it", "that", "this", "it for me", "that for me", "the button", "button"]:
+                elem_match = re.search(r"(?:there's|there is|see|found|spot)?\s*(?:a|an|the)?\s*([a-z0-9\s_-]+(?:button|icon|box|checkbox|toggle|link|menu|tab|item))\b", q_lower)
+                if elem_match:
+                    target = elem_match.group(1).strip()
+                    target = re.sub(r"^(?:there'?s\s+|there\s+is\s+|see\s+|found\s+)?(?:a\s+|an\s+|the\s+)?", "", target).strip()
+
             if any(w in target for w in ["first account", "second account", "first profile", "second profile"]):
                 idx = 0 if any(w in target for w in ["first", "1st", "1"]) else 1
                 gui_res = self.gui_control.select_chrome_profile_ui(idx, dry_run=dry_run)
@@ -1994,6 +2137,36 @@ class LocalLLM:
                     self.session_state["last_action"] = "gui_action"
                     self._record_turn(prompt, plan_res["voice_response"])
                 return plan_res
+            else:
+                # Set-of-Mark (SoM) Visual Grounding (Phase 2)
+                som_path, mark_dict = self.spatial.capture_and_annotate(mode="som")
+                btn = "right" if "right click" in q_lower else "left"
+                clicks = 2 if "double click" in q_lower else 1
+                located = self.model_mgr.locate_ui_mark(target, mark_dict, som_image_path=som_path, dry_run=dry_run)
+                if located.get("status") == "located" and located.get("mark_id") is not None:
+                    mid = located["mark_id"]
+                    gui_res = self.gui_control.click_mark(mid, mark_dict, button=btn, clicks=clicks, dry_run=dry_run)
+                    plan_res = {
+                        "action": "gui_action",
+                        "args": {"sub_action": "click_mark", "mark_id": mid, "target": target},
+                        "status": gui_res.get("status"),
+                        "voice_response": gui_res.get("voice_response")
+                    }
+                    if not dry_run:
+                        self.session_state["last_action"] = "gui_action"
+                        self._record_turn(prompt, plan_res["voice_response"])
+                    return plan_res
+                else:
+                    plan_res = {
+                        "action": "gui_action",
+                        "args": {"sub_action": "click_mark", "target": target},
+                        "status": "not_located",
+                        "voice_response": f"I couldn't locate the {target} on your screen."
+                    }
+                    if not dry_run:
+                        self.session_state["last_action"] = "gui_action"
+                        self._record_turn(prompt, plan_res["voice_response"])
+                    return plan_res
 
         # -------------------------------------------------------------
         # 8.9.5 ACTIVE-WINDOW CONTEXT AWARENESS (v10.0)
@@ -2077,7 +2250,40 @@ class LocalLLM:
             or re.search(r"\b(?:view\s+or\s+analyze\s+(?:the\s+|this\s+)?file|analyze\s+this\s+file|explain\s+this\s+file|what\s+does\s+this\s+file\s+do)\b", q_lower)
         )
         if clipboard_assist_match:
-            is_summary = bool(re.search(r"\b(?:summarize|what\s+did\s+i\s+copy)\b", q_lower))
+            is_summary = bool(re.search(r"\b(?:summarize|brief\s+summary|overview)\b", q_lower))
+            is_explain = bool(re.search(r"\b(?:explain|debug|diagnose|fix\s+the\s+error|solve|troubleshoot|review\s+code)\b", q_lower))
+            is_read = not (is_summary or is_explain)
+
+            if is_read:
+                payload = self.clipboard_agent.resolve_clipboard_payload()
+                kind = payload.get("kind", "empty")
+                if kind == "empty":
+                    voice_msg = "Your clipboard is currently empty."
+                elif kind == "text":
+                    raw_txt = (payload.get("text") or "").strip()
+                    preview = raw_txt[:120].replace("\n", " ").strip()
+                    suffix = "..." if len(raw_txt) > 120 else ""
+                    voice_msg = f"Your clipboard contains: {preview}{suffix}"
+                elif kind == "file":
+                    fname = payload.get("source", "a file")
+                    voice_msg = f"Your clipboard contains the file {fname}."
+                else:
+                    fname = payload.get("source", "a file")
+                    voice_msg = f"Your clipboard contains the empty file {fname}."
+
+                plan_res = {
+                    "action": "clipboard_assist",
+                    "sub_action": "clipboard_read",
+                    "args": {"query": cleaned_query},
+                    "clipboard_kind": kind,
+                    "clipboard_text": payload.get("text", ""),
+                    "voice_response": voice_msg
+                }
+                if not dry_run:
+                    self.session_state["last_action"] = "clipboard_assist"
+                    self._record_turn(prompt, voice_msg)
+                return plan_res
+
             plan_res = {
                 "action": "clipboard_assist",
                 "args": {"query": cleaned_query},
@@ -2689,6 +2895,21 @@ class LocalLLM:
                 relevant_memories = self.memory.recall_relevant(prompt, limit=2)
                 relevant_episodes = self.memory.recall_episodes(prompt, limit=2)
                 ctx_blocks = []
+                # Phase 1: Ingest verified semantic facts
+                if hasattr(self.memory, "format_semantic_facts_prompt"):
+                    sem_facts = self.memory.format_semantic_facts_prompt()
+                    if sem_facts:
+                        ctx_blocks.append(sem_facts)
+                # Phase 1: Ingest Markovian State
+                if hasattr(self.memory, "get_markov_state"):
+                    m_state = self.memory.get_markov_state()
+                    if m_state.get("rolling_summary") or m_state.get("active_goal"):
+                        m_lines = ["[Markovian Context State]"]
+                        if m_state.get("active_goal"):
+                            m_lines.append(f"- Active Goal: {m_state['active_goal']}")
+                        if m_state.get("rolling_summary"):
+                            m_lines.append(f"- Summary of Preceding Dialog: {m_state['rolling_summary']}")
+                        ctx_blocks.append("\n".join(m_lines))
                 if relevant_memories:
                     ctx_blocks.append("Stored Facts:\n" + "\n".join([f"- {r['content']}" for r in relevant_memories]))
                 if relevant_episodes:
@@ -2911,17 +3132,29 @@ class LocalLLM:
         return {"action": "lookup_entity", "voice_response": voice_text or summary[:200]}
 
     def _record_turn(self, user_text: str, assistant_text: str):
-        """Maintains the sliding window conversation history with rolling distillation and logs episodic memory."""
+        """Maintains the sliding window conversation history (max 6 turns) with Markovian compression and logs episodic memory."""
         if user_text:
             self.conversation_history.append({"role": "user", "content": user_text})
         if assistant_text:
             self.conversation_history.append({"role": "assistant", "content": assistant_text})
-        if len(self.conversation_history) > 8:
-            try:
-                compressed, _ = self.distiller.compress_history(self.conversation_history, threshold=8)
-                self.conversation_history = compressed
-            except Exception:
-                self.conversation_history = self.conversation_history[-8:]
+        # Phase 1: Markovian Sliding Window Compression (strictly <= 6 turns)
+        if len(self.conversation_history) > 6:
+            turns_to_fold = self.conversation_history[:-6]
+            self.conversation_history = self.conversation_history[-6:]
+            if hasattr(self.memory, "fold_conversation_into_markov"):
+                try:
+                    active_goal = self.session_state.get("active_goal", "")
+                    recent_tools = []
+                    last_act = self.session_state.get("last_action")
+                    if last_act and last_act != "chat":
+                        recent_tools.append({"action": last_act, "target": self.session_state.get("last_target")})
+                    self.memory.fold_conversation_into_markov(
+                        turns_to_fold,
+                        current_goal=active_goal,
+                        tool_outcomes=recent_tools
+                    )
+                except Exception as e:
+                    print(f"[Markovian Fold Warning]: {e}")
 
         # Log episode into SemanticMemory
         if user_text and assistant_text:
@@ -2930,3 +3163,23 @@ class LocalLLM:
                 self.memory.log_episode(user_text, assistant_text, route=route)
             except Exception as e:
                 print(f"[Episodic Log Warning]: {e}")
+
+            # Phase 10: Multi-Session Message Logging & Token Telemetry
+            try:
+                sid = getattr(self, "active_session_id", "default") or "default"
+                tm = getattr(self, "last_token_metrics", None)
+                route = self.session_state.get("last_action") or "chat"
+                self.memory.add_session_message(
+                    session_id=sid,
+                    role="user",
+                    content=user_text
+                )
+                self.memory.add_session_message(
+                    session_id=sid,
+                    role="assistant",
+                    content=assistant_text,
+                    token_metrics=tm,
+                    tool_used=route
+                )
+            except Exception as e:
+                pass

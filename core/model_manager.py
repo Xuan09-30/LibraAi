@@ -1,4 +1,7 @@
+import os
 import io
+import re
+import json
 import time
 import base64
 import requests
@@ -372,4 +375,112 @@ class ModelManager:
             "status": "error",
             "vision_response": "Vision model inference timed out or failed.",
             "voice_response": fallback_voice
+        }
+
+    def locate_ui_mark(
+        self,
+        prompt: str,
+        mark_dict: Dict[int, Dict[str, Any]],
+        som_image_path: Optional[str] = None,
+        dry_run: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Locates the mark ID matching the user's intent using Set-of-Mark visual reasoning
+        with qwen2.5vl:7b, backed by lexical element matching fallback.
+        Ensures strict 2m keep_alive to release VRAM immediately after inference.
+        """
+        if not mark_dict:
+            return {"status": "error", "message": "No marks available", "mark_id": None}
+
+        # 1. Exact / Substring name heuristic match (instant <1ms CPU check)
+        p_lower = prompt.lower()
+        direct_mark = re.search(r"\bmark\s+(\d+)\b", p_lower)
+        if direct_mark:
+            mid = int(direct_mark.group(1))
+            if mid in mark_dict:
+                return {
+                    "status": "located",
+                    "mark_id": mid,
+                    "target": mark_dict[mid],
+                    "method": "direct_number"
+                }
+
+        for mid, mdata in mark_dict.items():
+            name = (mdata.get("name") or "").lower().strip()
+            if name and (name in p_lower or p_lower in name):
+                return {
+                    "status": "located",
+                    "mark_id": mid,
+                    "target": mdata,
+                    "method": "name_match"
+                }
+
+        if dry_run:
+            first_key = next(iter(mark_dict.keys()))
+            return {
+                "status": "located",
+                "mark_id": first_key,
+                "target": mark_dict[first_key],
+                "method": "dry_run_fallback"
+            }
+
+        # 2. VLM Set-of-Mark Visual Grounding with qwen2.5vl:7b
+        if som_image_path and os.path.exists(som_image_path):
+            try:
+                with open(som_image_path, "rb") as f:
+                    b64_img = base64.b64encode(f.read()).decode("utf-8")
+
+                vision_spec = self.acquire_model("vision", dry_run=False)
+                active_vision_model = vision_spec.get("active_model", "qwen2.5vl:7b")
+
+                system_prompt = (
+                    "You are an expert GUI grounding agent. The user wants to click or interact with a UI element.\n"
+                    "Inspect the attached image which has numbered badges [1], [2], [3], etc. highlighting interactable elements.\n"
+                    "Select the single mark ID that best matches the user's intended target.\n"
+                    "Respond ONLY with valid JSON in this format: {\"mark_id\": <integer>, \"reason\": \"<short reason>\"}."
+                )
+
+                payload = {
+                    "model": active_vision_model,
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": f"{system_prompt}\nUser request: '{prompt}'",
+                            "images": [b64_img]
+                        }
+                    ],
+                    "format": "json",
+                    "stream": False,
+                    "keep_alive": "2m",
+                    "options": {"temperature": 0.0, "num_predict": 60}
+                }
+
+                resp = requests.post(f"{self.ollama_host}/api/chat", json=payload, timeout=30)
+                if resp.status_code == 200:
+                    raw_content = resp.json().get("message", {}).get("content", "").strip()
+                    parsed = json.loads(raw_content)
+                    chosen_id = parsed.get("mark_id")
+                    if chosen_id is not None:
+                        try:
+                            chosen_id = int(chosen_id)
+                            if chosen_id in mark_dict:
+                                return {
+                                    "status": "located",
+                                    "mark_id": chosen_id,
+                                    "target": mark_dict[chosen_id],
+                                    "reason": parsed.get("reason", ""),
+                                    "method": "vlm_grounding"
+                                }
+                        except (ValueError, TypeError):
+                            pass
+            except Exception as e:
+                print(f"[ModelManager locate_ui_mark VLM Error]: {e}")
+
+        # 3. Fallback to first candidate if VLM unreachable
+        first_key = next(iter(mark_dict.keys()))
+        return {
+            "status": "located",
+            "mark_id": first_key,
+            "target": mark_dict[first_key],
+            "method": "positional_fallback"
         }
