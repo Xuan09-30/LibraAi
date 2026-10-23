@@ -73,12 +73,30 @@
         </div>
 
         <div class="header-right">
+          <!-- PHASE 11 QUICK NAV BUTTONS -->
+          <button id="briefing-nav-btn" class="header-action-btn" title="Daily Tactical Briefing">
+            <span>⚡ Brief</span>
+          </button>
+          <button id="vault-nav-btn" class="header-action-btn" title="Memory Vault (Obsidian Sync)">
+            <span>◈ Vault</span>
+          </button>
+          <button id="airdrop-nav-btn" class="header-action-btn" title="AirDrop Bridge (Phone <-> PC)">
+            <span>✈ Drop</span>
+          </button>
           <!-- TOKEN TELEMETRY HUD BUTTON -->
           <button id="token-hud-btn" class="token-hud-btn" title="View Real-Time GPU Token Telemetry">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
               <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
             </svg>
             <span id="token-hud-text">TOKENS: 0</span>
+          </button>
+
+          <!-- CLIENT-SIDE MUTE / STOP VOICE BUTTON -->
+          <button id="stop-voice-btn" class="stop-voice-btn" title="Stop Voice Playback (Mute Voice)" style="display: none;">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+              <rect x="5" y="5" width="14" height="14" rx="2"></rect>
+            </svg>
+            <span>STOP VOICE</span>
           </button>
 
           <!-- HARDWARE VITALS -->
@@ -291,6 +309,108 @@
       </p>
       <input type="password" id="token-input" class="auth-input" placeholder="Enter Access Token...">
       <button id="save-token-btn" class="auth-btn">CONNECT</button>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       MODAL: MEMORY VAULT (PHASE 11 OBSIDIAN SYNC)
+       ======================================================================== -->
+  <div id="vault-modal" class="modal-overlay">
+    <div class="modal-content vault-modal-content">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span style="color: #00ffcc;">◈ MEMORY VAULT</span>
+          <span style="font-size: 11px; color: #64748b; margin-left: 8px;">OBSIDIAN SYNC (assets/vault/*.md)</span>
+        </div>
+        <button id="close-vault-modal" class="modal-close-btn" title="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="vault-modal-controls">
+        <input type="text" id="vault-search-input" class="auth-input" placeholder="Search memory notes (FTS5 BM25)...">
+        <select id="vault-category-filter" class="auth-input vault-select">
+          <option value="">ALL CATEGORIES</option>
+        </select>
+        <button id="vault-add-btn" class="modal-btn primary" style="white-space: nowrap;">+ ADD NOTE</button>
+      </div>
+      <div id="vault-cards-grid" class="vault-cards-grid">
+        <!-- Rendered dynamically by app.js -->
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       MODAL: AIRDROP BRIDGE (PHASE 11 PHONE <-> PC)
+       ======================================================================== -->
+  <div id="airdrop-modal" class="modal-overlay">
+    <div class="modal-content">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span style="color: #38bdf8;">✈ AIRDROP BRIDGE</span>
+          <span style="font-size: 11px; color: #64748b; margin-left: 8px;">PHONE ⟷ PC</span>
+        </div>
+        <button id="close-airdrop-modal" class="modal-close-btn" title="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 12px; color: #94a3b8; margin-bottom: 12px;">
+          Send photos, documents, and code from your phone directly into <code>Downloads/LibraDrop/</code> on your PC. PDFs and text are auto-indexed into RAG.
+        </p>
+        <div id="airdrop-drop-zone" class="airdrop-drop-zone">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="1.5">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="17 8 12 3 7 8"/>
+            <line x1="12" y1="3" x2="12" y2="15"/>
+          </svg>
+          <span id="airdrop-zone-text" style="font-size: 13px; color: #cbd5e1; margin-top: 8px;">Tap or Drop file to AirDrop to PC</span>
+          <input type="file" id="airdrop-file-input" style="display: none;">
+        </div>
+        <label style="display: flex; align-items: center; gap: 8px; font-size: 12px; color: #38bdf8; margin: 12px 0; cursor: pointer;">
+          <input type="checkbox" id="airdrop-open-on-pc" checked style="accent-color: #00ffcc;">
+          <span>Open on PC screen immediately upon arrival</span>
+        </label>
+        <div id="airdrop-status" style="font-size: 12px; color: #a7f3d0; margin-bottom: 10px; display: none;"></div>
+        <button id="airdrop-send-btn" class="modal-btn primary" style="width: 100%; display: none;">AIRDROP TO PC</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       MODAL: DAILY TACTICAL BRIEFING (PHASE 11)
+       ======================================================================== -->
+  <div id="briefing-modal" class="modal-overlay">
+    <div class="modal-content briefing-modal-content">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span style="color: #f59e0b;">⚡ DAILY TACTICAL BRIEFING</span>
+          <span id="briefing-date-badge" style="font-size: 11px; color: #64748b; margin-left: 8px;">KUALA LUMPUR</span>
+        </div>
+        <button id="close-briefing-modal" class="modal-close-btn" title="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div id="briefing-vitals-strip" class="briefing-vitals-strip">
+          <!-- Live cards: Weather %, GPU Temp, NVMe Free, Git Dirty -->
+        </div>
+        <div id="briefing-bullets-box" class="briefing-bullets-box">
+          <div style="color: #64748b; font-size: 13px;">Loading daily tactical briefing...</div>
+        </div>
+        <div class="modal-action-row" style="margin-top: 14px;">
+          <button id="refresh-briefing-btn" class="modal-btn secondary">↻ REFRESH</button>
+          <button id="speak-briefing-btn" class="modal-btn primary">🔊 LISTEN</button>
+        </div>
+      </div>
     </div>
   </div>
 

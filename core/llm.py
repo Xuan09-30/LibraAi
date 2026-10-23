@@ -46,6 +46,7 @@ from core.idle_daemon import IdleTaskDaemon
 from core.mcp_client import LibraMCPClient
 from tools.chrome_agent import ChromeProfileManager
 from tools.gui_control import GUIControlAgent
+from core.vram_governor import get_vram_governor
 
 
 def condense_spelling(text: str) -> str:
@@ -158,6 +159,8 @@ class LocalLLM:
         self.pending_confirmation = None
         self.pending_clarification: Optional[Dict[str, Any]] = None
         self.chrome_mgr = ChromeProfileManager()
+        self.vram_governor = get_vram_governor()
+        self.vram_governor.start()
         self.gui_control = GUIControlAgent()
         self.pending_chrome_profile: Optional[List[Dict[str, str]]] = None
         self.conversation_history = []

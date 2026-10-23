@@ -133,6 +133,9 @@ from core.audio_capture import scale_pcm_amplitude, get_windows_master_volume, g
 from tools.security_scanner import SecurityScanner
 from core.code_reloader import CodeReloader
 from core.version import LIBRA_VERSION, get_full_version_string
+from ui.spotlight_bar import SpotlightBar
+from ui.memory_vault_widget import MemoryVaultWidget
+from core.dictation import get_dictation_controller
 
 warnings.filterwarnings("ignore")
 
@@ -1033,6 +1036,19 @@ class FuturisticVoiceAssistantUI(QMainWindow):
                 except Exception:
                     pass
 
+        self.memory_vault_dialog = None
+        try:
+            self.spotlight_bar = SpotlightBar(parent=None)
+        except Exception as e:
+            print(f"[GUI Warning] SpotlightBar init: {e}")
+            self.spotlight_bar = None
+        try:
+            self.dictation_controller = get_dictation_controller()
+            self.dictation_controller.start()
+        except Exception as e:
+            print(f"[GUI Warning] DictationController init: {e}")
+            self.dictation_controller = None
+
         self.init_ui()
         _ = self.winId()
         self.init_tray_icon()
@@ -1071,6 +1087,18 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.stat_box.setStyleSheet(
             "color: #00e5ff; background: #0c1524; border: 1px solid #142845; border-radius: 4px; padding: 6px 12px;"
         )
+        self.vault_btn = QPushButton("◈ MEMORY VAULT")
+        self.vault_btn.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        self.vault_btn.setStyleSheet("""
+            QPushButton {
+                background: #091322; color: #00ffcc;
+                border: 1px solid #142845; border-radius: 4px; padding: 6px 12px;
+            }
+            QPushButton:hover { background: #12253f; border-color: #00ffcc; }
+        """)
+        self.vault_btn.setToolTip("Inspect and edit Memory Vault (Obsidian Markdown Sync at assets/vault/)")
+        self.vault_btn.clicked.connect(self.open_memory_vault)
+        header.addWidget(self.vault_btn)
         header.addWidget(self.stat_box)
 
         self.clock_label = QLabel()
@@ -1506,6 +1534,13 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             pass
 
         return QIcon(pixmap)
+
+    def open_memory_vault(self):
+        if self.memory_vault_dialog is None:
+            self.memory_vault_dialog = MemoryVaultWidget(parent=self)
+        self.memory_vault_dialog.show()
+        self.memory_vault_dialog.raise_()
+        self.memory_vault_dialog.activateWindow()
 
     def init_tray_icon(self):
         icon = self._create_default_tray_icon()

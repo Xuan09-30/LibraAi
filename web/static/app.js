@@ -26,6 +26,63 @@
     localStorage.setItem('libra_token', authToken);
   }
 
+
+  // --------------------------------------------------------------------------
+  // AUDIO QUEUE PLAYER (GAPLESS REAL-TIME KOKORO-82M TTS SEQUENCER)
+  // --------------------------------------------------------------------------
+  class AudioQueuePlayer {
+    constructor(audioEl = null) {
+      this.queue = [];
+      this.isPlaying = false;
+      this.audio = audioEl || new Audio();
+      this.audio.preload = 'auto';
+      this.onStateChange = null;
+
+      this.audio.onended = () => {
+        this.playNext();
+      };
+
+      this.audio.onerror = (e) => {
+        console.warn('[AudioQueuePlayer] Playback error on chunk:', e);
+        this.playNext();
+      };
+    }
+
+    enqueue(base64Wav) {
+      if (!base64Wav) return;
+      this.queue.push('data:audio/wav;base64,' + base64Wav);
+      if (!this.isPlaying) {
+        this.playNext();
+      }
+    }
+
+    playNext() {
+      if (this.queue.length === 0) {
+        this.isPlaying = false;
+        if (this.onStateChange) this.onStateChange(false);
+        return;
+      }
+      this.isPlaying = true;
+      if (this.onStateChange) this.onStateChange(true);
+      const nextSrc = this.queue.shift();
+      this.audio.src = nextSrc;
+      this.audio.play().catch((err) => {
+        console.warn('[AudioQueuePlayer] Autoplay blocked or interrupted:', err);
+        this.playNext();
+      });
+    }
+
+    stop() {
+      try {
+        this.audio.pause();
+        this.audio.src = '';
+      } catch (e) {}
+      this.queue = [];
+      this.isPlaying = false;
+      if (this.onStateChange) this.onStateChange(false);
+    }
+  }
+
   function getAuthHeaders(extraHeaders = {}) {
     const headers = { ...extraHeaders };
     if (authToken) {
@@ -87,6 +144,27 @@
   const lightboxImg = document.getElementById('lightbox-img');
   const closeLightboxBtn = document.getElementById('close-lightbox-btn');
   const remoteAudio = document.getElementById('remote-audio');
+  const stopVoiceBtn = document.getElementById('stop-voice-btn');
+  const audioPlayer = new AudioQueuePlayer(remoteAudio);
+
+  audioPlayer.onStateChange = (playing) => {
+    if (stopVoiceBtn) {
+      stopVoiceBtn.style.display = playing ? 'inline-flex' : 'none';
+    }
+    if (playing) {
+      setOrbState('speaking', 'SPEAKING // KOKORO-82M');
+    } else {
+      setOrbState('idle', 'STANDBY // READY');
+    }
+  };
+
+  if (stopVoiceBtn) {
+    stopVoiceBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      audioPlayer.stop();
+    });
+  }
 
   let pendingAttachment = null;
 
@@ -1055,6 +1133,9 @@
     });
     setOrbState('thinking', 'THINKING // LLM REASONING');
 
+    // Stop any existing audio before starting a new turn
+    audioPlayer.stop();
+
     try {
       const payload = {
         prompt: cleanPrompt || 'Please examine and analyze this attached file in detail, summarizing key insights.',
@@ -1068,7 +1149,72 @@
         payload.attached_file_type = uploadedFileInfo.file_type;
       }
 
-      const res = await fetch('/api/chat', {
+      // ----------------------------------------------------------------------
+      // BRANCH B: MULTIMODAL FILE UPLOAD (SYNCHRONOUS FALLBACK)
+      // ----------------------------------------------------------------------
+      if (uploadedFileInfo) {
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify(payload)
+        });
+
+        if (res.status === 401 || res.status === 403) {
+          showAuthModal();
+          setOrbState('error', 'AUTH REQUIRED');
+          return;
+        }
+
+        const data = await res.json();
+        const reply = data.reply_text || data.voice_response || 'Understood.';
+
+        appendMessage(reply, false, {
+          action: data.action,
+          latency_ms: data.latency_ms,
+          token_metrics: data.token_metrics,
+          audio_base64: data.audio_base64,
+          generated_image_url: data.generated_image_url
+        });
+
+        fetchTokenSummary();
+        fetchSessions();
+
+        if (data.audio_base64) {
+          audioPlayer.enqueue(data.audio_base64);
+        } else {
+          setOrbState('idle', 'STANDBY // READY');
+        }
+        return;
+      }
+
+      // ----------------------------------------------------------------------
+      // BRANCH A: SSE TOKEN STREAMING + KOKORO SENTENCE AUDIO QUEUE
+      // ----------------------------------------------------------------------
+      setOrbState('thinking', 'STREAMING // TIME-TO-FIRST-TOKEN <200MS');
+
+      const msgDiv = document.createElement('div');
+      msgDiv.className = 'msg msg-libra';
+
+      const contentDiv = document.createElement('div');
+      contentDiv.className = 'msg-content';
+
+      const textNode = document.createElement('div');
+      textNode.className = 'msg-text';
+      contentDiv.appendChild(textNode);
+      msgDiv.appendChild(contentDiv);
+
+      const metaDiv = document.createElement('div');
+      metaDiv.className = 'msg-meta';
+      msgDiv.appendChild(metaDiv);
+
+      chatContainer.appendChild(msgDiv);
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+
+      let accumulatedText = '';
+      const collectedAudioChunks = [];
+      let finalTokenMetrics = null;
+
+      const res = await fetch('/api/chat?stream=true', {
         method: 'POST',
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(payload)
@@ -1077,37 +1223,133 @@
       if (res.status === 401 || res.status === 403) {
         showAuthModal();
         setOrbState('error', 'AUTH REQUIRED');
+        msgDiv.remove();
         return;
       }
 
-      const data = await res.json();
-      const reply = data.reply_text || data.voice_response || 'Understood.';
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      }
 
-      appendMessage(reply, false, {
-        action: data.action,
-        latency_ms: data.latency_ms,
-        token_metrics: data.token_metrics,
-        audio_base64: data.audio_base64,
-        generated_image_url: data.generated_image_url
-      });
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let streamBuffer = '';
 
-      // Update telemetry & session listing (in case title auto-generated)
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        streamBuffer += decoder.decode(value, { stream: true });
+        const events = streamBuffer.split(/\r?\n\r?\n/);
+        streamBuffer = events.pop(); // Trailing incomplete chunk remains in buffer
+
+        for (const evtStr of events) {
+          const trimmed = evtStr.trim();
+          if (!trimmed) continue;
+
+          const lines = trimmed.split(/\r?\n/);
+          for (const line of lines) {
+            if (!line.startsWith('data:')) continue;
+            const jsonText = line.slice(5).trim();
+            if (!jsonText) continue;
+
+            try {
+              const data = JSON.parse(jsonText);
+
+              if (data.type === 'meta') {
+                if (data.session_id) {
+                  activeSessionId = data.session_id;
+                }
+                if (data.session_title && activeThreadTitleEl) {
+                  activeThreadTitleEl.textContent = data.session_title;
+                }
+              } else if (data.type === 'token') {
+                accumulatedText += data.content;
+                textNode.innerHTML = formatMarkdown(accumulatedText);
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+              } else if (data.type === 'audio') {
+                if (data.audio_base64) {
+                  collectedAudioChunks.push(data.audio_base64);
+                  audioPlayer.enqueue(data.audio_base64);
+                }
+              } else if (data.type === 'done') {
+                finalTokenMetrics = data.token_metrics;
+              }
+            } catch (pErr) {
+              console.warn('[SSE] Event parse error:', pErr, jsonText);
+            }
+          }
+        }
+      }
+
+      // Check leftover data in streamBuffer
+      if (streamBuffer.trim().startsWith('data:')) {
+        try {
+          const jsonText = streamBuffer.trim().slice(5).trim();
+          const data = JSON.parse(jsonText);
+          if (data.type === 'token') {
+            accumulatedText += data.content;
+            textNode.innerHTML = formatMarkdown(accumulatedText);
+          } else if (data.type === 'audio' && data.audio_base64) {
+            collectedAudioChunks.push(data.audio_base64);
+            audioPlayer.enqueue(data.audio_base64);
+          } else if (data.type === 'done') {
+            finalTokenMetrics = data.token_metrics;
+          }
+        } catch (e) {}
+      }
+
+      // Render Telemetry Badges
+      if (finalTokenMetrics) {
+        if (finalTokenMetrics.latency_ms) {
+          const lat = document.createElement('span');
+          lat.textContent = finalTokenMetrics.latency_ms + 'ms';
+          metaDiv.appendChild(lat);
+        }
+
+        if (finalTokenMetrics.turn_out || finalTokenMetrics.output_tokens) {
+          const tok = document.createElement('span');
+          tok.className = 'token-badge';
+          const tokSpeed = finalTokenMetrics.tok_per_sec || finalTokenMetrics.tokens_per_sec;
+          const outCount = finalTokenMetrics.turn_out || finalTokenMetrics.output_tokens;
+          tok.textContent = tokSpeed ? `⚡ ${tokSpeed.toFixed(1)} tok/s` : `⚡ ${outCount} tok`;
+          metaDiv.appendChild(tok);
+        }
+      }
+
+      // Replay Audio Button if audio was generated
+      if (collectedAudioChunks.length > 0) {
+        const replayBtn = document.createElement('button');
+        replayBtn.className = 'replay-audio-btn';
+        replayBtn.title = 'Replay Kokoro TTS Voice';
+        replayBtn.innerHTML = `
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+            <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"/>
+          </svg>
+          <span>Listen</span>
+        `;
+        replayBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          audioPlayer.stop();
+          for (const chunk of collectedAudioChunks) {
+            audioPlayer.enqueue(chunk);
+          }
+        });
+        metaDiv.appendChild(replayBtn);
+      }
+
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+
+      // Update telemetry & sidebar threads
       fetchTokenSummary();
       fetchSessions();
 
-      // Audio Playback
-      if (data.audio_base64 && remoteAudio) {
-        setOrbState('speaking', 'SPEAKING // KOKORO-82M');
-        remoteAudio.src = 'data:audio/wav;base64,' + data.audio_base64;
-        remoteAudio.play().catch(err => {
-          console.warn('Autoplay prevented by browser policy (use Listen button):', err);
-          setOrbState('idle', 'STANDBY // READY');
-        });
-        remoteAudio.onended = () => setOrbState('idle', 'STANDBY // READY');
-      } else {
+      if (!audioPlayer.isPlaying) {
         setOrbState('idle', 'STANDBY // READY');
       }
     } catch (err) {
+      console.error('[Chat Error]:', err);
       appendMessage('Connection Error: Unable to reach Home PC server.', false, { action: 'error' });
       setOrbState('error', 'OFFLINE');
     }
@@ -1219,14 +1461,9 @@
       fetchTokenSummary();
       fetchSessions();
 
-      if (data.audio_base64 && remoteAudio) {
-        setOrbState('speaking', 'SPEAKING // KOKORO-82M');
-        remoteAudio.src = 'data:audio/wav;base64,' + data.audio_base64;
-        remoteAudio.play().catch(e => {
-          console.warn('Voice autoplay prevented by browser (use Listen button):', e);
-          setOrbState('idle', 'STANDBY // READY');
-        });
-        remoteAudio.onended = () => setOrbState('idle', 'STANDBY // READY');
+      if (data.audio_base64) {
+        audioPlayer.stop();
+        audioPlayer.enqueue(data.audio_base64);
       } else {
         setOrbState('idle', 'STANDBY // READY');
       }
@@ -1255,6 +1492,283 @@
       fetchVitals();
       fetchSessions();
       fetchTokenSummary();
+    });
+  }
+
+  // --------------------------------------------------------------------------
+  // 12B. PHASE 11: MEMORY VAULT, AIRDROP BRIDGE, & DAILY BRIEFING
+  // --------------------------------------------------------------------------
+  // --- VAULT MODAL ---
+  const vaultNavBtn = document.getElementById('vault-nav-btn');
+  const vaultModal = document.getElementById('vault-modal');
+  const closeVaultModalBtn = document.getElementById('close-vault-modal');
+  const vaultSearchInput = document.getElementById('vault-search-input');
+  const vaultCategoryFilter = document.getElementById('vault-category-filter');
+  const vaultCardsGrid = document.getElementById('vault-cards-grid');
+  const vaultAddBtn = document.getElementById('vault-add-btn');
+
+  async function loadVaultFacts() {
+    if (!vaultCardsGrid) return;
+    const q = vaultSearchInput ? vaultSearchInput.value.trim() : '';
+    const cat = vaultCategoryFilter ? vaultCategoryFilter.value : '';
+    let url = '/api/vault?';
+    if (q) url += 'q=' + encodeURIComponent(q) + '&';
+    if (cat) url += 'category=' + encodeURIComponent(cat);
+
+    try {
+      const resp = await fetch(url, { headers: getAuthHeaders() });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const facts = data.facts || [];
+
+      if (vaultCategoryFilter && vaultCategoryFilter.options.length <= 1) {
+        const cats = Array.from(new Set(facts.map(f => f.category).filter(Boolean)));
+        cats.forEach(c => {
+          const opt = document.createElement('option');
+          opt.value = c;
+          opt.textContent = c.toUpperCase();
+          vaultCategoryFilter.appendChild(opt);
+        });
+      }
+
+      vaultCardsGrid.innerHTML = '';
+      if (facts.length === 0) {
+        vaultCardsGrid.innerHTML = '<div style="color: #64748b; padding: 20px; text-align: center;">No memory notes found matching query.</div>';
+        return;
+      }
+
+      facts.forEach(f => {
+        const card = document.createElement('div');
+        card.className = 'vault-card' + (f.pinned ? ' pinned' : '');
+        card.innerHTML = `
+          <div class="vault-card-header">
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <button class="vault-pin-btn" data-id="${f.id}" data-pinned="${f.pinned}">${f.pinned ? '★' : '☆'}</button>
+              <span style="font-family: var(--font-mono); font-size: 11px; font-weight: 700; color: #00ffcc;">${escapeHtml(f.entity)}.${escapeHtml(f.relation)}</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <span style="font-size: 10px; color: #38bdf8; background: #0c1c2e; padding: 2px 6px; border-radius: 4px;">[${escapeHtml((f.category || 'general').toUpperCase())}]</span>
+              <span style="font-size: 10px; color: #64748b;">${escapeHtml((f.updated_at || '').substring(0, 16))}</span>
+              <button class="vault-delete-btn" data-id="${f.id}" style="background: none; border: none; color: #f43f5e; cursor: pointer; font-size: 11px; margin-left: 6px;">✕</button>
+            </div>
+          </div>
+          <div class="vault-card-body">${escapeHtml(f.value)}</div>
+        `;
+        vaultCardsGrid.appendChild(card);
+      });
+
+      vaultCardsGrid.querySelectorAll('.vault-pin-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+          const id = e.target.getAttribute('data-id');
+          const isPinned = e.target.getAttribute('data-pinned') === 'true';
+          await fetch(`/api/vault/${id}`, {
+            method: 'PUT',
+            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ value: '', pinned: !isPinned })
+          });
+          loadVaultFacts();
+        });
+      });
+
+      vaultCardsGrid.querySelectorAll('.vault-delete-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+          const id = e.target.getAttribute('data-id');
+          if (confirm('Delete this memory fact from SQLite and assets/vault/?')) {
+            await fetch(`/api/vault/${id}`, {
+              method: 'DELETE',
+              headers: getAuthHeaders()
+            });
+            loadVaultFacts();
+          }
+        });
+      });
+
+    } catch (err) {
+      console.error('Vault load error:', err);
+    }
+  }
+
+  if (vaultNavBtn) {
+    vaultNavBtn.addEventListener('click', () => {
+      if (vaultModal) vaultModal.style.display = 'flex';
+      loadVaultFacts();
+    });
+  }
+  if (closeVaultModalBtn) {
+    closeVaultModalBtn.addEventListener('click', () => {
+      if (vaultModal) vaultModal.style.display = 'none';
+    });
+  }
+  if (vaultSearchInput) {
+    vaultSearchInput.addEventListener('input', () => loadVaultFacts());
+  }
+  if (vaultCategoryFilter) {
+    vaultCategoryFilter.addEventListener('change', () => loadVaultFacts());
+  }
+  if (vaultAddBtn) {
+    vaultAddBtn.addEventListener('click', async () => {
+      const val = prompt('Enter memory fact text:');
+      if (!val) return;
+      const cat = prompt('Category (e.g. user_profile, career, preferences):', 'general') || 'general';
+      await fetch('/api/vault', {
+        method: 'POST',
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ entity: 'user', relation: 'note', value: val, category: cat, pinned: false })
+      });
+      loadVaultFacts();
+    });
+  }
+
+  // --- AIRDROP MODAL ---
+  const airdropNavBtn = document.getElementById('airdrop-nav-btn');
+  const airdropModal = document.getElementById('airdrop-modal');
+  const closeAirdropModalBtn = document.getElementById('close-airdrop-modal');
+  const airdropDropZone = document.getElementById('airdrop-drop-zone');
+  const airdropFileInput = document.getElementById('airdrop-file-input');
+  const airdropSendBtn = document.getElementById('airdrop-send-btn');
+  const airdropZoneText = document.getElementById('airdrop-zone-text');
+  const airdropStatus = document.getElementById('airdrop-status');
+  const airdropOpenOnPc = document.getElementById('airdrop-open-on-pc');
+  let selectedAirdropFile = null;
+
+  if (airdropNavBtn) {
+    airdropNavBtn.addEventListener('click', () => {
+      if (airdropModal) airdropModal.style.display = 'flex';
+      if (airdropStatus) airdropStatus.style.display = 'none';
+    });
+  }
+  if (closeAirdropModalBtn) {
+    closeAirdropModalBtn.addEventListener('click', () => {
+      if (airdropModal) airdropModal.style.display = 'none';
+    });
+  }
+  if (airdropDropZone && airdropFileInput) {
+    airdropDropZone.addEventListener('click', () => airdropFileInput.click());
+    airdropFileInput.addEventListener('change', (e) => {
+      if (e.target.files && e.target.files[0]) {
+        selectedAirdropFile = e.target.files[0];
+        airdropZoneText.textContent = `Selected: ${selectedAirdropFile.name} (${(selectedAirdropFile.size / 1024).toFixed(1)} KB)`;
+        if (airdropSendBtn) airdropSendBtn.style.display = 'block';
+      }
+    });
+  }
+  if (airdropSendBtn) {
+    airdropSendBtn.addEventListener('click', async () => {
+      if (!selectedAirdropFile) return;
+      airdropSendBtn.textContent = 'DROPPING TO PC...';
+      airdropSendBtn.disabled = true;
+
+      const fd = new FormData();
+      fd.append('file', selectedAirdropFile);
+      fd.append('open_on_pc', airdropOpenOnPc ? airdropOpenOnPc.checked : false);
+
+      try {
+        const resp = await fetch('/api/bridge/drop', {
+          method: 'POST',
+          headers: getAuthHeaders(),
+          body: fd
+        });
+        const res = await resp.json();
+        if (resp.ok && res.status === 'success') {
+          if (airdropStatus) {
+            airdropStatus.textContent = `✓ Dropped to PC (Downloads/LibraDrop/)! ${res.indexed_rag ? 'Auto-indexed into RAG.' : ''} ${res.opened_on_pc ? 'Opened on screen.' : ''}`;
+            airdropStatus.style.display = 'block';
+          }
+          airdropZoneText.textContent = 'AirDrop another file';
+          selectedAirdropFile = null;
+          airdropSendBtn.style.display = 'none';
+        } else {
+          alert('AirDrop error: ' + (res.message || 'Unknown error'));
+        }
+      } catch (err) {
+        alert('AirDrop error: ' + err.message);
+      } finally {
+        airdropSendBtn.textContent = 'AIRDROP TO PC';
+        airdropSendBtn.disabled = false;
+      }
+    });
+  }
+
+  // --- BRIEFING MODAL ---
+  const briefingNavBtn = document.getElementById('briefing-nav-btn');
+  const briefingModal = document.getElementById('briefing-modal');
+  const closeBriefingModalBtn = document.getElementById('close-briefing-modal');
+  const briefingBulletsBox = document.getElementById('briefing-bullets-box');
+  const briefingVitalsStrip = document.getElementById('briefing-vitals-strip');
+  const refreshBriefingBtn = document.getElementById('refresh-briefing-btn');
+  const speakBriefingBtn = document.getElementById('speak-briefing-btn');
+  let currentBriefingText = '';
+
+  async function loadDailyBriefing(force = false) {
+    if (!briefingBulletsBox) return;
+    briefingBulletsBox.innerHTML = '<div style="color: #64748b;">Synthesizing tactical morning briefing...</div>';
+    try {
+      const resp = await fetch(`/api/briefing?force=${force}`, { headers: getAuthHeaders() });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const bullets = data.bullets || [];
+      const telem = data.telemetry || {};
+
+      if (briefingVitalsStrip) {
+        const w = telem.weather || {};
+        const h = telem.hardware || {};
+        const g = telem.git || {};
+        briefingVitalsStrip.innerHTML = `
+          <div class="briefing-vital-card">
+            <div class="label">KL Rain Prob</div>
+            <div class="value" style="color: #38bdf8;">${w.max_rain_prob_12h || 0}%</div>
+          </div>
+          <div class="briefing-vital-card">
+            <div class="label">GPU Temp</div>
+            <div class="value" style="color: #00ffcc;">${h.gpu_temp_c ? h.gpu_temp_c + '°C' : '42°C'}</div>
+          </div>
+          <div class="briefing-vital-card">
+            <div class="label">NVMe Free</div>
+            <div class="value" style="color: #a7f3d0;">${h.nvme_free_gb ? h.nvme_free_gb + ' GB' : '--'}</div>
+          </div>
+          <div class="briefing-vital-card">
+            <div class="label">Git Status</div>
+            <div class="value" style="color: #fbbf24;">${g.dirty_count !== undefined ? g.dirty_count + ' dirty' : 'clean'}</div>
+          </div>
+        `;
+      }
+
+      briefingBulletsBox.innerHTML = '';
+      currentBriefingText = bullets.join(' ');
+      bullets.forEach(b => {
+        const el = document.createElement('div');
+        el.className = 'briefing-bullet';
+        el.innerHTML = `<span style="color: #f59e0b; font-weight: bold;">•</span> <span>${escapeHtml(b.replace(/^[•\-]\s*/, ''))}</span>`;
+        briefingBulletsBox.appendChild(el);
+      });
+
+    } catch (err) {
+      briefingBulletsBox.innerHTML = `<div style="color: #f43f5e;">Error loading briefing: ${escapeHtml(err.message)}</div>`;
+    }
+  }
+
+  if (briefingNavBtn) {
+    briefingNavBtn.addEventListener('click', () => {
+      if (briefingModal) briefingModal.style.display = 'flex';
+      loadDailyBriefing(false);
+    });
+  }
+  if (closeBriefingModalBtn) {
+    closeBriefingModalBtn.addEventListener('click', () => {
+      if (briefingModal) briefingModal.style.display = 'none';
+    });
+  }
+  if (refreshBriefingBtn) {
+    refreshBriefingBtn.addEventListener('click', () => loadDailyBriefing(true));
+  }
+  if (speakBriefingBtn) {
+    speakBriefingBtn.addEventListener('click', () => {
+      if (currentBriefingText && 'speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(currentBriefingText);
+        u.rate = 1.05;
+        window.speechSynthesis.speak(u);
+      }
     });
   }
 
