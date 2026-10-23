@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from typing import Optional, Dict, Any, List
 
+from core.trust_guard import get_trust_guard, RiskTier
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
@@ -506,6 +508,10 @@ class FileManager:
 
         if not dry_run:
             try:
+                # Trust Guard Amber Tier: snapshot original file before modification for instant undo
+                if os.path.exists(resolved_path) and os.path.isfile(resolved_path):
+                    get_trust_guard().snapshot_file(resolved_path, op_name="write_to_file")
+
                 write_mode = "a" if mode == "append" else "w"
                 with open(resolved_path, write_mode, encoding="utf-8") as f:
                     if mode == "append" and os.path.exists(resolved_path) and os.path.getsize(resolved_path) > 0:
@@ -524,8 +530,76 @@ class FileManager:
             "status": "updated",
             "path": resolved_path,
             "name": self.last_file_name,
-            "voice_response": f"Updated {self.last_file_name}."
+            "voice_response": f"Updated {self.last_file_name}.",
+            "risk_tier": RiskTier.AMBER.value,
+            "undo_available": True
         }
+
+    def delete_file(
+        self,
+        file_path_or_name: str,
+        dry_run: bool = False,
+        force: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Deletes a specified file with TrustGuard RED tier confirmation guard and automatic snapshot.
+        """
+        if not file_path_or_name:
+            return {"status": "error", "voice_response": "No file specified for deletion."}
+
+        resolved_path = None
+        if os.path.isabs(file_path_or_name) and (dry_run or os.path.exists(file_path_or_name)):
+            resolved_path = file_path_or_name
+        else:
+            resolved_path = self.search_path(file_path_or_name, folders_only=False)
+
+        if not resolved_path or not os.path.exists(resolved_path):
+            return {"status": "not_found", "voice_response": f"File '{file_path_or_name}' could not be located."}
+
+        file_name = os.path.basename(resolved_path)
+
+        # Red Tier: Block & Prompt unless force/approval is provided
+        if not force and not dry_run:
+            ticket = get_trust_guard().request_red_approval(
+                action_name="delete_file",
+                target=resolved_path,
+                description=f"Permanently delete file: {file_name}",
+                diff_preview=f"- Deleting: {resolved_path} ({os.path.getsize(resolved_path)} bytes)"
+            )
+            return {
+                "status": "pending_approval",
+                "risk_tier": RiskTier.RED.value,
+                "token": ticket["token"],
+                "path": resolved_path,
+                "voice_response": f"Confirmation required before deleting {file_name}. Approval ticket generated."
+            }
+
+        # Snapshot before deletion so it can be completely undone
+        if not dry_run:
+            get_trust_guard().snapshot_file(resolved_path, op_name="delete_file")
+            try:
+                os.remove(resolved_path)
+            except Exception as e:
+                return {"status": "error", "voice_response": f"Failed to delete {file_name}: {e}"}
+
+        return {
+            "status": "deleted",
+            "path": resolved_path,
+            "name": file_name,
+            "voice_response": f"Deleted {file_name}. Snapshot preserved in Trust Guard for undo.",
+            "risk_tier": RiskTier.RED.value,
+            "undo_available": True
+        }
+
+    def undo_last_change(self, file_path: Optional[str] = None) -> Dict[str, Any]:
+        """Reverts the latest change using TrustGuard."""
+        target = file_path or self.last_file_path
+        res = get_trust_guard().undo_last(target)
+        if res.get("status") == "success":
+            res["voice_response"] = f"Reverted latest file changes to {os.path.basename(res['restored_path'])}."
+        else:
+            res["voice_response"] = res.get("message", "Unable to undo file change.")
+        return res
 
     def open_file(self, query: str = "", dry_run: bool = False) -> Dict[str, Any]:
         """

@@ -1,4 +1,5 @@
 import os
+import re
 import io
 import sys
 import json
@@ -17,7 +18,9 @@ from fastapi import (
     FastAPI, Request, Response, HTTPException, Depends,
     File, UploadFile, Query, Path, Body, WebSocket, WebSocketDisconnect, Form
 )
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, StreamingResponse
+import httpx
+import asyncio
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -30,6 +33,9 @@ from core.version import LIBRA_VERSION, get_full_version_string
 from core.orchestrator import SupervisorHub
 from core.llm import LocalLLM
 from tools.system_monitor import SystemMonitor
+from core.trust_guard import get_trust_guard
+from core.briefing import BriefingAndWorkspaces
+from tools.file_manager import FileManager
 
 logger = logging.getLogger("libra.web")
 
@@ -119,6 +125,36 @@ def convert_to_16k_mono_pcm(audio_bytes: bytes) -> np.ndarray:
         return np.zeros(0, dtype=np.float32)
 
 
+
+def get_or_init_tts(supervisor):
+    """Lazy-initializes or returns the KokoroTTS instance on supervisor.llm."""
+    tts = getattr(supervisor.llm, "tts", None)
+    if not tts:
+        try:
+            from core.kokoro_tts import KokoroTTS
+            tts = KokoroTTS(voice="af_heart", device="cuda")
+            supervisor.llm.tts = tts
+        except Exception as e:
+            logger.warning(f"Could not lazy-load KokoroTTS: {e}")
+    return tts
+
+
+def synthesize_sentence_wav_b64(supervisor, text: str) -> Optional[str]:
+    """Synthesizes a sentence via Kokoro TTS, returns base64 WAV string."""
+    clean_text = text.strip()
+    if not clean_text:
+        return None
+    try:
+        tts = get_or_init_tts(supervisor)
+        if tts and hasattr(tts, "synthesize_stream"):
+            chunks = list(tts.synthesize_stream(clean_text))
+            if chunks:
+                wav_bytes = pcm_to_wav_bytes(b"".join(chunks), sample_rate=24000)
+                return base64.b64encode(wav_bytes).decode("utf-8")
+    except Exception as e:
+        logger.warning(f"Sentence TTS error: {e}")
+    return None
+
 def pcm_to_wav_bytes(pcm_bytes: bytes, sample_rate: int = 24000) -> bytes:
     """Packs int16 PCM bytes into standard RIFF WAV format."""
     buf = io.BytesIO()
@@ -141,6 +177,7 @@ class ChatRequest(BaseModel):
     attached_file_path: Optional[str] = Field(None, description="Server path to uploaded image/document")
     attached_file_name: Optional[str] = Field(None, description="Original filename of attachment")
     attached_file_type: Optional[str] = Field(None, description="Attachment type: image or document")
+    stream: Optional[bool] = Field(None, description="Whether to stream response via SSE")
 
 
 class NewSessionRequest(BaseModel):
@@ -150,6 +187,29 @@ class NewSessionRequest(BaseModel):
 
 class RenameSessionRequest(BaseModel):
     title: str = Field(..., description="Updated title for chat session")
+
+
+class VaultFactRequest(BaseModel):
+    entity: str = Field("user", description="Fact entity name")
+    relation: str = Field("note", description="Fact relation")
+    value: str = Field(..., description="Fact text content")
+    category: Optional[str] = Field("general", description="Vault category")
+    pinned: Optional[bool] = Field(False, description="Pin status")
+
+
+class UpdateVaultFactRequest(BaseModel):
+    value: str = Field(..., description="Updated fact text content")
+    category: Optional[str] = Field(None, description="Updated category")
+    pinned: Optional[bool] = Field(None, description="Updated pin status")
+
+
+class TrustConfirmRequest(BaseModel):
+    token: str = Field(..., description="Approval token")
+    approve: bool = Field(..., description="Approve or reject action")
+
+
+class TrustUndoRequest(BaseModel):
+    file_path: Optional[str] = Field(None, description="Optional target file path to revert")
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +375,172 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         return FileResponse(target, media_type=mime_type or "application/octet-stream")
 
     # -----------------------------------------------------------------------
+    # MEMORY VAULT API (Phase 11 Obsidian Sync)
+    # -----------------------------------------------------------------------
+    @app.get("/api/vault")
+    async def get_vault_facts_api(
+        q: Optional[str] = Query(None),
+        category: Optional[str] = Query(None),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        memory = getattr(supervisor.llm, "memory", None)
+        if memory and hasattr(memory, "get_vault_facts"):
+            facts = memory.get_vault_facts(query=q, category=category)
+            return {"status": "success", "facts": facts, "count": len(facts)}
+        return {"status": "error", "message": "Memory offline", "facts": []}
+
+    @app.post("/api/vault")
+    async def create_vault_fact_api(
+        req: VaultFactRequest = Body(...),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        memory = getattr(supervisor.llm, "memory", None)
+        if memory and hasattr(memory, "upsert_semantic_fact"):
+            fid = memory.upsert_semantic_fact(
+                entity=req.entity,
+                relation=req.relation,
+                value=req.value,
+                category=req.category or "general",
+                pinned=bool(req.pinned)
+            )
+            return {"status": "success", "id": fid}
+        return {"status": "error", "message": "Memory offline"}
+
+    @app.put("/api/vault/{fact_id}")
+    async def update_vault_fact_api(
+        fact_id: int = Path(...),
+        req: UpdateVaultFactRequest = Body(...),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        memory = getattr(supervisor.llm, "memory", None)
+        if memory and hasattr(memory, "update_vault_fact"):
+            ok = memory.update_vault_fact(
+                fact_id=fact_id,
+                value=req.value,
+                category=req.category,
+                pinned=req.pinned
+            )
+            return {"status": "success" if ok else "error", "id": fact_id}
+        return {"status": "error", "message": "Memory offline"}
+
+    @app.delete("/api/vault/{fact_id}")
+    async def delete_vault_fact_api(
+        fact_id: int = Path(...),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        memory = getattr(supervisor.llm, "memory", None)
+        if memory and hasattr(memory, "delete_vault_fact"):
+            ok = memory.delete_vault_fact(fact_id=fact_id)
+            return {"status": "success" if ok else "error", "id": fact_id}
+        return {"status": "error", "message": "Memory offline"}
+
+    # -----------------------------------------------------------------------
+    # AIRDROP BRIDGE API (Phone <-> PC)
+    # -----------------------------------------------------------------------
+    @app.post("/api/bridge/drop")
+    async def bridge_drop_file(
+        file: UploadFile = File(...),
+        open_on_pc: bool = Form(False),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        user_home = os.path.expanduser("~")
+        drop_dir = os.path.join(user_home, "Downloads", "LibraDrop")
+        os.makedirs(drop_dir, exist_ok=True)
+
+        raw_filename = file.filename or "dropped_file"
+        clean_filename = os.path.basename(raw_filename)
+        dest_path = os.path.join(drop_dir, clean_filename)
+
+        content = await file.read()
+        with open(dest_path, "wb") as f:
+            f.write(content)
+
+        ext = os.path.splitext(clean_filename)[1].lower()
+        rag_indexed = False
+        if ext in [".pdf", ".docx", ".txt", ".md", ".py", ".csv", ".json"]:
+            try:
+                doc_rag = getattr(supervisor.llm, "document_rag", None)
+                if doc_rag and hasattr(doc_rag, "index_file"):
+                    res = doc_rag.index_file(dest_path)
+                    rag_indexed = (res.get("status") == "indexed")
+            except Exception as e:
+                logger.warning(f"RAG auto-index error: {e}")
+
+        opened = False
+        if open_on_pc and sys.platform == "win32":
+            try:
+                os.startfile(dest_path)
+                opened = True
+            except Exception as e:
+                logger.warning(f"Error opening on PC: {e}")
+
+        return {
+            "status": "success",
+            "message": f"Successfully dropped {clean_filename} to PC Downloads/LibraDrop.",
+            "path": dest_path,
+            "filename": clean_filename,
+            "size": len(content),
+            "indexed_rag": rag_indexed,
+            "opened_on_pc": opened
+        }
+
+    @app.get("/api/bridge/download")
+    async def bridge_download_file(
+        path: str = Query(...),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        norm_path = os.path.normpath(path)
+        if not os.path.isfile(norm_path):
+            raise HTTPException(status_code=404, detail="File not found on PC.")
+
+        filename = os.path.basename(norm_path)
+        import mimetypes
+        mime_type, _ = mimetypes.guess_type(norm_path)
+        return FileResponse(
+            norm_path,
+            filename=filename,
+            media_type=mime_type or "application/octet-stream"
+        )
+
+    # -----------------------------------------------------------------------
+    # TRUST GUARD CONFIRMATION & UNDO API
+    # -----------------------------------------------------------------------
+    @app.get("/api/trust/pending")
+    async def get_trust_pending(auth: Dict[str, Any] = Depends(authenticate_request)):
+        tg = get_trust_guard()
+        return {"status": "success", "pending": tg.get_pending_approvals()}
+
+    @app.post("/api/trust/confirm")
+    async def confirm_trust_action(
+        req: TrustConfirmRequest = Body(...),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        tg = get_trust_guard()
+        return tg.resolve_approval(req.token, req.approve)
+
+    @app.post("/api/trust/undo")
+    async def undo_trust_action(
+        req: TrustUndoRequest = Body(...),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        tg = get_trust_guard()
+        return tg.undo_last(req.file_path)
+
+    # -----------------------------------------------------------------------
+    # DAILY TACTICAL BRIEFING API
+    # -----------------------------------------------------------------------
+    @app.get("/api/briefing")
+    async def get_daily_briefing(
+        force: bool = Query(False),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        briefing = getattr(supervisor.llm, "briefing_engine", None)
+        if not briefing:
+            briefing = BriefingAndWorkspaces(memory=getattr(supervisor.llm, "memory", None))
+        res = briefing.generate_tactical_briefing(force=force, deliver_audio=False)
+        return res._data if hasattr(res, "_data") else {"status": "success", "summary": str(res)}
+
+    # -----------------------------------------------------------------------
     # MULTI-CHAT SESSIONS API (Phase 10 Gemini-Style Threads)
     # -----------------------------------------------------------------------
     @app.get("/api/sessions")
@@ -433,11 +659,277 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     # CHAT & VOICE INFERENCE ENDPOINTS
     # -----------------------------------------------------------------------
     @app.post("/api/chat")
-    async def post_chat(req: ChatRequest, auth: Dict[str, Any] = Depends(authenticate_request)):
+    async def post_chat(
+        req: ChatRequest,
+        stream: Optional[bool] = Query(None),
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
         """
         Executes a prompt through SupervisorHub under client_scope='remote_web'
         linked to session_id, recording exact token analytics.
+        Supports SSE token streaming & sentence-level Kokoro audio streaming when stream=true.
         """
+        scope = req.client_scope or "remote_web"
+        memory = getattr(supervisor.llm, "memory", None)
+        should_stream = (stream is True) or (req.stream is True)
+
+        # -------------------------------------------------------------------
+        # BRANCH A: SSE TOKEN STREAMING + KOKORO SENTENCE AUDIO QUEUE
+        # -------------------------------------------------------------------
+        if should_stream and not req.attached_file_path:
+            async def event_generator():
+                t0_stream = time.perf_counter()
+
+                # 1. Ensure or auto-create session thread
+                sid = req.session_id
+                if not sid:
+                    if memory and hasattr(memory, "create_session"):
+                        raw_sid = memory.create_session(title="New Chat", client_scope=scope)
+                        sid = str(raw_sid) if (raw_sid and not hasattr(raw_sid, "_mock_return_value")) else "default"
+                    else:
+                        sid = "default"
+                else:
+                    sid = str(sid)
+
+                sess_title = "New Chat"
+                if memory and hasattr(memory, "get_session"):
+                    sm = memory.get_session(sid)
+                    if isinstance(sm, dict):
+                        sess_title = str(sm.get("title", "New Chat"))
+
+                # 1.1 Emit Meta Event immediately (<20ms)
+                yield f"data: {json.dumps({'type': 'meta', 'session_id': sid, 'session_title': sess_title})}\n\n"
+
+                # 1.2 Check Desktop Sandbox Safeguard for remote_web scope
+                if scope == "remote_web":
+                    for pat in getattr(supervisor, "REMOTE_SANDBOX_PATTERNS", []):
+                        if re.search(pat, req.prompt, re.IGNORECASE):
+                            if not re.search(r"open\s+(?:my\s+)?(?:google\s+)?calendar\b", req.prompt, re.IGNORECASE):
+                                sandbox_msg = "Remote Web Mode active: Desktop OS control is restricted to local PC sessions."
+                                yield f"data: {json.dumps({'type': 'token', 'content': sandbox_msg})}\n\n"
+                                if req.synthesize_audio:
+                                    b64 = await asyncio.to_thread(synthesize_sentence_wav_b64, supervisor, sandbox_msg)
+                                    if b64:
+                                        yield f"data: {json.dumps({'type': 'audio', 'audio_base64': b64, 'sentence_index': 0})}\n\n"
+                                yield f"data: {json.dumps({'type': 'done', 'token_metrics': {'input_tokens': 0, 'output_tokens': max(1, len(sandbox_msg)//4), 'tokens_per_sec': 0.0}})}\n\n"
+                                if memory and hasattr(memory, "add_session_message"):
+                                    memory.add_session_message(session_id=sid, role="user", content=req.prompt.strip())
+                                    memory.add_session_message(session_id=sid, role="assistant", content=sandbox_msg)
+                                return
+
+                # 2. Context Window Protection: Pull only last 4-6 messages from SQLite
+                messages = [
+                    {"role": "system", "content": "You are Project Libra, a smart, concise, and helpful local AI desktop assistant."}
+                ]
+                if memory and hasattr(memory, "get_session_messages"):
+                    try:
+                        recent = memory.get_session_messages(sid, limit=6)
+                        for m in recent:
+                            if m.get("role") in ("user", "assistant") and m.get("content"):
+                                messages.append({"role": m["role"], "content": m["content"]})
+                    except Exception as e:
+                        logger.warning(f"Error fetching session context: {e}")
+
+                messages.append({"role": "user", "content": req.prompt.strip()})
+
+                # Check AirDrop PC -> Phone hook
+                airdrop_markdown = ""
+                if re.search(r"\b(?:send\s+me|airdrop|download|transfer\s+to\s+(?:my\s+)?phone)\b", req.prompt, re.IGNORECASE):
+                    try:
+                        fm = getattr(supervisor.llm, "file_mgr", None) or FileManager()
+                        q_clean = re.sub(r"^(?:please\s+)?(?:send\s+me|airdrop|download|transfer\s+to\s+(?:my\s+)?phone)\s+(?:the\s+)?", "", req.prompt, flags=re.IGNORECASE).strip()
+                        t_path = fm.search_path(q_clean, folders_only=False)
+                        if t_path and os.path.isfile(t_path):
+                            import urllib.parse
+                            enc_p = urllib.parse.quote(t_path)
+                            s_mb = round(os.path.getsize(t_path) / (1024 * 1024), 2)
+                            fn = os.path.basename(t_path)
+                            airdrop_markdown = f"\n\n[⬇️ **AirDrop to Phone**: {fn} ({s_mb} MB)](/api/bridge/download?path={enc_p})"
+                    except Exception as e:
+                        logger.warning(f"AirDrop search warning: {e}")
+
+                # 3. Audio & Token Queues Setup
+                event_queue = asyncio.Queue()
+                tts_queue = asyncio.Queue() if req.synthesize_audio else None
+
+                async def tts_worker():
+                    if not tts_queue:
+                        return
+                    while True:
+                        item = await tts_queue.get()
+                        if item is None:
+                            tts_queue.task_done()
+                            break
+                        text_chunk, idx = item
+                        try:
+                            b64 = await asyncio.to_thread(synthesize_sentence_wav_b64, supervisor, text_chunk)
+                            if b64:
+                                await event_queue.put({"type": "audio", "audio_base64": b64, "sentence_index": idx})
+                        except Exception as err:
+                            logger.warning(f"TTS synthesis error for chunk {idx}: {err}")
+                        finally:
+                            tts_queue.task_done()
+
+                tts_task = asyncio.create_task(tts_worker()) if req.synthesize_audio else None
+
+                # 4. Stream tokens from Ollama
+                ollama_base = cfg.get("ollama_base_url", "http://localhost:11434")
+                raw_model = getattr(getattr(supervisor, "llm", None), "models", {}).get("chat", "qwen3:8b")
+                target_model = str(raw_model) if (raw_model and not hasattr(raw_model, "_mock_return_value")) else "qwen3:8b"
+
+                payload = {
+                    "model": target_model,
+                    "messages": messages,
+                    "stream": True,
+                    "options": {
+                        "num_ctx": 4096,
+                        "temperature": 0.4
+                    }
+                }
+
+                full_text = ""
+                sentence_buffer = ""
+                clause_split = re.compile(r"(.*?[\.\?\!](?:\s+|$)|.*?(?::\n|\n\n|\n))", re.DOTALL)
+                sentence_idx = 0
+                in_tok = 0
+                out_tok = 0
+                tok_sec = 0.0
+
+                async def ollama_stream_producer():
+                    nonlocal full_text, sentence_buffer, sentence_idx, in_tok, out_tok, tok_sec
+                    try:
+                        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0)) as client:
+                            async with client.stream("POST", f"{ollama_base}/api/chat", json=payload) as resp:
+                                if resp.status_code != 200:
+                                    err_txt = f"Ollama Error (HTTP {resp.status_code})"
+                                    await event_queue.put({"type": "token", "content": err_txt})
+                                    full_text += err_txt
+                                    return
+
+                                async for line in resp.aiter_lines():
+                                    if not line:
+                                        continue
+                                    try:
+                                        chunk = json.loads(line)
+                                        token = chunk.get("message", {}).get("content", "")
+                                        if token:
+                                            full_text += token
+                                            await event_queue.put({"type": "token", "content": token})
+
+                                            if req.synthesize_audio and tts_queue:
+                                                sentence_buffer += token
+                                                while len(sentence_buffer) >= 25:
+                                                    m = clause_split.match(sentence_buffer)
+                                                    if m:
+                                                        clause = m.group(1).strip()
+                                                        sentence_buffer = sentence_buffer[len(m.group(1)):].lstrip()
+                                                        clean_c = re.sub(r"<think>.*?</think>", "", clause, flags=re.DOTALL).strip()
+                                                        if clean_c and len(clean_c) >= 15:
+                                                            await tts_queue.put((clean_c, sentence_idx))
+                                                            sentence_idx += 1
+                                                    else:
+                                                        break
+
+                                        if chunk.get("done", False):
+                                            in_tok = int(chunk.get("prompt_eval_count", 0))
+                                            out_tok = int(chunk.get("eval_count", 0))
+                                            eval_dur = float(chunk.get("eval_duration", 0) / 1e9)
+                                            tok_sec = round(out_tok / max(eval_dur, 0.001), 2) if eval_dur > 0 else 0.0
+                                            break
+                                    except Exception as c_err:
+                                        logger.warning(f"Chunk decode error: {c_err}")
+                    except Exception as e:
+                        logger.error(f"Ollama streaming exception: {e}")
+                        await event_queue.put({"type": "token", "content": f"\n\n[Inference Error: {e}]"})
+                    finally:
+                        # Flush residual sentence buffer
+                        if req.synthesize_audio and tts_queue:
+                            leftover = sentence_buffer.strip()
+                            clean_leftover = re.sub(r"<think>.*?</think>", "", leftover, flags=re.DOTALL).strip()
+                            if clean_leftover and len(clean_leftover) >= 2:
+                                await tts_queue.put((clean_leftover, sentence_idx))
+                                sentence_idx += 1
+                            await tts_queue.put(None)  # Sentinel to stop worker
+
+                producer_task = asyncio.create_task(ollama_stream_producer())
+
+                try:
+                    while True:
+                        if producer_task.done() and (tts_task is None or tts_task.done()) and event_queue.empty():
+                            break
+                        try:
+                            event = await asyncio.wait_for(event_queue.get(), timeout=0.05)
+                            yield f"data: {json.dumps(event)}\n\n"
+                            event_queue.task_done()
+                        except asyncio.TimeoutError:
+                            continue
+
+                    await producer_task
+                    if tts_task:
+                        await tts_task
+
+                    # If AirDrop link was found, emit it now
+                    if airdrop_markdown:
+                        yield f"data: {json.dumps({'type': 'token', 'content': airdrop_markdown})}\n\n"
+                        full_text += airdrop_markdown
+
+                    # 5. Emit Done Telemetry Event
+                    elapsed_ms = round((time.perf_counter() - t0_stream) * 1000.0, 2)
+                    done_payload = {
+                        "type": "done",
+                        "token_metrics": {
+                            "turn_in": in_tok,
+                            "turn_out": out_tok,
+                            "turn_total": in_tok + out_tok,
+                            "tok_per_sec": tok_sec,
+                            "latency_ms": elapsed_ms,
+                            "model": target_model
+                        },
+                        "reply_text": full_text
+                    }
+                    yield f"data: {json.dumps(done_payload)}\n\n"
+
+                    # 6. Save message turn to SQLite memory in background
+                    if memory and hasattr(memory, "add_session_message"):
+                        try:
+                            memory.add_session_message(
+                                session_id=sid,
+                                role="user",
+                                content=req.prompt.strip(),
+                                model_used=target_model
+                            )
+                            memory.add_session_message(
+                                session_id=sid,
+                                role="assistant",
+                                content=full_text,
+                                input_tokens=in_tok,
+                                output_tokens=out_tok,
+                                tokens_per_sec=tok_sec,
+                                model_used=target_model,
+                                latency_ms=elapsed_ms
+                            )
+                        except Exception as m_err:
+                            logger.warning(f"Error saving stream messages to memory: {m_err}")
+
+                finally:
+                    if not producer_task.done():
+                        producer_task.cancel()
+                    if tts_task and not tts_task.done():
+                        tts_task.cancel()
+
+            return StreamingResponse(
+                event_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
+
+        # -------------------------------------------------------------------
+        # BRANCH B: NON-STREAMING / MULTIMODAL FALLBACK
+        # -------------------------------------------------------------------
         t0 = time.perf_counter()
         scope = req.client_scope or "remote_web"
         memory = getattr(supervisor.llm, "memory", None)
@@ -576,6 +1068,29 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             gen_image_url = f"/api/assets/plots/{os.path.basename(result['plot_path'])}"
         elif result.get("image_path") and os.path.isfile(result["image_path"]):
             gen_image_url = f"/api/assets/plots/{os.path.basename(result['image_path'])}"
+
+        # Phase 11 AirDrop PC -> Phone hook
+        if re.search(r"\b(?:send\s+me|airdrop|download|transfer\s+to\s+(?:my\s+)?phone)\b", req.prompt, re.IGNORECASE):
+            try:
+                fm = getattr(supervisor.llm, "file_mgr", None) or FileManager()
+                q_clean = re.sub(r"^(?:please\s+)?(?:send\s+me|airdrop|download|transfer\s+to\s+(?:my\s+)?phone)\s+(?:the\s+)?", "", req.prompt, flags=re.IGNORECASE).strip()
+                t_path = fm.search_path(q_clean, folders_only=False)
+                if t_path and os.path.isfile(t_path):
+                    import urllib.parse
+                    enc_p = urllib.parse.quote(t_path)
+                    s_mb = round(os.path.getsize(t_path) / (1024 * 1024), 2)
+                    fn = os.path.basename(t_path)
+                    reply_text += f"\n\n[⬇️ **AirDrop to Phone**: {fn} ({s_mb} MB)](/api/bridge/download?path={enc_p})"
+            except Exception as e:
+                logger.warning(f"AirDrop search warning: {e}")
+
+        # Phase 11 First Daily Access Briefing Check
+        try:
+            b_eng = getattr(supervisor.llm, "briefing_engine", None)
+            if b_eng and hasattr(b_eng, "check_and_trigger_daily_briefing"):
+                b_eng.check_and_trigger_daily_briefing(deliver_audio=False)
+        except Exception:
+            pass
 
         turn_in = int(raw_tm.get("input_tokens", 0) or 0)
         turn_out = int(raw_tm.get("output_tokens", 0) or 0)
@@ -963,4 +1478,4 @@ if __name__ == "__main__":
     cfg = load_web_config("config.json")
     print(f"[Project Libra] Starting Remote Web Agent standalone on {cfg['host']}:{cfg['port']}...")
     app = create_app()
-    uvicorn.run(app, host=cfg["host"], port=cfg["port"])
+    uvicorn.run(app, host=cfg["host"], port=cfg["port"], log_config=None)

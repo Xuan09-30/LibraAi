@@ -10,6 +10,7 @@ import psutil
 PSUTIL_AVAILABLE = True
 
 from core.game_discovery import GameDiscoveryEngine
+from core.trust_guard import get_trust_guard, RiskTier
 
 
 class SafeOSDispatcher:

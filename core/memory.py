@@ -7,6 +7,22 @@ import requests
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    yaml = None
+    YAML_AVAILABLE = False
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    WATCHDOG_AVAILABLE = True
+except ImportError:
+    Observer = None
+    FileSystemEventHandler = object
+    WATCHDOG_AVAILABLE = False
+
 
 class SemanticMemory:
     """
@@ -37,20 +53,29 @@ class SemanticMemory:
         self.embed_model = embed_model
         self.dim = dim
 
+        self.vault_dir = os.path.join(project_root if db_filename != ":memory:" else ".", "assets", "vault")
+        os.makedirs(self.vault_dir, exist_ok=True)
+        self._is_syncing_from_disk = False
+        self._vault_observer = None
+
         self._init_db()
         self._backfill_missing_embeddings()
+
+        if self.db_path != ":memory:":
+            self.sync_all_to_vault_markdown()
+            self.start_vault_watchdog()
 
     def _get_connection(self) -> sqlite3.Connection:
         if self.db_path == ":memory:":
             if self._shared_conn is None:
-                conn = sqlite3.connect(":memory:")
+                conn = sqlite3.connect(":memory:", check_same_thread=False)
                 conn.enable_load_extension(True)
                 sqlite_vec.load(conn)
                 conn.enable_load_extension(False)
                 self._shared_conn = conn
             return self._shared_conn
 
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.enable_load_extension(True)
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
@@ -152,18 +177,73 @@ class SemanticMemory:
             VALUES (1, '', '{}', '[]', '[]', '')
         """)
 
-        # 9. H-MEM Semantic Facts Table (v11.0 / Phase 1)
+        # 9. H-MEM Semantic Facts Table (v11.0 / Phase 1 & Phase 11 Vault)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS semantic_facts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 entity TEXT NOT NULL,
                 relation TEXT NOT NULL,
                 value TEXT NOT NULL,
+                category TEXT DEFAULT 'general',
+                pinned INTEGER DEFAULT 0,
                 confidence REAL DEFAULT 1.0,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(entity, relation)
             )
         """)
+
+        # Migration: Ensure category and pinned exist on existing databases
+        try:
+            sf_cols = [c[1] for c in cursor.execute("PRAGMA table_info(semantic_facts)").fetchall()]
+            if "category" not in sf_cols:
+                cursor.execute("ALTER TABLE semantic_facts ADD COLUMN category TEXT DEFAULT 'general'")
+            if "pinned" not in sf_cols:
+                cursor.execute("ALTER TABLE semantic_facts ADD COLUMN pinned INTEGER DEFAULT 0")
+        except Exception as e:
+            print(f"[SemanticMemory Migration Warning]: {e}")
+
+        # FTS5 Virtual Table for Instant BM25 Search
+        try:
+            cursor.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS semantic_facts_fts USING fts5(
+                    value,
+                    entity,
+                    relation,
+                    category,
+                    content='semantic_facts',
+                    content_rowid='id'
+                )
+            """)
+            # Triggers to keep FTS in sync with semantic_facts
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS semantic_facts_ai AFTER INSERT ON semantic_facts BEGIN
+                    INSERT INTO semantic_facts_fts(rowid, value, entity, relation, category)
+                    VALUES (new.id, new.value, new.entity, new.relation, new.category);
+                END;
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS semantic_facts_ad AFTER DELETE ON semantic_facts BEGIN
+                    INSERT INTO semantic_facts_fts(semantic_facts_fts, rowid, value, entity, relation, category)
+                    VALUES('delete', old.id, old.value, old.entity, old.relation, old.category);
+                END;
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS semantic_facts_au AFTER UPDATE ON semantic_facts BEGIN
+                    INSERT INTO semantic_facts_fts(semantic_facts_fts, rowid, value, entity, relation, category)
+                    VALUES('delete', old.id, old.value, old.entity, old.relation, old.category);
+                    INSERT INTO semantic_facts_fts(rowid, value, entity, relation, category)
+                    VALUES (new.id, new.value, new.entity, new.relation, new.category);
+                END;
+            """)
+            # Populate FTS if empty and facts exist
+            fts_cnt = cursor.execute("SELECT count(*) FROM semantic_facts_fts").fetchone()[0]
+            if fts_cnt == 0:
+                cursor.execute("""
+                    INSERT INTO semantic_facts_fts(rowid, value, entity, relation, category)
+                    SELECT id, value, entity, relation, category FROM semantic_facts
+                """)
+        except Exception as e:
+            print(f"[SemanticMemory FTS Warning]: {e}")
 
         # 10. PreAct Action Macros Table (v11.0 / Phase 3)
         cursor.execute("""
@@ -521,6 +601,19 @@ class SemanticMemory:
             return "No prior user preferences recorded."
         return "Relevant Stored Facts: " + "; ".join(facts)
 
+    def get_preference(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("SELECT pref_value FROM preferences WHERE pref_key = ?", (key.strip(),))
+            row = cursor.fetchone()
+            return row[0] if row else default
+        except Exception:
+            return default
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
     def set_preference(self, key: str, value: str):
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -842,38 +935,64 @@ class SemanticMemory:
         return current_state
 
     # -------------------------------------------------------------
-    # H-MEM SEMANTIC FACTS (Phase 1)
+    # H-MEM SEMANTIC FACTS & MEMORY VAULT (Phase 1 & Phase 11)
     # -------------------------------------------------------------
-    def upsert_semantic_fact(self, entity: str, relation: str, value: str, confidence: float = 1.0) -> int:
+    def upsert_semantic_fact(
+        self,
+        entity: str,
+        relation: str,
+        value: str,
+        confidence: float = 1.0,
+        category: str = "general",
+        pinned: bool = False
+    ) -> int:
         """
         Upserts a verified long-term fact into semantic_facts:
-        (entity, relation) -> value with confidence score and timestamp.
+        (entity, relation) -> value with confidence score, category, pinned state, and timestamp.
+        Syncs markdown representation to assets/vault/ if not actively syncing from disk.
         """
         clean_e = (entity or "").strip().lower()
         clean_r = (relation or "").strip().lower()
         clean_v = (value or "").strip()
+        clean_c = (category or "general").strip().lower()
+        pin_val = 1 if pinned else 0
         if not clean_e or not clean_r or not clean_v:
             return -1
 
         conn = self._get_connection()
         cursor = conn.cursor()
+        fact_id = -1
         try:
             cursor.execute("""
-                INSERT INTO semantic_facts (entity, relation, value, confidence, updated_at)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO semantic_facts (entity, relation, value, confidence, category, pinned, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(entity, relation) DO UPDATE SET
                     value=excluded.value,
                     confidence=excluded.confidence,
+                    category=excluded.category,
+                    pinned=CASE WHEN excluded.pinned = 1 THEN 1 ELSE semantic_facts.pinned END,
                     updated_at=CURRENT_TIMESTAMP
-            """, (clean_e, clean_r, clean_v, float(confidence)))
+            """, (clean_e, clean_r, clean_v, float(confidence), clean_c, pin_val))
             conn.commit()
-            return cursor.lastrowid or 1
+
+            # Retrieve the affected row id
+            cursor.execute("SELECT id FROM semantic_facts WHERE entity = ? AND relation = ?", (clean_e, clean_r))
+            row = cursor.fetchone()
+            if row:
+                fact_id = row[0]
+            else:
+                fact_id = cursor.lastrowid or 1
         except Exception as e:
             print(f"[SemanticMemory upsert_semantic_fact Error]: {e}")
             return -1
         finally:
             if self.db_path != ":memory:":
                 conn.close()
+
+        if fact_id > 0 and not self._is_syncing_from_disk and self.db_path != ":memory:":
+            self.sync_fact_to_vault_markdown(fact_id)
+
+        return fact_id
 
     def get_semantic_facts(self, entity: Optional[str] = None) -> list[dict]:
         """Returns verified semantic facts, optionally filtered by entity."""
@@ -882,12 +1001,12 @@ class SemanticMemory:
         try:
             if entity:
                 cursor.execute(
-                    "SELECT id, entity, relation, value, confidence, updated_at FROM semantic_facts WHERE entity = ? ORDER BY updated_at DESC",
+                    "SELECT id, entity, relation, value, confidence, category, pinned, updated_at FROM semantic_facts WHERE entity = ? ORDER BY pinned DESC, updated_at DESC",
                     (entity.strip().lower(),)
                 )
             else:
                 cursor.execute(
-                    "SELECT id, entity, relation, value, confidence, updated_at FROM semantic_facts ORDER BY updated_at DESC"
+                    "SELECT id, entity, relation, value, confidence, category, pinned, updated_at FROM semantic_facts ORDER BY pinned DESC, updated_at DESC"
                 )
             rows = cursor.fetchall()
             return [
@@ -897,7 +1016,9 @@ class SemanticMemory:
                     "relation": r[2],
                     "value": r[3],
                     "confidence": float(r[4]),
-                    "updated_at": r[5]
+                    "category": r[5] or "general",
+                    "pinned": bool(r[6]),
+                    "updated_at": r[7]
                 }
                 for r in rows
             ]
@@ -907,6 +1028,333 @@ class SemanticMemory:
         finally:
             if self.db_path != ":memory:":
                 conn.close()
+
+    def get_vault_facts(self, query: Optional[str] = None, category: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Retrieves Memory Vault facts supporting FTS5 BM25 search and category filtering.
+        Pinned facts are prioritized.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        clean_q = (query or "").strip()
+        clean_c = (category or "").strip().lower()
+
+        try:
+            if clean_q:
+                # 1. Try FTS5 BM25 query
+                safe_q = re.sub(r"[^\w\s]", "", clean_q).strip()
+                if safe_q:
+                    fts_term = f'"{safe_q}"*'
+                    sql = """
+                        SELECT sf.id, sf.entity, sf.relation, sf.value, sf.confidence, sf.category, sf.pinned, sf.updated_at
+                        FROM semantic_facts sf
+                        JOIN semantic_facts_fts fts ON sf.id = fts.rowid
+                        WHERE semantic_facts_fts MATCH ?
+                    """
+                    params: list = [fts_term]
+                    if clean_c:
+                        sql += " AND sf.category = ?"
+                        params.append(clean_c)
+                    sql += " ORDER BY sf.pinned DESC, bm25(semantic_facts_fts) ASC"
+
+                    try:
+                        cursor.execute(sql, tuple(params))
+                        rows = cursor.fetchall()
+                        if rows:
+                            return [
+                                {
+                                    "id": r[0], "entity": r[1], "relation": r[2], "value": r[3],
+                                    "confidence": float(r[4]), "category": r[5] or "general",
+                                    "pinned": bool(r[6]), "updated_at": r[7]
+                                }
+                                for r in rows
+                            ]
+                    except Exception:
+                        pass
+
+                # Fallback to LIKE query
+                like_sql = """
+                    SELECT id, entity, relation, value, confidence, category, pinned, updated_at
+                    FROM semantic_facts
+                    WHERE (value LIKE ? OR entity LIKE ? OR relation LIKE ?)
+                """
+                like_params: list = [f"%{clean_q}%", f"%{clean_q}%", f"%{clean_q}%"]
+                if clean_c:
+                    like_sql += " AND category = ?"
+                    like_params.append(clean_c)
+                like_sql += " ORDER BY pinned DESC, updated_at DESC"
+                cursor.execute(like_sql, tuple(like_params))
+            else:
+                base_sql = "SELECT id, entity, relation, value, confidence, category, pinned, updated_at FROM semantic_facts"
+                b_params: list = []
+                if clean_c:
+                    base_sql += " WHERE category = ?"
+                    b_params.append(clean_c)
+                base_sql += " ORDER BY pinned DESC, updated_at DESC"
+                cursor.execute(base_sql, tuple(b_params))
+
+            rows = cursor.fetchall()
+            return [
+                {
+                    "id": r[0], "entity": r[1], "relation": r[2], "value": r[3],
+                    "confidence": float(r[4]), "category": r[5] or "general",
+                    "pinned": bool(r[6]), "updated_at": r[7]
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            print(f"[SemanticMemory get_vault_facts Error]: {e}")
+            return []
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def update_vault_fact(
+        self,
+        fact_id: int,
+        value: str,
+        category: Optional[str] = None,
+        pinned: Optional[bool] = None
+    ) -> bool:
+        """
+        Updates an existing vault fact by ID and syncs changes to assets/vault/.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            updates = ["value = ?", "updated_at = CURRENT_TIMESTAMP"]
+            params: list = [value.strip()]
+            if category is not None:
+                updates.append("category = ?")
+                params.append(category.strip().lower())
+            if pinned is not None:
+                updates.append("pinned = ?")
+                params.append(1 if pinned else 0)
+
+            params.append(int(fact_id))
+            sql = f"UPDATE semantic_facts SET {', '.join(updates)} WHERE id = ?"
+            cursor.execute(sql, tuple(params))
+            conn.commit()
+            success = cursor.rowcount > 0
+        except Exception as e:
+            print(f"[SemanticMemory update_vault_fact Error]: {e}")
+            return False
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+        if success and not self._is_syncing_from_disk and self.db_path != ":memory:":
+            self.sync_fact_to_vault_markdown(fact_id)
+
+        return success
+
+    def pin_vault_fact(self, fact_id: int, pinned: bool) -> bool:
+        """Toggles pinned status for a vault fact, preventing Markovian decay."""
+        return self.update_vault_fact(fact_id, "", pinned=pinned) if False else self._set_pinned(fact_id, pinned)
+
+    def _set_pinned(self, fact_id: int, pinned: bool) -> bool:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "UPDATE semantic_facts SET pinned = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (1 if pinned else 0, int(fact_id))
+            )
+            conn.commit()
+            success = cursor.rowcount > 0
+        except Exception as e:
+            print(f"[SemanticMemory pin_vault_fact Error]: {e}")
+            return False
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+        if success and not self._is_syncing_from_disk and self.db_path != ":memory:":
+            self.sync_fact_to_vault_markdown(fact_id)
+        return success
+
+    def delete_vault_fact(self, fact_id: int) -> bool:
+        """
+        Hard-deletes fact from SQLite (and FTS5) and removes the note from assets/vault/.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM semantic_facts WHERE id = ?", (int(fact_id),))
+            conn.commit()
+            deleted = cursor.rowcount > 0
+        except Exception as e:
+            print(f"[SemanticMemory delete_vault_fact Error]: {e}")
+            return False
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+        # Remove corresponding .md note from vault
+        if deleted and self.vault_dir and os.path.isdir(self.vault_dir):
+            try:
+                for f in os.listdir(self.vault_dir):
+                    if f.startswith(f"fact_{fact_id}_") and f.endswith(".md"):
+                        os.remove(os.path.join(self.vault_dir, f))
+            except Exception as e:
+                print(f"[SemanticMemory Vault File Removal Warning]: {e}")
+
+        return deleted
+
+    # -------------------------------------------------------------
+    # OBSIDIAN-STYLE VAULT MARKDOWN SYNC ENGINE
+    # -------------------------------------------------------------
+    def sync_fact_to_vault_markdown(self, fact_id: int):
+        """Exports a single fact to an individual Markdown note with YAML frontmatter."""
+        if not self.vault_dir:
+            return
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                "SELECT id, entity, relation, value, category, pinned, updated_at FROM semantic_facts WHERE id = ?",
+                (int(fact_id),)
+            )
+            row = cursor.fetchone()
+            if not row:
+                return
+
+            fid, entity, relation, val, cat, pinned, updated_at = row
+            slug = re.sub(r"[^\w\-_]", "_", f"{entity}_{relation}").strip("_")[:40]
+            filename = f"fact_{fid}_{slug}.md"
+            filepath = os.path.join(self.vault_dir, filename)
+
+            meta = {
+                "id": fid,
+                "category": cat or "general",
+                "pinned": bool(pinned),
+                "updated_at": str(updated_at)
+            }
+
+            if YAML_AVAILABLE and yaml is not None:
+                yaml_block = yaml.dump(meta, sort_keys=False, default_flow_style=False).strip()
+            else:
+                yaml_block = f"id: {fid}\ncategory: {cat or 'general'}\npinned: {str(bool(pinned)).lower()}\nupdated_at: '{updated_at}'"
+
+            md_content = f"---\n{yaml_block}\n---\n{val.strip()}\n"
+
+            # Remove any prior matching note with different slug
+            for f in os.listdir(self.vault_dir):
+                if f.startswith(f"fact_{fid}_") and f.endswith(".md") and f != filename:
+                    try:
+                        os.remove(os.path.join(self.vault_dir, f))
+                    except Exception:
+                        pass
+
+            with open(filepath, "w", encoding="utf-8") as nf:
+                nf.write(md_content)
+        except Exception as e:
+            print(f"[SemanticMemory Vault Sync Error]: {e}")
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def sync_all_to_vault_markdown(self):
+        """Exports all database semantic facts to assets/vault/ on startup."""
+        if not self.vault_dir:
+            return
+        os.makedirs(self.vault_dir, exist_ok=True)
+        facts = self.get_semantic_facts()
+        for f in facts:
+            self.sync_fact_to_vault_markdown(f["id"])
+
+    def start_vault_watchdog(self):
+        """Starts real-time watchdog file watcher on assets/vault/."""
+        if not WATCHDOG_AVAILABLE or self._vault_observer is not None or self.db_path == ":memory:":
+            return
+
+        parent = self
+
+        class VaultEventHandler(FileSystemEventHandler):
+            def on_modified(self, event):
+                if event.is_directory or not event.src_path.endswith(".md"):
+                    return
+                parent._handle_vault_file_change(event.src_path)
+
+            def on_created(self, event):
+                if event.is_directory or not event.src_path.endswith(".md"):
+                    return
+                parent._handle_vault_file_change(event.src_path)
+
+            def on_deleted(self, event):
+                if event.is_directory or not event.src_path.endswith(".md"):
+                    return
+                base = os.path.basename(event.src_path)
+                m = re.match(r"^fact_(\d+)_", base)
+                if m and not parent._is_syncing_from_disk:
+                    parent._handle_vault_file_delete(int(m.group(1)))
+
+        try:
+            self._vault_observer = Observer()
+            self._vault_observer.schedule(VaultEventHandler(), self.vault_dir, recursive=False)
+            self._vault_observer.daemon = True
+            self._vault_observer.start()
+            print(f"[Memory Vault] Obsidian sync watcher online on: {self.vault_dir}")
+        except Exception as e:
+            print(f"[Memory Vault Watchdog Error]: {e}")
+
+    def _handle_vault_file_change(self, filepath: str):
+        if self._is_syncing_from_disk or not os.path.isfile(filepath):
+            return
+        try:
+            with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+
+            if not content.startswith("---"):
+                return
+
+            parts = content.split("---", 2)
+            if len(parts) < 3:
+                return
+
+            header_str = parts[1]
+            body_text = parts[2].strip()
+
+            meta = {}
+            if YAML_AVAILABLE and yaml is not None:
+                meta = yaml.safe_load(header_str) or {}
+            else:
+                for line in header_str.splitlines():
+                    if ":" in line:
+                        k, v = line.split(":", 1)
+                        meta[k.strip()] = v.strip().strip("'\"")
+
+            fact_id = meta.get("id")
+            if not fact_id:
+                return
+
+            cat = meta.get("category", "general")
+            pinned = meta.get("pinned", False)
+            if isinstance(pinned, str):
+                pinned = pinned.lower() in ["true", "1", "yes"]
+
+            self._is_syncing_from_disk = True
+            try:
+                self.update_vault_fact(int(fact_id), body_text, category=str(cat), pinned=bool(pinned))
+            finally:
+                self._is_syncing_from_disk = False
+        except Exception as e:
+            print(f"[Memory Vault Sync File Warning]: {e}")
+
+    def _handle_vault_file_delete(self, fact_id: int):
+        self._is_syncing_from_disk = True
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM semantic_facts WHERE id = ?", (int(fact_id),))
+            conn.commit()
+            if self.db_path != ":memory:":
+                conn.close()
+        except Exception as e:
+            print(f"[Memory Vault File Delete Sync Warning]: {e}")
+        finally:
+            self._is_syncing_from_disk = False
 
     def delete_semantic_fact(self, entity: str, relation: str) -> bool:
         """Deletes a semantic fact matching (entity, relation)."""
@@ -1007,6 +1455,41 @@ class SemanticMemory:
         finally:
             if self.db_path != ":memory:":
                 conn.close()
+
+    def prune_unpinned_facts(self, max_facts: int = 50) -> int:
+        """
+        Memory Compression & Eviction Guard (Phase 11):
+        When semantic facts exceed capacity, prunes oldest unpinned facts
+        while strictly preserving all pinned facts.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        pruned = 0
+        try:
+            cursor.execute("SELECT COUNT(*) FROM semantic_facts WHERE pinned = 0")
+            unpinned_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM semantic_facts")
+            total = cursor.fetchone()[0]
+
+            if total > max_facts and unpinned_count > 0:
+                to_remove = min(unpinned_count, total - max_facts)
+                cursor.execute("""
+                    DELETE FROM semantic_facts
+                    WHERE id IN (
+                        SELECT id FROM semantic_facts
+                        WHERE pinned = 0
+                        ORDER BY updated_at ASC
+                        LIMIT ?
+                    )
+                """, (to_remove,))
+                conn.commit()
+                pruned = cursor.rowcount
+        except Exception as e:
+            print(f"[SemanticMemory Prune Warning]: {e}")
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+        return pruned
 
     # -------------------------------------------------------------
     # PREACT DETERMINISTIC ACTION MACROS (Phase 3)
@@ -1482,6 +1965,9 @@ class SemanticMemory:
         finally:
             if self.db_path != ":memory:":
                 conn.close()
+
+    # Alias for API compatibility
+    add_message = add_session_message
 
     def get_session_messages(self, session_id: str, limit: int = 100) -> list[dict]:
         """Retrieves conversation messages for a given thread ordered chronologically."""

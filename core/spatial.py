@@ -36,6 +36,8 @@ except ImportError:
     RapidOCR = None
     RAPIDOCR_AVAILABLE = False
 
+from core.vram_governor import get_vram_governor
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 DEFAULT_PROFILE = {
