@@ -147,5 +147,9 @@ def run_scheduler_tests():
         sys.exit(1)
 
 
+
+def test_suite():
+    run_scheduler_tests()
+
 if __name__ == "__main__":
     run_scheduler_tests()

@@ -60,9 +60,100 @@ APP_FRIENDLY_NAMES = {
     "riot client.exe": ("Riot Client", "game"),
     "riotclientelectron.exe": ("Riot Client", "game"),
     "riotclientservices.exe": ("Riot Client", "game"),
+    "genshinimpact.exe": ("Genshin Impact", "game"),
+    "starrail.exe": ("Honkai: Star Rail", "game"),
+    "honkaistarrail.exe": ("Honkai: Star Rail", "game"),
+    "zenlesszonezero.exe": ("Zenless Zone Zero", "game"),
+    "minecraft.exe": ("Minecraft", "game"),
+    "javaw.exe": ("Minecraft", "game"),
+    "eldenring.exe": ("Elden Ring", "game"),
+    "helldivers2.exe": ("Helldivers 2", "game"),
+    "destiny2.exe": ("Destiny 2", "game"),
+    "warframe.x64.exe": ("Warframe", "game"),
+    "pubg.exe": ("PUBG", "game"),
+    "tslgame.exe": ("PUBG", "game"),
+    "rainbowsix.exe": ("Rainbow Six Siege", "game"),
+    "r6.exe": ("Rainbow Six Siege", "game"),
+    "cyberpunk2077.exe": ("Cyberpunk 2077", "game"),
     "antigravity.exe": ("Antigravity IDE", "ide"),
     "explorer.exe": ("File Explorer", "system"),
 }
+
+
+IGNORE_PROCESSES = {
+    "python.exe", "pythonw.exe", "libra.exe", "TextInputHost.exe",
+    "ShellExperienceHost.exe", "SearchHost.exe", "NVIDIA Overlay.exe",
+    "wallpaper64.exe", "vgtray.exe"
+}
+
+_poller_thread = None
+_poller_lock = __import__("threading").Lock()
+_last_external_window = None
+
+
+def _poll_foreground_window():
+    global _last_external_window
+    if sys.platform != "win32" or not hasattr(ctypes, "windll"):
+        return
+    user32 = ctypes.windll.user32
+    libra_pid = os.getpid()
+    ignore_set = {p.lower() for p in IGNORE_PROCESSES}
+
+    while True:
+        try:
+            hwnd = user32.GetForegroundWindow()
+            if hwnd and user32.IsWindowVisible(hwnd) and not user32.IsIconic(hwnd):
+                length = user32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buff = ctypes.create_unicode_buffer(length + 1)
+                    user32.GetWindowTextW(hwnd, buff, length + 1)
+                    title = buff.value.strip()
+                    if title:
+                        pid = wintypes.DWORD(0)
+                        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                        p_pid = pid.value
+                        proc_name = ""
+                        if p_pid > 0 and PSUTIL_AVAILABLE:
+                            try:
+                                proc = psutil.Process(p_pid)
+                                proc_name = proc.name()
+                            except Exception:
+                                pass
+
+                        proc_lower = proc_name.lower()
+                        title_upper = title.upper()
+                        is_ignored = (
+                            p_pid == libra_pid
+                            or proc_lower in ignore_set
+                            or any(k in title_upper for k in ["LIBRA", "FUTURISTICVOICEASSISTANTUI", "CYBERNETIC"])
+                            or title.lower() in {"program manager", "settings", "default ime", "taskbar", "search"}
+                        )
+                        if not is_ignored:
+                            with _poller_lock:
+                                _last_external_window = {
+                                    "hwnd": int(hwnd),
+                                    "title": title,
+                                    "process": proc_name,
+                                    "pid": int(p_pid),
+                                    "timestamp": __import__("time").time()
+                                }
+        except Exception:
+            pass
+        __import__("time").sleep(0.25)
+
+
+def start_window_poller():
+    global _poller_thread
+    if _poller_thread is None and sys.platform == "win32" and hasattr(ctypes, "windll"):
+        _poller_thread = __import__("threading").Thread(
+            target=_poll_foreground_window,
+            daemon=True,
+            name="WindowContextPoller"
+        )
+        _poller_thread.start()
+
+
+start_window_poller()
 
 
 class ActiveWindowEngine:
@@ -253,6 +344,7 @@ class ActiveWindowEngine:
             hwnd = user32.GetForegroundWindow()
             pid = wintypes.DWORD(0)
             title = ""
+            proc_name = ""
             if hwnd:
                 user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
                 length = user32.GetWindowTextLengthW(hwnd)
@@ -260,30 +352,59 @@ class ActiveWindowEngine:
                     buff = ctypes.create_unicode_buffer(length + 1)
                     user32.GetWindowTextW(hwnd, buff, length + 1)
                     title = buff.value.strip()
+                if pid.value > 0 and PSUTIL_AVAILABLE:
+                    try:
+                        proc_name = psutil.Process(pid.value).name()
+                    except Exception:
+                        pass
 
-            if not hwnd or pid.value == os.getpid() or not title or "LIBRA // CYBERNETIC" in title.upper() or "FUTURISTICVOICEASSISTANTUI" in title.upper():
-                external_hwnd = self._find_top_external_window(user32, hwnd or 0, pid.value or os.getpid())
-                if external_hwnd:
-                    hwnd = external_hwnd
-                    length = user32.GetWindowTextLengthW(hwnd)
-                    if length > 0:
-                        buff = ctypes.create_unicode_buffer(length + 1)
-                        user32.GetWindowTextW(hwnd, buff, length + 1)
-                        title = buff.value.strip()
-                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                elif not hwnd:
-                    self.last_window_snapshot = info
-                    return info
+            ignore_set = {p.lower() for p in IGNORE_PROCESSES}
+            is_self_or_ignored = (
+                not hwnd
+                or not title
+                or pid.value == os.getpid()
+                or proc_name.lower() in ignore_set
+                or any(k in title.upper() for k in ["LIBRA", "CYBERNETIC", "FUTURISTICVOICEASSISTANTUI"])
+                or title.lower() in {"program manager", "settings", "default ime", "taskbar", "search"}
+            )
+
+            if is_self_or_ignored:
+                with _poller_lock:
+                    ext_snap = dict(_last_external_window) if _last_external_window else None
+
+                if ext_snap and ext_snap.get("hwnd") and user32.IsWindow(ext_snap["hwnd"]):
+                    hwnd = ext_snap["hwnd"]
+                    title = ext_snap.get("title", "")
+                    pid = wintypes.DWORD(ext_snap.get("pid", 0))
+                    proc_name = ext_snap.get("process", "")
                 else:
-                    info["hwnd"] = int(hwnd)
-                    info["window_title"] = "Libra Neural Terminal"
-                    info["pid"] = int(pid.value)
-                    info["process_name"] = "LibraAi"
-                    info["app_label"] = "Libra Neural Terminal"
-                    info["app_category"] = "assistant"
-                    self._enrich_parsed_metadata(info)
-                    self.last_window_snapshot = info
-                    return info
+                    external_hwnd = self._find_top_external_window(user32, hwnd or 0, pid.value or os.getpid())
+                    if external_hwnd:
+                        hwnd = external_hwnd
+                        length = user32.GetWindowTextLengthW(hwnd)
+                        if length > 0:
+                            buff = ctypes.create_unicode_buffer(length + 1)
+                            user32.GetWindowTextW(hwnd, buff, length + 1)
+                            title = buff.value.strip()
+                        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                        if pid.value > 0 and PSUTIL_AVAILABLE:
+                            try:
+                                proc_name = psutil.Process(pid.value).name()
+                            except Exception:
+                                pass
+                    elif not hwnd:
+                        self.last_window_snapshot = info
+                        return info
+                    else:
+                        info["hwnd"] = int(hwnd)
+                        info["window_title"] = "Libra Neural Terminal"
+                        info["pid"] = int(pid.value)
+                        info["process_name"] = "LibraAi"
+                        info["app_label"] = "Libra Neural Terminal"
+                        info["app_category"] = "assistant"
+                        self._enrich_parsed_metadata(info)
+                        self.last_window_snapshot = info
+                        return info
 
             info["hwnd"] = int(hwnd)
             info["window_title"] = title
@@ -340,10 +461,14 @@ class ActiveWindowEngine:
                 category = "terminal"
                 info["app_category"] = "terminal"
                 info["app_label"] = "Terminal"
-            elif any(g in title_lower for g in ["overwatch", "valorant", "counter-strike", "apex legends", "league of legends", "dota", "fortnite", "palworld", "roblox", "stardew valley", "genshin impact"]):
+            elif (
+                any(g in title_lower for g in ["overwatch", "valorant", "counter-strike", "apex legends", "league of legends", "dota", "fortnite", "palworld", "roblox", "stardew valley", "genshin impact", "minecraft", "honkai", "star rail", "zenless", "elden ring", "helldivers", "cyberpunk", "warframe", "destiny", "pubg", "rainbow six"])
+                or proc_lower.endswith("-shipping.exe")
+                or "game" in proc_lower
+            ):
                 category = "game"
                 info["app_category"] = "game"
-                for g_cand in ["overwatch", "valorant", "apex legends", "counter-strike", "league of legends", "dota", "fortnite", "palworld", "roblox"]:
+                for g_cand in ["overwatch", "valorant", "apex legends", "counter-strike", "league of legends", "dota", "fortnite", "palworld", "roblox", "minecraft", "genshin impact", "elden ring", "cyberpunk"]:
                     if g_cand in title_lower:
                         info["app_label"] = g_cand.title()
                         break
@@ -405,11 +530,93 @@ class ActiveWindowEngine:
                 pass
         return None
 
-    def summarize_active_window(self, dry_run: bool = False) -> Dict[str, Any]:
+    LAUNCHER_PROCESSES = {
+        "steam.exe", "steamwebhelper.exe", "riot client.exe",
+        "riotclientelectron.exe", "riotclientservices.exe", "riotclientux.exe",
+        "epicgameslauncher.exe", "battle.net.exe"
+    }
+
+    def detect_running_game(self, dry_run: bool = False) -> Optional[Dict[str, Any]]:
         """
-        Answers 'What am I working on?', 'What window am I in?', or 'What app is focused?'.
+        Detects any currently running game on the system.
+        Checks the active foreground window first; if the user alt-tabbed or fullscreen exclusive mode
+        hides hwnd, scans running processes for actual game executables (e.g. VALORANT-Win64-Shipping.exe),
+        picking the main engine process with highest RAM usage and ignoring background launchers.
         """
         info = self.get_active_window_info(dry_run=dry_run)
+        proc_low = (info.get("process_name") or "").lower()
+        if info.get("app_category") == "game" and proc_low not in self.LAUNCHER_PROCESSES:
+            return info
+
+        # Respect deterministic unit test mocks
+        if self.mock_window_info is not None or not PSUTIL_AVAILABLE:
+            return None
+
+        candidates = []
+        try:
+            for proc in psutil.process_iter(["pid", "name", "memory_info"]):
+                try:
+                    pname = proc.info.get("name") or ""
+                    p_low = pname.lower()
+                    if not p_low or p_low in self.LAUNCHER_PROCESSES:
+                        continue
+                    label = None
+                    if p_low in APP_FRIENDLY_NAMES:
+                        cand_label, cand_cat = APP_FRIENDLY_NAMES[p_low]
+                        if cand_cat == "game":
+                            label = cand_label
+                    elif p_low.endswith("-shipping.exe"):
+                        base = p_low.replace("-win64-shipping.exe", "").replace("-shipping.exe", "")
+                        label = "Valorant" if "valorant" in base else base.replace("_", " ").title()
+
+                    if label:
+                        rss = proc.info.get("memory_info").rss if proc.info.get("memory_info") else 0
+                        candidates.append({
+                            "hwnd": 0,
+                            "pid": int(proc.info.get("pid") or 0),
+                            "process_name": pname,
+                            "app_label": label,
+                            "app_category": "game",
+                            "window_title": label,
+                            "memory_mb": round(rss / (1024 * 1024), 1) if rss else 0.0,
+                        })
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+        except Exception:
+            pass
+        if candidates:
+            return max(candidates, key=lambda c: c.get("memory_mb", 0.0))
+        return None
+
+    def summarize_active_window(self, dry_run: bool = False, prompt: str = "") -> Dict[str, Any]:
+        """
+        Answers 'What am I working on?', 'What am I playing?', 'What window am I in?', or 'What app is focused?'.
+        """
+        q_low = (prompt or "").lower()
+        asking_game = any(w in q_low for w in ["playing", "what game", "which game", "game am i"])
+        if asking_game:
+            game_info = self.detect_running_game(dry_run=dry_run)
+            if game_info:
+                g_label = game_info.get("app_label", "a game")
+                g_mem = game_info.get("memory_mb", 0.0)
+                voice = f"You're currently playing {g_label}"
+                if g_mem and g_mem > 50:
+                    voice += f", using {int(g_mem)} megabytes of RAM."
+                else:
+                    voice += "."
+                return {
+                    "status": "success",
+                    "action": "active_window",
+                    "sub_action": "status",
+                    "window_info": game_info,
+                    "voice_response": voice,
+                }
+
+        info = self.get_active_window_info(dry_run=dry_run)
+        if info.get("app_label") in ("Desktop", "Unknown", "") and self.mock_window_info is None:
+            running_g = self.detect_running_game(dry_run=dry_run)
+            if running_g:
+                info = running_g
         app = info.get("app_label") or "Desktop"
         cat = info.get("app_category", "general")
         title = info.get("window_title") or ""
@@ -432,6 +639,8 @@ class ActiveWindowEngine:
             voice = f"You have {app} focused on {page}."
         elif cat == "terminal":
             voice = f"You're in {app}" + (f" ({title})." if title and title.lower() != app.lower() else ".")
+        elif cat == "game":
+            voice = f"You're currently playing {app}."
         elif title:
             voice = f"You're currently focused on {app} — {title}."
         else:
@@ -479,12 +688,12 @@ class ActiveWindowEngine:
                 active_file = named_f
                 active_file_path = resolved
 
-        # 1. Direct "What am I working on?" / "What window am I in?"
+        # 1. Direct "What am I working on?" / "What am I playing?" / "What window am I in?"
         if re.search(
-            r"\b(?:what\s+(?:am\s+i|a\s+man|i'm|i\s+am)\s+(?:working|walking|workin|focusing|focused)\s+on|what\s+am\s+i\s+(?:doing|looking\s+at)|what\s+(?:window|app|application)\s+(?:am\s+i\s+in|is\s+(?:active|focused|open))|which\s+window\s+is\s+active)\b",
+            r"\b(?:what\s+(?:am\s+i|a\s+man|i'm|i\s+am|im)\s+(?:working|walking|workin|focusing|focused)\s+on|what\s+(?:(?:application|app|game)?\s*(?:window)?\s*)?(?:am\s+i|i'm|i\s+am|im)\s+(?:currently\s+)?(?:looking\s+at|viewing|doing|in|playing)|what\s+(?:window|app|application|game)\s+(?:am\s+i\s+(?:in|playing)|is\s+(?:active|focused|open|running))|which\s+(?:window|game)\s+is\s+(?:active|open|running)|(?:do\s+you\s+)?know\s+what\s+(?:game\s+)?(?:i'm|i\s+am|im)\s+playing)\b",
             q_low,
         ):
-            return self.summarize_active_window(dry_run=dry_run)
+            return self.summarize_active_window(dry_run=dry_run, prompt=prompt)
 
         # 2. Error / Bug Diagnosis in Active Window ("What does this error mean?", "How do I fix this bug?")
         if re.search(
@@ -722,4 +931,4 @@ class ActiveWindowEngine:
                 "voice_response": f"You're viewing {page_title} in {app_label}.",
             }
 
-        return self.summarize_active_window(dry_run=dry_run)
+        return self.summarize_active_window(dry_run=dry_run, prompt=prompt)

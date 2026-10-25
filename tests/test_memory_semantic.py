@@ -115,5 +115,9 @@ def run_semantic_memory_tests():
         sys.exit(1)
 
 
+
+def test_suite():
+    run_semantic_memory_tests()
+
 if __name__ == "__main__":
     run_semantic_memory_tests()

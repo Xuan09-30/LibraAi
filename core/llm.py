@@ -1836,9 +1836,7 @@ class LocalLLM:
             # Guard: If query mentions "spotify" or music playback ("open my spotify to place a music", "play some music")
             clean_low = raw_app.lower()
             if "spotify" in clean_low or clean_low in ["music", "some music", "a song"]:
-                query_target = ""
-                if any(k in clean_low for k in ["music", "song", "play", "place", "some"]):
-                    query_target = re.sub(r"\b(?:open|launch|start|play|place|my|the|spotify|some|a|music|song|and|to)\b", "", clean_low).strip()
+                query_target = re.sub(r"\b(?:open|launch|start|play|place|my|the|spotify|some|a|music|song|and|to|on|in|from)\b", "", clean_low).strip()
                 sp_res = self.spotify_agent.play_query(query_target, dry_run=dry_run)
                 plan_res = {
                     "action": "spotify_play",
@@ -2179,7 +2177,7 @@ class LocalLLM:
             and not self.attached_file_path
             and (
                 re.search(
-                    r"\b(?:what\s+(?:am\s+i|a\s+man|i'm|i\s+am)\s+(?:working|walking|workin)\s+on|what\s+am\s+i\s+(?:doing|looking\s+at)|what\s+(?:window|app|application)\s+(?:am\s+i\s+in|is\s+(?:active|focused|open))|which\s+window\s+is\s+active)\b",
+                    r"\b(?:what\s+(?:am\s+i|a\s+man|i'm|i\s+am|im)\s+(?:working|walking|workin|focusing|focused)\s+on|what\s+(?:(?:application|app|game)?\s*(?:window)?\s*)?(?:am\s+i|i'm|i\s+am|im)\s+(?:currently\s+)?(?:looking\s+at|viewing|doing|in|playing)|what\s+(?:window|app|application|game)\s+(?:am\s+i\s+(?:in|playing)|is\s+(?:active|focused|open|running))|which\s+(?:window|game)\s+is\s+(?:active|open|running)|(?:do\s+you\s+)?know\s+what\s+(?:game\s+)?(?:i'm|i\s+am|im)\s+playing)\b",
                     q_lower,
                 )
                 or re.search(
@@ -2591,16 +2589,10 @@ class LocalLLM:
             return self._process_response(plan_res, prompt, dry_run=dry_run)
 
         # -------------------------------------------------------------
-        # 8.14.1 DYNAMIC GLOBAL WEATHER ENGINE (v8.5 / v9.0)
+        # 8.14.1 DYNAMIC GLOBAL WEATHER ENGINE (STRICT ROUTE ISOLATION)
         # -------------------------------------------------------------
-        is_capability_weather = bool(
-            re.search(r"\b(?:can\s+you\s+predict|predict\s+the\s+weather|next\s+month|next\s+year)\b", q_lower)
-        )
-        weather_match = not is_capability_weather and (
-            re.search(r"\b(?:what(?:'s|\s+is|\s+the)?\s+(?:the\s+)?weather|how(?:'s|\s+is|\s+the)?\s+(?:the\s+)?weather|weather\s+(?:in|for|at|like\s+in)|forecast\s+(?:in|for|at)|temperature\s+(?:in|for|at)|is\s+it\s+(?:going\s+to\s+rain|raining|hot|cold)|how\s+(?:hot|cold|warm)\s+(?:is\s+it|it\s+is))\b", q_lower)
-            or re.search(r"^(?:weather|forecast)(?:\s+(?:in|for|at))?\s*([a-zA-Z\s,]+)?[\.\?!]*$", q_lower)
-            or re.search(r"\b(?:what\s+about\s+(?:the\s+)?weather|check\s+(?:the\s+)?weather)\b", q_lower)
-        )
+        from core.dispatcher import is_weather_intent, dispatch_weather
+        weather_match = is_weather_intent(cleaned_query) or is_weather_intent(prompt)
         if weather_match:
             loc_extracted = None
             loc_m = re.search(
@@ -2898,6 +2890,20 @@ class LocalLLM:
                 relevant_memories = self.memory.recall_relevant(prompt, limit=2)
                 relevant_episodes = self.memory.recall_episodes(prompt, limit=2)
                 ctx_blocks = []
+                # Phase 11: Ingest live active window and currently running game so chat never hallucinates stale games
+                try:
+                    live_win = self.window_engine.get_active_window_info(dry_run=False)
+                    running_game = self.window_engine.detect_running_game(dry_run=False)
+                    live_lines = ["[Live Desktop & Game State]"]
+                    if running_game:
+                        live_lines.append(f"- Currently Playing Game: {running_game.get('app_label')} ({running_game.get('process_name')})")
+                    else:
+                        live_lines.append("- Currently Playing Game: None")
+                    if live_win and live_win.get("app_label"):
+                        live_lines.append(f"- Foreground Application: {live_win.get('app_label')} ({live_win.get('window_title')})")
+                    ctx_blocks.append("\n".join(live_lines))
+                except Exception:
+                    pass
                 # Phase 1: Ingest verified semantic facts
                 if hasattr(self.memory, "format_semantic_facts_prompt"):
                     sem_facts = self.memory.format_semantic_facts_prompt()

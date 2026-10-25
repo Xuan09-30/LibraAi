@@ -8,6 +8,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 from core.llm import LocalLLM
 from core.text_cleaner import normalize_for_tts
 from core.telemetry import profiler
+from core.dispatcher import is_weather_intent, dispatch_weather
 
 
 def normalize_trigger(text: str) -> str:
@@ -169,6 +170,10 @@ class SupervisorHub:
             return [prompt]
         if re.search(r"\b(?:find\s+(?:me\s+)?(?:valid\s+)?data\s+(?:on|about|for)|analyze\s+(?:the\s+)?dataset|make\s+(?:it\s+into\s+)?a\s+visualization)\b", prompt, re.IGNORECASE):
             return [prompt]
+        # Preserve unified weather requests containing 'and' (e.g. 'current weather and rain forecast')
+        if re.search(r"\bweather\s+and\s+(?:the\s+)?(?:rain\s+)?forecast\b", prompt, re.IGNORECASE) or \
+           (re.search(r"\bweather\b", prompt, re.IGNORECASE) and re.search(r"\b(?:rain\s+)?forecast\b", prompt, re.IGNORECASE) and not re.search(r"\b(?:open|launch|close|kill|play|switch)\b", prompt, re.IGNORECASE)):
+            return [prompt]
 
         # Sequencing delimiters: 'and then', 'then', ', and', 'and also', 'and', ';'
         split_regex = r"\s+(?:,\s*and\s+then|;\s*|then|and\s+then|,\s*and|and\s+also|and)\s+"
@@ -295,16 +300,48 @@ class SupervisorHub:
         if session_id and hasattr(self.llm, "active_session_id"):
             self.llm.active_session_id = session_id
 
+        # STRICT ROUTE ISOLATION: Weather Intent (Tier 1 Fix)
+        # Directly queries tools.weather and returns immediately without running secondary RAG or web search
+        if is_weather_intent(prompt):
+            sub_steps = self.split_compound_intent(prompt)
+            if len(sub_steps) == 1:
+                ctx_city = None
+                if hasattr(self.llm, "last_context") and isinstance(self.llm.last_context, dict):
+                    ctx_city = self.llm.last_context.get("city")
+                res = dispatch_weather(
+                    prompt,
+                    dry_run=dry_run,
+                    default_city=getattr(self.llm, "city", "Kuala Lumpur"),
+                    context_city=ctx_city
+                )
+                res["compound"] = False
+                if hasattr(self.llm, "last_context") and isinstance(self.llm.last_context, dict):
+                    loc_val = res.get("location") or (res.get("args") or {}).get("location")
+                    if loc_val:
+                        self.llm.last_context["city"] = str(loc_val).split(",")[0].strip()
+                fast_tm = {
+                    "input_tokens": 0, "output_tokens": max(1, len(res.get("voice_response", "")) // 4),
+                    "total_tokens": max(1, len(res.get("voice_response", "")) // 4),
+                    "tokens_per_sec": 0.0, "saved_tokens": 350,
+                    "model": "weather_isolated", "fast_path": True
+                }
+                res["token_metrics"] = fast_tm
+                if hasattr(self.llm, "last_token_metrics"):
+                    self.llm.last_token_metrics = dict(fast_tm)
+                return res
+
         norm_trigger = normalize_trigger(prompt)
         intent_signature = f"macro:{norm_trigger}"
         t_start = time.perf_counter()
+        sub_steps = self.split_compound_intent(prompt)
 
         # PREACT DETERMINISTIC ACTION MACRO FAST-PATH (<5ms)
-        if hasattr(self.llm, "memory") and hasattr(self.llm.memory, "get_action_macro"):
+        _DYNAMIC_NO_MACRO_ACTIONS = {"chat", "clarify", "error", "active_window", "weather", "world_time", "time", "run_learned_skill"}
+        if len(sub_steps) == 1 and hasattr(self.llm, "memory") and hasattr(self.llm.memory, "get_action_macro"):
             cached_macro = self.llm.memory.get_action_macro(norm_trigger)
             if cached_macro and cached_macro.get("success_count", 0) >= 2:
                 tool_chain = cached_macro.get("tool_chain", [])
-                if tool_chain:
+                if tool_chain and not any(s.get("action") in _DYNAMIC_NO_MACRO_ACTIONS for s in tool_chain):
                     profiler.record_preact_cache_hit(
                         trigger=norm_trigger,
                         intent_signature=intent_signature,
@@ -347,7 +384,7 @@ class SupervisorHub:
                     }
                     if hasattr(self.llm, "last_token_metrics"):
                         self.llm.last_token_metrics = dict(fast_tm)
-                    return {
+                    out_macro = {
                         "action": macro_act,
                         "compound": len(tool_chain) > 1,
                         "steps": [norm_trigger],
@@ -358,33 +395,36 @@ class SupervisorHub:
                         "token_metrics": fast_tm,
                         "latency_ms": round(elapsed_ms, 2)
                     }
+                    if len(step_results) == 1 and isinstance(step_results[0], dict) and step_results[0].get("slug"):
+                        out_macro["slug"] = step_results[0]["slug"]
+                    return out_macro
 
-        # SEMANTIC FAST-PATH ROUTING (Phase 9) (<5ms)
-        sem_fast = self._match_semantic_fastpath(prompt)
-        if sem_fast:
-            if client_scope == "remote_web" and sem_fast["action"] in BLOCKED_REMOTE_ACTIONS:
-                return {
-                    "action": "sandboxed_blocked",
-                    "status": "blocked",
-                    "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
-                    "client_scope": client_scope
+        # SEMANTIC FAST-PATH ROUTING (Phase 9) (<5ms) - Only for single-clause intents
+        if len(sub_steps) == 1:
+            sem_fast = self._match_semantic_fastpath(prompt)
+            if sem_fast:
+                if client_scope == "remote_web" and sem_fast["action"] in BLOCKED_REMOTE_ACTIONS:
+                    return {
+                        "action": "sandboxed_blocked",
+                        "status": "blocked",
+                        "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                        "client_scope": client_scope
+                    }
+                profiler.record_metric("semantic_fastpath_hit", 1.0)
+                res = self._execute_cached_tool(sem_fast["action"], sem_fast["args"], dry_run=dry_run)
+                res["semantic_fastpath"] = True
+                res["compound"] = False
+                fast_tm = {
+                    "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+                    "tokens_per_sec": 0.0, "saved_tokens": 350,
+                    "model": "semantic_fastpath", "fast_path": True
                 }
-            profiler.record_metric("semantic_fastpath_hit", 1.0)
-            res = self._execute_cached_tool(sem_fast["action"], sem_fast["args"], dry_run=dry_run)
-            res["semantic_fastpath"] = True
-            fast_tm = {
-                "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
-                "tokens_per_sec": 0.0, "saved_tokens": 350,
-                "model": "semantic_fastpath", "fast_path": True
-            }
-            res["token_metrics"] = fast_tm
-            if hasattr(self.llm, "last_token_metrics"):
-                self.llm.last_token_metrics = dict(fast_tm)
-            if sem_fast.get("voice_response") and not res.get("voice_response"):
-                res["voice_response"] = sem_fast["voice_response"]
-            return res
-
-        sub_steps = self.split_compound_intent(prompt)
+                res["token_metrics"] = fast_tm
+                if hasattr(self.llm, "last_token_metrics"):
+                    self.llm.last_token_metrics = dict(fast_tm)
+                if sem_fast.get("voice_response") and not res.get("voice_response"):
+                    res["voice_response"] = sem_fast["voice_response"]
+                return res
 
         # FAST PATH (<5ms): Single intent query
         if len(sub_steps) == 1:
@@ -400,7 +440,7 @@ class SupervisorHub:
                     "client_scope": client_scope,
                     "blocked_action": act
                 }
-            if not dry_run and act and act not in ["chat", "clarify", "error"] and res.get("status") != "error":
+            if not dry_run and act and act not in _DYNAMIC_NO_MACRO_ACTIONS and res.get("status") != "error":
                 tool_chain = [{"action": act, "args": res.get("args", {})}]
                 if hasattr(self.llm, "memory") and hasattr(self.llm.memory, "record_action_macro"):
                     self.llm.memory.record_action_macro(
@@ -447,7 +487,7 @@ class SupervisorHub:
             successful_chain = [
                 {"action": r.get("action"), "args": r.get("args", {})}
                 for r in step_results
-                if r.get("action") and r.get("action") not in ["chat", "clarify", "error"] and r.get("status") != "error"
+                if r.get("action") and r.get("action") not in ["chat", "clarify", "error", "active_window", "weather"] and r.get("status") != "error"
             ]
             if successful_chain and len(successful_chain) == len(step_results):
                 if hasattr(self.llm, "memory") and hasattr(self.llm.memory, "record_action_macro"):

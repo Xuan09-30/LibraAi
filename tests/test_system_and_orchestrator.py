@@ -153,5 +153,9 @@ def run_tests():
         sys.exit(1)
 
 
+
+def test_suite():
+    run_tests()
+
 if __name__ == "__main__":
     run_tests()

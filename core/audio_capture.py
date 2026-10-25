@@ -216,19 +216,73 @@ def get_dynamic_chime_pcm(cached_chime_bytes: bytes, base_gain: float = 0.35) ->
 class AudioDucker:
     """
     Native Windows Core Audio API wrapper (WASAPI per-app session ducking) (Phase 7).
-    When Wake Word triggers or Kokoro TTS speaks, automatically ducks third-party
-    media and game audio sessions (e.g. Spotify, Chrome, Discord, games) to 20%,
-    while keeping Project Libra's own process audio at 100%, and smoothly restoring volumes.
+    When Wake Word triggers or Kokoro TTS speaks on desktop, ducks third-party
+    media sessions (e.g. Spotify, Chrome) to 20% while keeping Project Libra's
+    own process audio at 100%, and smoothly restoring volumes.
+    NEVER ducks active game processes (Valorant, CS2, Overwatch, etc.) and
+    automatically heals any sessions trapped at ducked volume after hot-reloads.
     """
+
+    PROTECTED_GAME_PROCESSES = {
+        "valorant.exe",
+        "valorant-win64-shipping.exe",
+        "overwatch.exe",
+        "overwatch 2.exe",
+        "apex.exe",
+        "r5apex.exe",
+        "cs2.exe",
+        "csgo.exe",
+        "league of legends.exe",
+        "leagueclient.exe",
+        "leagueclientux.exe",
+        "dota2.exe",
+        "dota.exe",
+        "fortniteclient-win64-shipping.exe",
+        "gta5.exe",
+        "palworld-win64-shipping.exe",
+        "genshinimpact.exe",
+        "starrail.exe",
+        "honkaistarrail.exe",
+        "zenlesszonezero.exe",
+        "robloxplayerbeta.exe",
+        "minecraft.exe",
+        "javaw.exe",
+        "rainbowsix.exe",
+        "r6.exe",
+        "destiny2.exe",
+        "warframe.x64.exe",
+        "pubg.exe",
+        "tslgame.exe",
+        "helldivers2.exe",
+        "eldenring.exe",
+        "cyberpunk2077.exe",
+    }
 
     def __init__(self):
         self._saved_volumes: Dict[int, float] = {}
         self._is_ducked = False
         self._lock = threading.Lock()
+        # Self-heal any sessions left ducked by a prior process or hot-reload
+        try:
+            self.restore_background_audio()
+        except Exception:
+            pass
+
+    @classmethod
+    def _is_game_process(cls, pname: str) -> bool:
+        p = (pname or "").lower().strip()
+        if not p:
+            return False
+        return (
+            p in cls.PROTECTED_GAME_PROCESSES
+            or p.endswith("-shipping.exe")
+            or "valorant" in p
+        )
 
     def duck_background_audio(self, target_level: float = 0.20) -> int:
         """
-        Ducks non-Libra audio sessions down to target_level (default 20%).
+        Ducks non-Libra, non-game audio sessions down to target_level (default 20%).
+        If a protected game is running, skips ducking and ensures game volume is 100%.
         Returns the number of ducked application sessions.
         """
         if not PYCAW_AVAILABLE:
@@ -240,19 +294,39 @@ class AudioDucker:
         with self._lock:
             try:
                 sessions = AudioUtilities.GetAllSessions()
+                # First pass: check if any protected game has an active audio session
+                game_running = False
+                for session in sessions:
+                    proc = session.Process
+                    if not proc:
+                        continue
+                    pname = (proc.name() or "").lower()
+                    if self._is_game_process(pname):
+                        game_running = True
+                        try:
+                            vol_ctl = session._ctl.QueryInterface(ISimpleAudioVolume)
+                            if float(vol_ctl.GetMasterVolume()) <= 0.25:
+                                vol_ctl.SetMasterVolume(1.0, None)
+                        except Exception:
+                            pass
+
+                if game_running:
+                    return 0
+
                 for session in sessions:
                     proc = session.Process
                     if not proc or proc.pid == current_pid:
                         continue
                     pname = (proc.name() or "").lower()
-                    if pname in ["system", "idle", "audiodg.exe"]:
+                    if pname in ["system", "idle", "audiodg.exe"] or self._is_game_process(pname):
                         continue
 
                     try:
                         volume = session._ctl.QueryInterface(ISimpleAudioVolume)
                         curr_vol = float(volume.GetMasterVolume())
                         if session.ProcessId not in self._saved_volumes:
-                            self._saved_volumes[session.ProcessId] = curr_vol
+                            # Never record an already-ducked volume (<=0.25) as original volume
+                            self._saved_volumes[session.ProcessId] = curr_vol if curr_vol > 0.25 else 1.0
                         if curr_vol > target_level:
                             volume.SetMasterVolume(target_level, None)
                             ducked_count += 1
@@ -265,28 +339,38 @@ class AudioDucker:
                 return 0
 
     def restore_background_audio(self) -> int:
-        """Restores previously ducked application volumes to their original levels."""
+        """Restores previously ducked application volumes to their original levels and heals stuck sessions."""
         if not PYCAW_AVAILABLE:
             return 0
 
         restored_count = 0
         with self._lock:
-            if not self._saved_volumes:
-                self._is_ducked = False
-                return 0
-
             try:
                 sessions = AudioUtilities.GetAllSessions()
                 for session in sessions:
+                    proc = session.Process
+                    if not proc:
+                        continue
                     pid = session.ProcessId
-                    if pid in self._saved_volumes:
-                        orig_vol = self._saved_volumes[pid]
-                        try:
-                            volume = session._ctl.QueryInterface(ISimpleAudioVolume)
+                    pname = (proc.name() or "").lower()
+                    try:
+                        volume = session._ctl.QueryInterface(ISimpleAudioVolume)
+                        curr_vol = float(volume.GetMasterVolume())
+                        if pid in self._saved_volumes:
+                            orig_vol = self._saved_volumes[pid]
+                            if orig_vol <= 0.25:
+                                orig_vol = 1.0
                             volume.SetMasterVolume(orig_vol, None)
                             restored_count += 1
-                        except Exception:
-                            pass
+                        elif self._is_game_process(pname) and curr_vol <= 0.25:
+                            volume.SetMasterVolume(1.0, None)
+                            restored_count += 1
+                        elif 0.14 <= curr_vol <= 0.21:
+                            # Heal session stuck at ducked volume from prior reload
+                            volume.SetMasterVolume(1.0, None)
+                            restored_count += 1
+                    except Exception:
+                        pass
                 self._saved_volumes.clear()
                 self._is_ducked = False
                 return restored_count

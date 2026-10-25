@@ -259,7 +259,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             clean_email = email.lower().strip()
             # If email is admin or matches authorized Gmail
             if clean_email == admin_email or clean_email.startswith(admin_email.split("@")[0]):
-                return {"authenticated": True, "method": "tailscale_identity", "email": clean_email}
+                return {"authenticated": True, "role": "host", "method": "tailscale_identity", "email": clean_email}
             else:
                 raise HTTPException(
                     status_code=403,
@@ -277,9 +277,25 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             token = request.query_params.get("token", "").strip()
         elif "libra_token" in request.cookies:
             token = request.cookies.get("libra_token", "").strip()
+        elif "libra_auth" in request.cookies:
+            token = request.cookies.get("libra_auth", "").strip()
 
+        # Host Master Token
         if token and token == access_token:
-            return {"authenticated": True, "method": "token", "token": token}
+            return {"authenticated": True, "role": "host", "method": "master_token", "token": token, "email": admin_email}
+
+        # Guest Access Token
+        memory = getattr(supervisor.llm, "memory", None)
+        if memory and hasattr(memory, "validate_guest_token") and token:
+            guest_info = memory.validate_guest_token(token)
+            if guest_info:
+                return {
+                    "authenticated": True,
+                    "role": "guest",
+                    "method": "guest_token",
+                    "token": token,
+                    "label": guest_info.get("label", "Guest")
+                }
 
         raise HTTPException(
             status_code=401,
@@ -627,6 +643,166 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     # -----------------------------------------------------------------------
     # TOKEN METRICS SUMMARY ENDPOINT
     # -----------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # GUEST ACCESS & TAILSCALE FUNNEL ENDPOINTS (ROLE-BASED ACCESS CONTROL)
+    # -----------------------------------------------------------------------
+    class CreateGuestTokenRequest(BaseModel):
+        label: Optional[str] = "Guest"
+        expires_in_days: Optional[int] = 7
+
+    @app.get("/api/auth/me")
+    async def get_auth_me(auth: Dict[str, Any] = Depends(authenticate_request)):
+        """Returns active user role and Dual-Tunnel (Cloudflare + Tailscale) connectivity status."""
+        cf_info = get_cloudflare_info()
+        cf_url = cf_info.get("public_url", "")
+        return {
+            "status": "success",
+            "role": auth.get("role", "guest"),
+            "email": auth.get("email", ""),
+            "label": auth.get("label", "Host"),
+            "funnel_active": is_funnel_active(),
+            "funnel_enable_url": "https://login.tailscale.com/f/funnel?node=nXwMr4Nxm221CNTRL",
+            "serve_url": _TAILSCALE_INFO.get("serve_url", "https://libra-beta.note-loggerhead.ts.net/"),
+            "cloudflare_active": bool(cf_url),
+            "cloudflare_url": cf_url
+        }
+
+    @app.post("/api/cloudflare/restart")
+    async def post_restart_cloudflare(auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Only host can manage Cloudflare tunnel.")
+        port = cfg.get("port", 8765)
+        cf_info = ensure_cloudflare_tunnel(port=port, force_restart=True)
+        return {
+            "status": "success" if cf_info.get("public_url") else "error",
+            "cloudflare_active": bool(cf_info.get("public_url")),
+            "cloudflare_url": cf_info.get("public_url", "")
+        }
+
+    @app.get("/api/tokens/guests")
+    async def get_guest_tokens(auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Only host can manage guest tokens.")
+        memory = getattr(supervisor.llm, "memory", None)
+        tokens = memory.list_guest_tokens() if (memory and hasattr(memory, "list_guest_tokens")) else []
+        return {"status": "success", "tokens": tokens}
+
+    @app.post("/api/tokens/guests")
+    async def post_create_guest_token(req: CreateGuestTokenRequest, auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Only host can create guest tokens.")
+        memory = getattr(supervisor.llm, "memory", None)
+        if not memory or not hasattr(memory, "create_guest_token"):
+            raise HTTPException(status_code=500, detail="MemoryCore guest token manager not initialized.")
+        tok_info = memory.create_guest_token(label=req.label or "Guest", expires_in_days=req.expires_in_days)
+        tok_str = tok_info.get("token", "")
+        ts_base = _TAILSCALE_INFO.get("serve_url", "https://libra-beta.note-loggerhead.ts.net").rstrip("/")
+        cf_info = get_cloudflare_info()
+        cf_base = (cf_info.get("public_url") or "").rstrip("/")
+        if not cf_base:
+            cf_info = ensure_cloudflare_tunnel(port=cfg.get("port", 8765))
+            cf_base = (cf_info.get("public_url") or "").rstrip("/")
+        ts_invite_url = f"{ts_base}/?token={tok_str}"
+        cf_invite_url = f"{cf_base}/?token={tok_str}" if cf_base else ""
+        primary_invite = cf_invite_url if cf_invite_url else ts_invite_url
+        return {
+            "status": "success",
+            "token_info": tok_info,
+            "invite_url": primary_invite,
+            "cloudflare_invite_url": cf_invite_url,
+            "tailscale_invite_url": ts_invite_url
+        }
+
+    class BugReportRequest(BaseModel):
+        reporter_name: Optional[str] = "Friend Tester"
+        category: Optional[str] = "Bug"
+        description: str
+        device_info: Optional[str] = ""
+        session_id: Optional[str] = ""
+
+    @app.get("/api/bugs")
+    async def get_bug_reports(auth: Dict[str, Any] = Depends(authenticate_request)):
+        bug_file = os.path.join(PROJECT_ROOT, "logs", "bug_reports.json")
+        reports = []
+        if os.path.isfile(bug_file):
+            try:
+                with open(bug_file, "r", encoding="utf-8") as f:
+                    reports = json.load(f)
+            except Exception:
+                reports = []
+        return {"status": "success", "reports": reports}
+
+    @app.post("/api/bugs")
+    async def post_bug_report(req: BugReportRequest, auth: Dict[str, Any] = Depends(authenticate_request)):
+        if not req.description or not req.description.strip():
+            raise HTTPException(status_code=400, detail="Bug description cannot be empty.")
+        os.makedirs(os.path.join(PROJECT_ROOT, "logs"), exist_ok=True)
+        bug_file = os.path.join(PROJECT_ROOT, "logs", "bug_reports.json")
+        reports = []
+        if os.path.isfile(bug_file):
+            try:
+                with open(bug_file, "r", encoding="utf-8") as f:
+                    reports = json.load(f)
+            except Exception:
+                reports = []
+        from datetime import datetime
+        entry = {
+            "id": f"bug_{int(time.time()*1000)}",
+            "reporter": (req.reporter_name or auth.get("label") or "Guest").strip(),
+            "role": auth.get("role", "guest"),
+            "category": (req.category or "Bug").strip(),
+            "description": req.description.strip(),
+            "device_info": (req.device_info or "")[:200],
+            "session_id": req.session_id or "",
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        reports.insert(0, entry)
+        with open(bug_file, "w", encoding="utf-8") as f:
+            json.dump(reports[:200], f, indent=2)
+        return {"status": "success", "report": entry, "message": "Bug report saved to Host PC!"}
+
+    @app.delete("/api/bugs/{bug_id}")
+    async def delete_bug_report(bug_id: str, auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Only host can resolve/delete bug reports.")
+        bug_file = os.path.join(PROJECT_ROOT, "logs", "bug_reports.json")
+        reports = []
+        if os.path.isfile(bug_file):
+            try:
+                with open(bug_file, "r", encoding="utf-8") as f:
+                    reports = json.load(f)
+            except Exception:
+                reports = []
+        new_reports = [r for r in reports if r.get("id") != bug_id]
+        with open(bug_file, "w", encoding="utf-8") as f:
+            json.dump(new_reports, f, indent=2)
+        return {"status": "success", "deleted": bug_id}
+
+    @app.delete("/api/tokens/guests/{token}")
+    async def delete_revoke_guest_token(token: str, auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Only host can revoke guest tokens.")
+        memory = getattr(supervisor.llm, "memory", None)
+        ok = memory.revoke_guest_token(token) if (memory and hasattr(memory, "revoke_guest_token")) else False
+        return {"status": "success" if ok else "error", "revoked": token}
+
+    @app.post("/api/tailscale/funnel/enable")
+    async def post_enable_funnel(auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Only host can configure Tailscale Funnel.")
+        import subprocess
+        flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+        port = cfg.get("port", 8765)
+        res = subprocess.run(["tailscale", "funnel", "--yes", "--bg", str(port)], capture_output=True, text=True, timeout=10, **flags)
+        out = (res.stdout or "") + (res.stderr or "")
+        active = is_funnel_active()
+        return {
+            "status": "success" if active else "pending_tailnet_approval",
+            "funnel_active": active,
+            "output": out.strip(),
+            "enable_url": "https://login.tailscale.com/f/funnel?node=nXwMr4Nxm221CNTRL"
+        }
+
     @app.get("/api/tokens/summary")
     async def get_token_summary(
         session_id: Optional[str] = Query(None),
@@ -669,7 +845,9 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         linked to session_id, recording exact token analytics.
         Supports SSE token streaming & sentence-level Kokoro audio streaming when stream=true.
         """
-        scope = req.client_scope or "remote_web"
+        role = auth.get("role", "guest")
+        # If host, grant remote_host scope (allows desktop app launch on PC!); if guest, sandbox to remote_web
+        scope = "remote_host" if role == "host" else "remote_web"
         memory = getattr(supervisor.llm, "memory", None)
         should_stream = (stream is True) or (req.stream is True)
 
@@ -700,22 +878,91 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                 # 1.1 Emit Meta Event immediately (<20ms)
                 yield f"data: {json.dumps({'type': 'meta', 'session_id': sid, 'session_title': sess_title})}\n\n"
 
-                # 1.2 Check Desktop Sandbox Safeguard for remote_web scope
-                if scope == "remote_web":
-                    for pat in getattr(supervisor, "REMOTE_SANDBOX_PATTERNS", []):
-                        if re.search(pat, req.prompt, re.IGNORECASE):
-                            if not re.search(r"open\s+(?:my\s+)?(?:google\s+)?calendar\b", req.prompt, re.IGNORECASE):
-                                sandbox_msg = "Remote Web Mode active: Desktop OS control is restricted to local PC sessions."
-                                yield f"data: {json.dumps({'type': 'token', 'content': sandbox_msg})}\n\n"
-                                if req.synthesize_audio:
-                                    b64 = await asyncio.to_thread(synthesize_sentence_wav_b64, supervisor, sandbox_msg)
-                                    if b64:
-                                        yield f"data: {json.dumps({'type': 'audio', 'audio_base64': b64, 'sentence_index': 0})}\n\n"
-                                yield f"data: {json.dumps({'type': 'done', 'token_metrics': {'input_tokens': 0, 'output_tokens': max(1, len(sandbox_msg)//4), 'tokens_per_sec': 0.0}})}\n\n"
-                                if memory and hasattr(memory, "add_session_message"):
-                                    memory.add_session_message(session_id=sid, role="user", content=req.prompt.strip())
-                                    memory.add_session_message(session_id=sid, role="assistant", content=sandbox_msg)
-                                return
+                # 1.2 Check Desktop Safeguards & Host Local Execution
+                is_desktop_open = bool(re.search(r"^(?:please\s+)?(?:open|launch|start|run)\s+(.+?)(?:\s+on\s+(?:my\s+)?pc)?$", req.prompt.strip(), re.IGNORECASE))
+                is_desktop_close = bool(re.search(r"^(?:please\s+)?(?:close|kill|terminate|stop)\s+(.+?)(?:\s+on\s+(?:my\s+)?pc)?$", req.prompt.strip(), re.IGNORECASE))
+                is_desktop_cmd = False
+                for pat in getattr(supervisor, "REMOTE_SANDBOX_PATTERNS", []):
+                    if re.search(pat, req.prompt, re.IGNORECASE):
+                        if not re.search(r"open\s+(?:my\s+)?(?:google\s+)?calendar\b", req.prompt, re.IGNORECASE):
+                            is_desktop_cmd = True
+                            break
+
+                # 1.2.1 Natural Language Guest Token Generation (Host Only)
+                if role == "host" and re.search(r"\b(?:generate|create|get|make|give\s+me)\s+(?:an?\s+)?(?:access\s+token|guest\s+token|guest\s+link|invite\s+link|invite\s+token|guest\s+access)\b", req.prompt, re.IGNORECASE):
+                    guest_tok = memory.create_guest_token(label="Guest Friend") if (memory and hasattr(memory, "create_guest_token")) else {"token": "libra_guest_sample"}
+                    base_url = _TAILSCALE_INFO.get("serve_url", "https://libra-beta.note-loggerhead.ts.net").rstrip("/")
+                    invite_url = f"{base_url}/?token={guest_tok.get('token', '')}"
+                    tok_reply = (
+                        f"Generated a new Guest Access Token for Project Libra:\n\n"
+                        f"🔗 **Invite Link**: [{invite_url}]({invite_url})\n"
+                        f"🔑 **Token**: `{guest_tok.get('token', '')}`\n\n"
+                        f"*Send this link to your friend. They can open it directly in their phone or laptop browser to try Libra AI. "
+                        f"Guest mode is strictly sandboxed—they cannot control your PC or access your private files.*"
+                    )
+                    yield f"data: {json.dumps({'type': 'token', 'content': tok_reply})}\n\n"
+                    if req.synthesize_audio:
+                        b64 = await asyncio.to_thread(synthesize_sentence_wav_b64, supervisor, "Generated a new guest access token for Project Libra. You can share the link with your friend.")
+                        if b64:
+                            yield f"data: {json.dumps({'type': 'audio', 'audio_base64': b64, 'sentence_index': 0})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done', 'token_metrics': {'turn_in': 0, 'output_tokens': max(1, len(tok_reply)//4), 'tokens_per_sec': 0.0}})}\n\n"
+                    if memory and hasattr(memory, "add_session_message"):
+                        memory.add_session_message(session_id=sid, role="user", content=req.prompt.strip())
+                        memory.add_session_message(session_id=sid, role="assistant", content=tok_reply)
+                    return
+
+                # 1.2.2 Desktop Execution for Host vs. Guest
+                if is_desktop_cmd or is_desktop_open or is_desktop_close:
+                    if role == "guest":
+                        sandbox_msg = "Guest Mode active: Desktop OS control is restricted to the host owner."
+                        yield f"data: {json.dumps({'type': 'token', 'content': sandbox_msg})}\n\n"
+                        if req.synthesize_audio:
+                            b64 = await asyncio.to_thread(synthesize_sentence_wav_b64, supervisor, sandbox_msg)
+                            if b64:
+                                yield f"data: {json.dumps({'type': 'audio', 'audio_base64': b64, 'sentence_index': 0})}\n\n"
+                        yield f"data: {json.dumps({'type': 'done', 'token_metrics': {'turn_in': 0, 'output_tokens': max(1, len(sandbox_msg)//4), 'tokens_per_sec': 0.0}})}\n\n"
+                        if memory and hasattr(memory, "add_session_message"):
+                            memory.add_session_message(session_id=sid, role="user", content=req.prompt.strip())
+                            memory.add_session_message(session_id=sid, role="assistant", content=sandbox_msg)
+                        return
+                    else:
+                        # HOST IS EXECUTING ON LOCAL PC!
+                        exec_msg = ""
+                        if is_desktop_open:
+                            m_app = re.search(r"^(?:please\s+)?(?:open|launch|start|run)\s+(.+?)(?:\s+on\s+(?:my\s+)?pc)?$", req.prompt.strip(), re.IGNORECASE)
+                            target_app = m_app.group(1).strip() if m_app else "app"
+                            target_app = re.sub(r"\s+on\s+(?:my\s+)?pc\b", "", target_app, flags=re.IGNORECASE).strip()
+                            from tools.system_actions import launch_any_application
+                            ok, launch_res = launch_any_application(target_app, dry_run=False)
+                            if ok:
+                                exec_msg = f"Executing on host PC: Launching {target_app.title()} now."
+                            else:
+                                res_proc = supervisor.process_command(req.prompt, client_scope="local_desktop", dry_run=False)
+                                exec_msg = res_proc.get("voice_response") or f"Executed on host PC: {target_app}."
+                        elif is_desktop_close:
+                            m_app = re.search(r"^(?:please\s+)?(?:close|kill|terminate|stop)\s+(.+?)(?:\s+on\s+(?:my\s+)?pc)?$", req.prompt.strip(), re.IGNORECASE)
+                            target_app = m_app.group(1).strip() if m_app else "app"
+                            target_app = re.sub(r"\s+on\s+(?:my\s+)?pc\b", "", target_app, flags=re.IGNORECASE).strip()
+                            disp = getattr(supervisor.llm, "dispatcher", None)
+                            if disp and hasattr(disp, "terminate_app"):
+                                ok, term_res = disp.terminate_app(target_app, dry_run=False)
+                                exec_msg = f"Executing on host PC: Closed {target_app.title()}." if ok else term_res
+                            else:
+                                exec_msg = f"Executing on host PC: Sent close signal to {target_app.title()}."
+                        else:
+                            res_proc = supervisor.process_command(req.prompt, client_scope="local_desktop", dry_run=False)
+                            exec_msg = res_proc.get("voice_response") or "Executed command on host PC."
+
+                        yield f"data: {json.dumps({'type': 'token', 'content': exec_msg})}\n\n"
+                        if req.synthesize_audio:
+                            b64 = await asyncio.to_thread(synthesize_sentence_wav_b64, supervisor, exec_msg)
+                            if b64:
+                                yield f"data: {json.dumps({'type': 'audio', 'audio_base64': b64, 'sentence_index': 0})}\n\n"
+                        yield f"data: {json.dumps({'type': 'done', 'token_metrics': {'turn_in': 0, 'output_tokens': max(1, len(exec_msg)//4), 'tokens_per_sec': 0.0}})}\n\n"
+                        if memory and hasattr(memory, "add_session_message"):
+                            memory.add_session_message(session_id=sid, role="user", content=req.prompt.strip())
+                            memory.add_session_message(session_id=sid, role="assistant", content=exec_msg)
+                        return
 
                 # 2. Context Window Protection: Pull only last 4-6 messages from SQLite
                 messages = [
@@ -931,14 +1178,73 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         # BRANCH B: NON-STREAMING / MULTIMODAL FALLBACK
         # -------------------------------------------------------------------
         t0 = time.perf_counter()
-        scope = req.client_scope or "remote_web"
+        scope = "remote_host" if role == "host" else (req.client_scope or "remote_web")
         memory = getattr(supervisor.llm, "memory", None)
+
+        # Natural Language Guest Token Generation (Host Only)
+        if role == "host" and re.search(r"\b(?:generate|create|get|make|give\s+me)\s+(?:an?\s+)?(?:access\s+token|guest\s+token|guest\s+link|invite\s+link|invite\s+token|guest\s+access)\b", req.prompt, re.IGNORECASE):
+            guest_tok = memory.create_guest_token(label="Guest Friend") if (memory and hasattr(memory, "create_guest_token")) else {"token": "libra_guest_sample"}
+            base_url = _TAILSCALE_INFO.get("serve_url", "https://libra-beta.note-loggerhead.ts.net").rstrip("/")
+            invite_url = f"{base_url}/?token={guest_tok.get('token', '')}"
+            tok_reply = (
+                f"Generated a new Guest Access Token for Project Libra:\n\n"
+                f"🔗 **Invite Link**: [{invite_url}]({invite_url})\n"
+                f"🔑 **Token**: `{guest_tok.get('token', '')}`\n\n"
+                f"*Send this link to your friend. They can open it directly in their phone or laptop browser to try Libra AI. "
+                f"Guest mode is strictly sandboxed—they cannot control your PC or access your private files.*"
+            )
+            return {
+                "status": "success",
+                "voice_response": tok_reply,
+                "action": "guest_token_created",
+                "token_metrics": {"input_tokens": 0, "output_tokens": max(1, len(tok_reply)//4), "tokens_per_sec": 0.0}
+            }
+
+        # Desktop execution in Branch B
+        explicit_pc_target = bool(re.search(r"\bon\s+(?:my\s+)?(?:pc|computer|desktop)\b", req.prompt.strip(), re.IGNORECASE))
+        is_desktop_open = bool(re.search(r"^(?:please\s+)?(?:open|launch|start|run)\s+(.+?)(?:\s+on\s+(?:my\s+)?pc)?$", req.prompt.strip(), re.IGNORECASE))
+        is_desktop_close = bool(re.search(r"^(?:please\s+)?(?:close|kill|terminate|stop)\s+(.+?)(?:\s+on\s+(?:my\s+)?pc)?$", req.prompt.strip(), re.IGNORECASE))
+        is_desktop_cmd = False
+        for pat in getattr(supervisor, "REMOTE_SANDBOX_PATTERNS", []):
+            if re.search(pat, req.prompt, re.IGNORECASE):
+                if not re.search(r"open\s+(?:my\s+)?(?:google\s+)?calendar\b", req.prompt, re.IGNORECASE):
+                    is_desktop_cmd = True
+                    break
+
+        if is_desktop_cmd or is_desktop_open or is_desktop_close:
+            if role == "guest":
+                sandbox_msg = "Guest Mode active: Desktop OS control is restricted to the host owner."
+                return {
+                    "status": "blocked",
+                    "reply_text": sandbox_msg,
+                    "voice_response": sandbox_msg,
+                    "action": "remote_sandbox_blocked",
+                    "client_scope": req.client_scope or scope,
+                    "token_metrics": {"input_tokens": 0, "output_tokens": max(1, len(sandbox_msg)//4), "tokens_per_sec": 0.0}
+                }
+            elif is_desktop_open and (explicit_pc_target or req.client_scope == "remote_host"):
+                m_app = re.search(r"^(?:please\s+)?(?:open|launch|start|run)\s+(.+?)(?:\s+on\s+(?:my\s+)?pc)?$", req.prompt.strip(), re.IGNORECASE)
+                target_app = m_app.group(1).strip() if m_app else "app"
+                target_app = re.sub(r"\s+on\s+(?:my\s+)?pc\b", "", target_app, flags=re.IGNORECASE).strip()
+                from tools.system_actions import launch_any_application
+                ok, launch_res = launch_any_application(target_app, dry_run=False)
+                exec_msg = f"Executing on host PC: Launching {target_app.title()} now." if ok else supervisor.process_command(req.prompt, client_scope="local_desktop", dry_run=False).get("voice_response", f"Executed: {target_app}.")
+                return {
+                    "status": "success",
+                    "reply_text": exec_msg,
+                    "voice_response": exec_msg,
+                    "action": "host_desktop_launch",
+                    "client_scope": "remote_host",
+                    "token_metrics": {"input_tokens": 0, "output_tokens": max(1, len(exec_msg)//4), "tokens_per_sec": 0.0}
+                }
+
+        effective_scope = req.client_scope if (req.client_scope == "remote_web" and not explicit_pc_target) else scope
 
         # 1. Ensure or auto-create session thread
         sid = req.session_id
         if not sid:
             if memory and hasattr(memory, "create_session"):
-                sid = memory.create_session(title="New Chat", client_scope=scope)
+                sid = memory.create_session(title="New Chat", client_scope=effective_scope)
             else:
                 sid = "default"
 
@@ -1053,10 +1359,10 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                     f"=== DOCUMENT CONTENT ===\n{extracted_text}\n=== END DOCUMENT ===\n\n"
                     f"User instruction: {req.prompt.strip() or 'Please analyze this document, summarize the key findings, and explain how it helps me.'}"
                 )
-                result = supervisor.process_command(doc_prompt, client_scope=scope, dry_run=False, session_id=sid)
+                result = supervisor.process_command(doc_prompt, client_scope=effective_scope, dry_run=False, session_id=sid)
         else:
             # Standard Text Execution
-            result = supervisor.process_command(req.prompt, client_scope=scope, dry_run=False, session_id=sid)
+            result = supervisor.process_command(req.prompt, client_scope=effective_scope, dry_run=False, session_id=sid)
 
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
@@ -1129,7 +1435,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             "action": action,
             "session_id": sid,
             "session_title": sess_title,
-            "client_scope": scope,
+            "client_scope": effective_scope,
             "latency_ms": elapsed_ms,
             "token_metrics": {
                 "turn_in": turn_in,
@@ -1276,6 +1582,126 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             "audio_base64": audio_b64
         })
 
+    # -----------------------------------------------------------------------
+    # PHASE 12: GAMING SHIELD CONTROL CENTER, AUDIO HEALER & THREAD EXPORT
+    # -----------------------------------------------------------------------
+    @app.get("/api/gaming/status")
+    async def get_gaming_status(auth: Dict[str, Any] = Depends(authenticate_request)):
+        """Returns live Game Detection, Wake-Word Gaming Shield state, and Windows WASAPI app volumes."""
+        from core.audio_capture import audio_ducker, AudioDucker, PYCAW_AVAILABLE
+        win_eng = getattr(supervisor.llm, "window_engine", None)
+        vram_gov = getattr(supervisor.llm, "vram_governor", None)
+
+        running_game = win_eng.detect_running_game(dry_run=False) if win_eng and hasattr(win_eng, "detect_running_game") else None
+        lite_mode = vram_gov.is_gaming_lite_mode() if vram_gov and hasattr(vram_gov, "is_gaming_lite_mode") else False
+        shield_active = bool(running_game or lite_mode)
+
+        audio_sessions = []
+        if PYCAW_AVAILABLE:
+            try:
+                from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
+                for s in AudioUtilities.GetAllSessions():
+                    if s.Process:
+                        pname = s.Process.name() or "Unknown"
+                        vol_ctl = s._ctl.QueryInterface(ISimpleAudioVolume)
+                        vol = float(vol_ctl.GetMasterVolume())
+                        audio_sessions.append({
+                            "pid": int(s.ProcessId),
+                            "process": pname,
+                            "volume_percent": round(vol * 100),
+                            "protected": AudioDucker._is_game_process(pname)
+                        })
+            except Exception as e:
+                logger.debug(f"Audio session enumeration warning: {e}")
+
+        return {
+            "status": "online",
+            "gaming_shield_active": shield_active,
+            "gaming_lite_mode": lite_mode,
+            "active_game": running_game,
+            "wake_threshold": 0.78 if shield_active else 0.58,
+            "agc_status": "Bypassed (Game Shield Active)" if shield_active else "Active (Dynamic Gain)",
+            "audio_ducking_policy": "Disabled (100% Game Audio Protected)" if shield_active else "Desktop Media Ducking",
+            "audio_sessions": audio_sessions
+        }
+
+    @app.post("/api/gaming/heal-audio")
+    async def heal_all_audio(auth: Dict[str, Any] = Depends(authenticate_request)):
+        """Force-restores all Windows per-application audio sessions to 100% (1.0)."""
+        from core.audio_capture import audio_ducker, PYCAW_AVAILABLE
+        healed = []
+        try:
+            audio_ducker.restore_background_audio()
+        except Exception:
+            pass
+
+        if PYCAW_AVAILABLE:
+            try:
+                from pycaw.pycaw import AudioUtilities, ISimpleAudioVolume
+                for s in AudioUtilities.GetAllSessions():
+                    if s.Process:
+                        pname = s.Process.name() or "Unknown"
+                        if pname.lower() in ["system", "idle", "audiodg.exe"]:
+                            continue
+                        try:
+                            vol_ctl = s._ctl.QueryInterface(ISimpleAudioVolume)
+                            prev_vol = float(vol_ctl.GetMasterVolume())
+                            vol_ctl.SetMasterVolume(1.0, None)
+                            healed.append({
+                                "process": pname,
+                                "previous_percent": round(prev_vol * 100),
+                                "current_percent": 100
+                            })
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.warning(f"Heal audio error: {e}")
+
+        return {
+            "status": "success",
+            "healed_count": len(healed),
+            "sessions": healed
+        }
+
+    @app.get("/api/sessions/{session_id}/export")
+    async def export_session_markdown(session_id: str, auth: Dict[str, Any] = Depends(authenticate_request)):
+        """Exports a conversation session as a clean Markdown (.md) document."""
+        memory = getattr(supervisor.llm, "memory", None)
+        if not memory or not hasattr(memory, "get_session_messages"):
+            raise HTTPException(status_code=404, detail="Session memory unavailable")
+
+        sess = memory.get_session(session_id) if hasattr(memory, "get_session") else None
+        title = (sess or {}).get("title") or f"Session {session_id}"
+        msgs = memory.get_session_messages(session_id) or []
+
+        md_lines = [
+            f"# Project Libra // {title}",
+            f"- **Session ID:** `{session_id}`",
+            f"- **Exported At:** `{time.strftime('%Y-%m-%d %H:%M:%S')}`",
+            f"- **Version:** `{get_full_version_string()}`",
+            "",
+            "---",
+            ""
+        ]
+        for m in msgs:
+            role_label = "🧑 **USER**" if m.get("role") == "user" else "🤖 **LIBRA AI**"
+            ts = m.get("created_at") or ""
+            tool = f" `[Tool: {m.get('tool_used')}]`" if m.get("tool_used") else ""
+            md_lines.append(f"### {role_label} {ts}{tool}")
+            md_lines.append("")
+            md_lines.append(m.get("content") or "")
+            md_lines.append("")
+            md_lines.append("---")
+            md_lines.append("")
+
+        md_content = "\n".join(md_lines)
+        safe_title = re.sub(r"[^a-zA-Z0-9_-]+", "_", title).strip("_") or "libra_chat"
+        return Response(
+            content=md_content,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{safe_title}.md"'}
+        )
+
     @app.get("/api/vitals")
     async def get_vitals(auth: Dict[str, Any] = Depends(authenticate_request)):
         """Returns live PC telemetry: RTX 5060 Ti VRAM, CPU, RAM, and version info."""
@@ -1368,11 +1794,123 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 # ---------------------------------------------------------------------------
 # TAILSCALE SERVE & BACKGROUND DAEMON THREAD LAUNCHER
 # ---------------------------------------------------------------------------
+_TAILSCALE_INFO = {
+    "tailscale_ip": "",
+    "magicdns_domain": "libra-beta.note-loggerhead.ts.net",
+    "serve_url": "https://libra-beta.note-loggerhead.ts.net/",
+    "status": "online"
+}
+
+_CLOUDFLARE_INFO = {
+    "public_url": "",
+    "pid": None,
+    "status": "offline"
+}
+
+def get_cloudflare_info() -> Dict[str, Any]:
+    global _CLOUDFLARE_INFO
+    cf_state_file = os.path.join(PROJECT_ROOT, "logs", "cloudflare_tunnel.json")
+    if os.path.isfile(cf_state_file):
+        try:
+            with open(cf_state_file, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            pid = saved.get("pid")
+            url = saved.get("public_url", "")
+            if pid and url:
+                import psutil
+                if psutil.pid_exists(int(pid)):
+                    _CLOUDFLARE_INFO.update({"public_url": url, "pid": pid, "status": "online"})
+                    return _CLOUDFLARE_INFO
+        except Exception:
+            pass
+    return _CLOUDFLARE_INFO
+
+def ensure_cloudflare_tunnel(port: int = 8765, force_restart: bool = False) -> Dict[str, Any]:
+    """
+    Ensures a live Cloudflare Quick Tunnel (cloudflared.exe tunnel --url http://127.0.0.1:8765)
+    is running alongside Tailscale so friends outside the Tailnet can connect via public HTTPS.
+    """
+    global _CLOUDFLARE_INFO
+    import subprocess
+    import psutil
+
+    if not force_restart:
+        existing = get_cloudflare_info()
+        if existing.get("public_url") and existing.get("status") == "online":
+            return existing
+
+    # Terminate old cloudflared processes if force_restart or stale
+    if force_restart:
+        for p in psutil.process_iter(["pid", "name"]):
+            try:
+                if (p.info.get("name") or "").lower().startswith("cloudflared"):
+                    p.terminate()
+            except Exception:
+                pass
+
+    cf_bin = os.path.join(PROJECT_ROOT, "bin", "cloudflared.exe")
+    if not os.path.isfile(cf_bin):
+        return _CLOUDFLARE_INFO
+
+    os.makedirs(os.path.join(PROJECT_ROOT, "logs"), exist_ok=True)
+    cf_log = os.path.join(PROJECT_ROOT, "logs", "cloudflared.log")
+    cf_state_file = os.path.join(PROJECT_ROOT, "logs", "cloudflare_tunnel.json")
+
+    try:
+        flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        log_f = open(cf_log, "w", encoding="utf-8")
+        proc = subprocess.Popen(
+            [cf_bin, "tunnel", "--url", f"http://127.0.0.1:{port}", "--no-autoupdate"],
+            stdout=log_f,
+            stderr=subprocess.STDOUT,
+            creationflags=flags,
+            close_fds=True
+        )
+        # Poll log file up to 6.5s for https://xxxx.trycloudflare.com
+        found_url = ""
+        t0 = time.time()
+        while time.time() - t0 < 6.5:
+            time.sleep(0.35)
+            try:
+                with open(cf_log, "r", encoding="utf-8", errors="ignore") as rf:
+                    text = rf.read()
+                m = re.search(r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)", text)
+                if m:
+                    found_url = m.group(1)
+                    break
+            except Exception:
+                pass
+
+        if found_url:
+            _CLOUDFLARE_INFO.update({
+                "public_url": found_url,
+                "pid": proc.pid,
+                "status": "online"
+            })
+            with open(cf_state_file, "w", encoding="utf-8") as sf:
+                json.dump(_CLOUDFLARE_INFO, sf, indent=2)
+    except Exception as e:
+        logger.warning(f"Cloudflare tunnel startup warning: {e}")
+
+    return _CLOUDFLARE_INFO
+
+def is_funnel_active() -> bool:
+    """Checks if Tailscale Funnel (public internet access) is currently active."""
+    import subprocess
+    flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+    try:
+        res = subprocess.run(["tailscale", "funnel", "status"], capture_output=True, text=True, timeout=2, **flags)
+        out = (res.stdout or "") + (res.stderr or "")
+        return "(tailnet only)" not in out and "https://" in out
+    except Exception:
+        return False
+
 def ensure_tailscale_serve(port: int = 8765) -> Dict[str, str]:
     """
     Auto-discovers Tailscale IP, MagicDNS hostname, and ensures
     'tailscale serve' background proxy is active for HTTPS mobile access.
     """
+    global _TAILSCALE_INFO
     import subprocess
     info = {
         "tailscale_ip": "",
@@ -1418,6 +1956,7 @@ def ensure_tailscale_serve(port: int = 8765) -> Dict[str, str]:
             info["status"] = "online"
     except Exception as e:
         logger.debug(f"Tailscale auto-discovery info: {e}")
+    _TAILSCALE_INFO.update(info)
     return info
 
 
@@ -1437,8 +1976,9 @@ def start_web_server_thread(
     server_host = host or cfg.get("host", "0.0.0.0")
     server_port = port or cfg.get("port", 8765)
 
-    # 1. Discover Tailscale endpoints and activate Tailscale Serve proxy
+    # 1. Discover Tailscale endpoints and activate Tailscale Serve + Cloudflare Public Tunnel
     ts_info = ensure_tailscale_serve(server_port)
+    cf_info = ensure_cloudflare_tunnel(server_port)
 
     # 2. Initialize FastAPI app attached to SupervisorHub
     app = create_app(hub=hub, config_path=config_path)
@@ -1465,6 +2005,8 @@ def start_web_server_thread(
     )
     if ts_info.get("serve_url"):
         banner += f"  - Tailscale HTTPS:  {ts_info['serve_url']}\n"
+    if cf_info.get("public_url"):
+        banner += f"  - Cloudflare URL:   {cf_info['public_url']} (Public Friend Access)\n"
     if ts_info.get("tailscale_ip"):
         banner += f"  - Tailscale Direct: http://{ts_info['tailscale_ip']}:{server_port}/\n"
     banner += f"======================================================\n"

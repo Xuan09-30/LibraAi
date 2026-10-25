@@ -54,3 +54,4 @@ Whenever a similar ambiguous query or command arises, Libra consults these lesso
 
 - **Trigger**: `open my project folder` | **Avoid**: `OldDrafts` | **Corrected Action**: `LibraAi` (2026-10-21 17:37)
 - **Windows Startup & Process Singleton**: Never register in both `HKCU\...\Run` and `shell:startup` simultaneously (Windows will execute both at logon). Always use an atomic Windows Named Mutex (`CreateMutexW`) before importing heavy modules (Torch/Whisper) to guarantee zero-latency single-instance protection and avoid GPU/PyAudio port collisions. To guarantee UI window focus on Windows 11 boot, use VK_MENU Alt pulse + `AttachThreadInput` + `SetWindowPos(HWND_TOPMOST -> HWND_NOTOPMOST)` with staggered timer pulses.
+- **Trigger**: `open my project folder` | **Avoid**: `OldDrafts` | **Corrected Action**: `LibraAi` (2026-10-26 01:01)

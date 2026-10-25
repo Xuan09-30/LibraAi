@@ -9,8 +9,13 @@ def search_live_web(query: str, max_results: int = 4) -> str:
     Queries DuckDuckGo silently in the background and aggregates concise snippets.
     Imported by core.llm and ui.gui for live research.
     """
+    import re
     clean_query = query.strip().strip('"').strip("'")
     if not clean_query:
+        return ""
+
+    # Guard against weather queries polluting general web search
+    if re.search(r"\b(?:weather|forecast|rain\s+forecast|rain\s+chance|is\s+it\s+going\s+to\s+rain)\b", clean_query, re.IGNORECASE):
         return ""
 
     context_snippets = []

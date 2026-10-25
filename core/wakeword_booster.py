@@ -19,15 +19,26 @@ class WakeWordBooster:
         target_frame_size: int = 1280,
         default_threshold: float = 0.50,
         vad_assisted_threshold: float = 0.32,
+        gaming_threshold: float = 0.78,
         preroll_max_chunks: int = 32
     ):
         self.sample_rate = sample_rate
         self.target_frame_size = target_frame_size
         self.default_threshold = default_threshold
         self.vad_assisted_threshold = vad_assisted_threshold
+        self.gaming_threshold = gaming_threshold
+        self.is_game_mode: bool = False
+        self.consecutive_hits: int = 0
         self.accumulator = np.array([], dtype=np.int16)
         self.preroll_buffer = collections.deque(maxlen=preroll_max_chunks)
         self.followup_until_epoch: float = 0.0
+
+    def set_game_mode(self, active: bool):
+        """Toggles anti-false-positive gaming shield mode."""
+        self.is_game_mode = bool(active)
+        if self.is_game_mode:
+            self.consecutive_hits = 0
+            self.clear_followup_window()
 
     @property
     def remainder_buffer(self) -> np.ndarray:
@@ -41,6 +52,10 @@ class WakeWordBooster:
         amplifies signal with dynamic gain (capped at 3.5x) without clipping [-32768, 32767].
         """
         if len(frame) == 0:
+            return frame
+
+        # If gaming mode active, suppress AGC amplification to avoid boosting teammate Discord voices
+        if self.is_game_mode:
             return frame
 
         peak = float(np.max(np.abs(frame)))
@@ -97,19 +112,39 @@ class WakeWordBooster:
         """Alias for process_chunk."""
         return self.process_chunk(chunk, apply_agc=apply_agc)
 
-    def get_threshold(self, vad_prob: float = 0.0) -> float:
+    def get_threshold(self, vad_prob: float = 0.0, in_game: Union[bool, None] = None) -> float:
         """
         Returns dynamic wake-word threshold.
-        Lowers threshold to 0.32 when Silero VAD indicates active human speech (>= 0.35).
+        In game mode, enforces elevated gaming_threshold (0.78) to eliminate ambient voice chat triggers.
+        In desktop mode, uses vad_assisted_threshold when human speech is active.
         """
+        active_game = self.is_game_mode if in_game is None else in_game
+        if active_game:
+            return self.gaming_threshold
         if vad_prob >= 0.35:
             return self.vad_assisted_threshold
         return self.default_threshold
 
-    def is_wakeword_triggered(self, score: float, vad_prob: float = 0.0) -> bool:
-        """Checks if detection score satisfies dynamic threshold."""
-        thresh = self.get_threshold(vad_prob=vad_prob)
-        return score >= thresh
+    def is_wakeword_triggered(self, score: float, vad_prob: float = 0.0, in_game: Union[bool, None] = None) -> bool:
+        """
+        Checks if detection score satisfies dynamic threshold.
+        When in gaming mode, requires multi-frame verification (>=2 consecutive frames meeting gaming threshold
+        or a single definitive score >= 0.88) to filter out transient phonemes from normal conversational speech.
+        """
+        active_game = self.is_game_mode if in_game is None else in_game
+        thresh = self.get_threshold(vad_prob=vad_prob, in_game=active_game)
+        if active_game:
+            if score >= thresh:
+                self.consecutive_hits += 1
+            else:
+                self.consecutive_hits = 0
+
+            if self.consecutive_hits >= 2 or score >= 0.88:
+                self.consecutive_hits = 0
+                return True
+            return False
+        else:
+            return score >= thresh
 
     def set_followup_window(self, duration_sec: float = 6.0):
         """Sets the active conversational follow-up window."""
@@ -139,6 +174,7 @@ class WakeWordBooster:
         self.preroll_buffer.clear()
 
     def reset(self):
-        """Resets sample accumulator and pre-roll buffer."""
+        """Resets sample accumulator, pre-roll buffer, and consecutive frame hits."""
         self.accumulator = np.array([], dtype=np.int16)
         self.preroll_buffer.clear()
+        self.consecutive_hits = 0

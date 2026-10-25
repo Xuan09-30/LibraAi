@@ -70,9 +70,17 @@
           </button>
           <span id="active-thread-title" class="active-thread-title">Main Chat</span>
           <span class="scope-pill">ONLINE</span>
+          <span id="role-badge" class="role-badge host" title="Access Role">👑 HOST</span>
         </div>
 
         <div class="header-right">
+          <!-- PHASE 12 COMMAND PALETTE & GAME SHIELD -->
+          <button id="cmd-palette-btn" class="header-action-btn" title="Command Palette (Ctrl + K)">
+            <span>⌘ Cmd</span>
+          </button>
+          <button id="game-shield-btn" class="header-action-btn" title="Live Gaming & Audio Shield Control">
+            <span>🎮 Shield</span>
+          </button>
           <!-- PHASE 11 QUICK NAV BUTTONS -->
           <button id="briefing-nav-btn" class="header-action-btn" title="Daily Tactical Briefing">
             <span>⚡ Brief</span>
@@ -82,6 +90,12 @@
           </button>
           <button id="airdrop-nav-btn" class="header-action-btn" title="AirDrop Bridge (Phone <-> PC)">
             <span>✈ Drop</span>
+          </button>
+          <button id="bug-nav-btn" class="header-action-btn" title="Report a Bug or View Friend Feedback">
+            <span>🐞 Bug</span>
+          </button>
+          <button id="invite-nav-btn" class="header-action-btn" title="Guest Invites & Dual-Tunnel (Cloudflare + Tailscale)">
+            <span>🔑 Invite</span>
           </button>
           <!-- TOKEN TELEMETRY HUD BUTTON -->
           <button id="token-hud-btn" class="token-hud-btn" title="View Real-Time GPU Token Telemetry">
@@ -409,6 +423,189 @@
         <div class="modal-action-row" style="margin-top: 14px;">
           <button id="refresh-briefing-btn" class="modal-btn secondary">↻ REFRESH</button>
           <button id="speak-briefing-btn" class="modal-btn primary">🔊 LISTEN</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       MODAL: GUEST ACCESS & TAILSCALE FUNNEL (ROLE-BASED ACCESS CONTROL)
+       ======================================================================== -->
+  <div id="invite-modal" class="modal-overlay">
+    <div class="modal-content invite-modal-content">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span style="color: #a855f7;">🔑 GUEST INVITES & ACCESS</span>
+          <span id="funnel-badge" class="funnel-badge-indicator">TAILNET ONLY</span>
+        </div>
+        <button id="close-invite-modal" class="modal-close-btn" title="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <!-- DUAL-TUNNEL STATUS: CLOUDFLARE PUBLIC + TAILSCALE -->
+        <div id="funnel-status-box" class="funnel-notice-box active">
+          <div class="funnel-notice-header" style="display: flex; align-items: center; justify-content: space-between;">
+            <strong>☁️ Cloudflare + Tailscale Dual-Tunnel</strong>
+            <button id="restart-cf-btn" class="modal-btn secondary" style="font-size: 10px; padding: 4px 8px;">↻ Restart Cloudflare</button>
+          </div>
+          <p id="funnel-status-desc" style="font-size: 12px; color: #cbd5e1; margin: 6px 0;">
+            Checking Cloudflare Public Tunnel &amp; Tailscale status...
+          </p>
+          <div style="display: flex; gap: 6px; align-items: center; margin-top: 6px;">
+            <input type="text" id="cloudflare-base-url-field" readonly placeholder="Starting Cloudflare Tunnel..." style="flex: 1; background: #020617; border: 1px solid #334155; border-radius: 4px; padding: 5px 8px; color: #10b981; font-family: monospace; font-size: 11px;">
+          </div>
+        </div>
+
+        <!-- GENERATE GUEST TOKEN SECTION -->
+        <div style="margin-top: 16px;">
+          <h4 style="font-size: 13px; color: #f1f5f9; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between;">
+            <span>Generate New Friend / Guest Invite</span>
+          </h4>
+          <div style="display: flex; gap: 8px;">
+            <input type="text" id="guest-label-input" placeholder="Friend Name (e.g. Alex)" style="flex: 1; background: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 8px 12px; color: #fff; font-size: 13px;">
+            <button id="create-guest-token-btn" class="modal-btn primary" style="white-space: nowrap;">+ GENERATE</button>
+          </div>
+          <div id="guest-token-created-box" style="display: none; margin-top: 10px; background: rgba(168, 85, 247, 0.1); border: 1px solid rgba(168, 85, 247, 0.3); border-radius: 8px; padding: 10px;">
+            <div style="font-size: 12px; color: #34d399; font-weight: 600; margin-bottom: 4px;">🌐 Cloudflare Friend Link (Works Anywhere — No Tailscale Needed):</div>
+            <div style="display: flex; gap: 6px; align-items: center; margin-bottom: 8px;">
+              <input type="text" id="guest-invite-url-field" readonly style="flex: 1; background: #020617; border: 1px solid #10b981; border-radius: 4px; padding: 6px 8px; color: #34d399; font-family: monospace; font-size: 12px;">
+              <button id="copy-guest-url-btn" class="modal-btn primary" style="font-size: 11px; padding: 6px 10px;">COPY</button>
+            </div>
+            <div style="font-size: 11px; color: #38bdf8; font-weight: 600; margin-bottom: 4px;">🔒 Tailscale Link (Your Tailnet Devices):</div>
+            <div style="display: flex; gap: 6px; align-items: center;">
+              <input type="text" id="guest-ts-invite-url-field" readonly style="flex: 1; background: #020617; border: 1px solid #475569; border-radius: 4px; padding: 5px 8px; color: #38bdf8; font-family: monospace; font-size: 11px;">
+            </div>
+            <div style="font-size: 11px; color: #94a3b8; margin-top: 6px;">
+              🛡️ <em>Guest is strictly sandboxed. Your friend can also click the <strong>🐞 Bug</strong> button on top to send bug reports directly to your PC!</em>
+            </div>
+          </div>
+        </div>
+
+        <!-- ACTIVE GUEST TOKENS LIST -->
+        <div style="margin-top: 20px;">
+          <h4 style="font-size: 13px; color: #f1f5f9; margin-bottom: 8px;">Active Guest Tokens</h4>
+          <div id="guest-tokens-list" class="guest-tokens-table-container">
+            <div style="color: #64748b; font-size: 12px;">Loading guest tokens...</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       MODAL: CYBERNETIC COMMAND PALETTE (CTRL + K / SLASH MENU - PHASE 12)
+       ======================================================================== -->
+  <div id="cmd-palette-modal" class="modal-overlay">
+    <div class="modal-content cmd-palette-content">
+      <div class="cmd-palette-search-bar">
+        <span style="color: var(--neon-cyan); font-weight: bold; font-size: 15px;">⌘</span>
+        <input type="text" id="cmd-palette-input" placeholder="Type a command or search actions... (Ctrl+K)" autocomplete="off">
+        <span class="cmd-kbd-hint">ESC</span>
+      </div>
+      <div id="cmd-palette-list" class="cmd-palette-list">
+        <!-- Populated dynamically by app.js -->
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       MODAL: LIVE GAMING & AUDIO SHIELD CONTROL CENTER (PHASE 12)
+       ======================================================================== -->
+  <div id="game-shield-modal" class="modal-overlay">
+    <div class="modal-content">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span style="color: #10b981;">🎮 GAMING &amp; AUDIO SHIELD</span>
+          <span id="game-shield-badge" class="scope-pill" style="margin-left: 8px;">STANDBY</span>
+        </div>
+        <button id="close-game-shield-modal" class="modal-close-btn" title="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div id="game-shield-status-cards" class="token-grid" style="margin-bottom: 14px;">
+          <!-- Populated dynamically -->
+        </div>
+        <div style="margin-top: 10px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+            <span style="font-size: 12px; font-weight: 700; color: #94a3b8; letter-spacing: 0.5px;">WINDOWS APP AUDIO SESSIONS (WASAPI)</span>
+            <button id="heal-audio-btn" class="modal-btn primary" style="font-size: 11px; padding: 5px 10px;">🔊 RESTORE ALL TO 100%</button>
+          </div>
+          <div id="game-audio-sessions-list" style="display: flex; flex-direction: column; gap: 6px; max-height: 180px; overflow-y: auto;">
+            <!-- Populated dynamically -->
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       MODAL: LIVE CODE / HTML ARTIFACT PREVIEW SANDBOX (PHASE 12)
+       ======================================================================== -->
+  <div id="artifact-preview-modal" class="modal-overlay">
+    <div class="modal-content" style="max-width: 780px; width: 94%;">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span style="color: var(--neon-cyan);">▶ LIVE ARTIFACT PREVIEW</span>
+        </div>
+        <button id="close-artifact-preview-modal" class="modal-close-btn" title="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body" style="padding: 0;">
+        <iframe id="artifact-preview-iframe" sandbox="allow-scripts" style="width: 100%; height: 420px; border: none; background: #ffffff; border-radius: 0 0 12px 12px;"></iframe>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       MODAL: FRIEND BUG REPORT & TESTER FEEDBACK CENTER (PHASE 12)
+       ======================================================================== -->
+  <div id="bug-report-modal" class="modal-overlay">
+    <div class="modal-content" style="max-width: 560px; width: 92%;">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span style="color: #fb7185;">🐞 BUG REPORT &amp; TESTER FEEDBACK</span>
+        </div>
+        <button id="close-bug-modal" class="modal-close-btn" title="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 12px; color: #94a3b8; margin-bottom: 10px;">
+          Found a bug or have an idea while testing Project Libra? Submit it below—it goes straight to the Host PC!
+        </p>
+        <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+          <input type="text" id="bug-reporter-input" class="auth-input" placeholder="Your Name (e.g. Alex)" style="flex: 1; margin: 0;">
+          <select id="bug-category-select" class="auth-input" style="width: 155px; margin: 0;">
+            <option value="UI / Mobile Layout">UI / Mobile Layout</option>
+            <option value="AI Response / Chat">AI Response / Chat</option>
+            <option value="Voice / Audio">Voice / Audio</option>
+            <option value="File / Vision Upload">File / Vision Upload</option>
+            <option value="Feature Idea">Feature Idea</option>
+          </select>
+        </div>
+        <textarea id="bug-desc-input" class="auth-input" rows="3" placeholder="Describe what happened or what you expected..." style="width: 100%; resize: vertical; font-family: inherit; margin-bottom: 8px;"></textarea>
+        <div id="bug-submit-status" style="display: none; font-size: 12px; color: #34d399; margin-bottom: 8px;"></div>
+        <button id="submit-bug-btn" class="modal-btn primary" style="width: 100%;">🚀 SEND BUG REPORT TO HOST PC</button>
+
+        <!-- HOST-ONLY BUG REPORT INBOX -->
+        <div id="host-bug-inbox-section" style="display: none; margin-top: 16px; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 12px;">
+          <div style="font-size: 12px; font-weight: 700; color: #cbd5e1; margin-bottom: 8px;">📥 SUBMITTED TESTER BUG REPORTS</div>
+          <div id="bug-reports-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 190px; overflow-y: auto;"></div>
         </div>
       </div>
     </div>
