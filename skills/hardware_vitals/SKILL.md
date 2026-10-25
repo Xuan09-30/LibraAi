@@ -7,7 +7,7 @@ triggers:
   - top processes
   - what is slowing down my pc
 version: 1.0.0
-success_count: 15
+success_count: 18
 ---
 # Hardware Vitals & Memory Hog Inspector
 Identifies the top memory-consuming processes and system RAM/CPU load in real time.

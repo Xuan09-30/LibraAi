@@ -116,5 +116,9 @@ def run_security_tests():
         sys.exit(1)
 
 
+
+def test_suite():
+    run_security_tests()
+
 if __name__ == "__main__":
     run_security_tests()

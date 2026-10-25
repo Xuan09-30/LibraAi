@@ -19,13 +19,20 @@ class TestVersionAndReloaderDisplay(unittest.TestCase):
         self.assertEqual(get_full_version_string(5), "v10.2.0-r5")
 
     def test_gui_version_display_mock(self):
-        from PyQt6.QtWidgets import QApplication
+        os.environ["QT_QPA_PLATFORM"] = "offscreen"
+        from unittest.mock import patch
+        from PyQt6.QtWidgets import QApplication, QWidget
         from ui.gui import FuturisticVoiceAssistantUI
+
+        class MockWebEngineView(QWidget):
+            def setUrl(self, url):
+                pass
 
         app = QApplication.instance() or QApplication(["test"])
 
         # Test initial launch display (reload_count = 0)
-        window = FuturisticVoiceAssistantUI(start_worker=False)
+        with patch("ui.gui.QWebEngineView", side_effect=MockWebEngineView):
+            window = FuturisticVoiceAssistantUI(start_worker=False)
         self.assertEqual(window.reload_count, 0)
         self.assertIsNotNone(window.version_label)
         text_initial = window.version_label.text()
@@ -50,7 +57,7 @@ class TestVersionAndReloaderDisplay(unittest.TestCase):
         text_override = window.version_label.text()
         self.assertIn("RELOADING (orchestrator.py)...", text_override)
 
-        window.close()
+        window._quit_application()
 
 
 if __name__ == "__main__":

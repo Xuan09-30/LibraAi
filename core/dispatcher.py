@@ -518,3 +518,105 @@ class SafeOSDispatcher:
             return False, "Shutdown is only supported on Windows."
         except Exception as e:
             return False, f"Failed to schedule shutdown: {e}"
+
+    def dispatch_weather(self, prompt: str, dry_run: bool = False, default_city: str = "Kuala Lumpur") -> dict:
+        """Executes isolated weather telemetry directly via tools.weather."""
+        return dispatch_weather(prompt, dry_run=dry_run, default_city=default_city)
+
+
+# ---------------------------------------------------------------------------
+# STRICT ROUTE ISOLATION: WEATHER ENGINE
+# ---------------------------------------------------------------------------
+def is_weather_intent(prompt: str) -> bool:
+    """Determines if a prompt is an isolated weather or forecast query."""
+    if not prompt or not str(prompt).strip():
+        return False
+    q_lower = str(prompt).lower().strip()
+    if re.search(r"\b(?:can\s+you\s+predict|predict\s+the\s+weather|next\s+month|next\s+year)\b", q_lower):
+        return False
+    return bool(re.search(
+        r"\b(?:weather|forecast|rain\s+forecast|rain\s+chance|raining|temperature|is\s+it\s+(?:going\s+to\s+)?rain|how\s+(?:hot|cold|warm)\s+is\s+it)\b",
+        q_lower
+    ))
+
+
+def dispatch_weather(prompt: str, dry_run: bool = False, default_city: str = "Kuala Lumpur", context_city: str | None = None) -> dict:
+    """
+    Direct, strictly isolated weather dispatcher.
+    Bypasses LLM planning, RAG pipelines, Wikipedia searches, and web search agents completely.
+    Executes ONLY tools/weather.py and returns clean Open-Meteo telemetry immediately.
+    """
+    from tools.weather import get_weather, get_weekly_forecast, geocode_location, BUILT_IN_LOCATIONS
+    q_lower = str(prompt).lower().strip()
+
+    def _clean_loc_str(raw: str) -> str | None:
+        s = re.sub(
+            r"\b(?:today|tomorrow|right\s+now|now|this\s+weekend|weekend|this\s+week|weekly|7\s+days?|next\s+few\s+days|tonight|please|for\s+me)\b",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        ).strip(" ,.?!'")
+        if s and s.lower() not in ["me", "here", "my area", "outside", "there"]:
+            return s
+        return None
+
+    has_there = bool(re.search(r"\bthere\b", q_lower))
+
+    # 1. Weekly / 7-day forecast request
+    if re.search(r"\b(?:weekly|this\s+week|weekend|7\s+days?|next\s+few\s+days)\b", q_lower):
+        loc = None
+        loc_m = re.search(r"\b(?:in|for|at)\s+([a-zA-Z\s,]+?)[\.\?!]*$", q_lower)
+        if loc_m:
+            loc = _clean_loc_str(loc_m.group(1).strip())
+        if not loc:
+            for city_key in BUILT_IN_LOCATIONS:
+                if re.search(rf"\b{re.escape(city_key)}\b", q_lower):
+                    loc = city_key
+                    break
+        if not loc and has_there and context_city:
+            loc = context_city
+        target_loc = loc or default_city
+        geo = geocode_location(target_loc)
+        resolved_name = geo.get("name", target_loc) if geo else target_loc
+        voice = get_weekly_forecast(location_query=target_loc)
+        return {
+            "action": "weather",
+            "status": "success",
+            "args": {"location": resolved_name},
+            "location": resolved_name,
+            "forecast_type": "weekly",
+            "voice_response": voice,
+            "isolated_route": True
+        }
+
+    # 2. Daily / current weather request
+    loc_extracted = None
+    loc_m = re.search(r"\b(?:in|for|at)\s+([a-zA-Z\s,]+?)[\.\?!]*$", q_lower)
+    if loc_m:
+        loc_extracted = _clean_loc_str(loc_m.group(1).strip())
+
+    if not loc_extracted:
+        for city_key in BUILT_IN_LOCATIONS:
+            if re.search(rf"\b{re.escape(city_key)}\b", q_lower):
+                loc_extracted = city_key
+                break
+
+    if not loc_extracted and has_there and context_city:
+        loc_extracted = context_city
+
+    target_loc = loc_extracted or default_city
+    w_res = get_weather(location_query=target_loc, dry_run=dry_run)
+    return {
+        "action": "weather",
+        "status": w_res.get("status", "success"),
+        "args": {"location": w_res.get("location") or target_loc},
+        "location": w_res.get("location"),
+        "latitude": w_res.get("latitude"),
+        "longitude": w_res.get("longitude"),
+        "temperature_c": w_res.get("temperature_c"),
+        "condition": w_res.get("condition"),
+        "rain_chance": w_res.get("rain_chance"),
+        "voice_response": w_res.get("voice_response"),
+        "isolated_route": True
+    }
+

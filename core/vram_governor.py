@@ -35,11 +35,37 @@ class VRAMAutoGovernor:
 
     TARGET_GAMES: Set[str] = {
         "valorant.exe",
+        "valorant-win64-shipping.exe",
         "overwatch.exe",
+        "overwatch 2.exe",
         "apex.exe",
         "r5apex.exe",
         "cs2.exe",
-        "league of legends.exe"
+        "csgo.exe",
+        "league of legends.exe",
+        "leagueclient.exe",
+        "leagueclientux.exe",
+        "dota2.exe",
+        "dota.exe",
+        "fortniteclient-win64-shipping.exe",
+        "gta5.exe",
+        "palworld-win64-shipping.exe",
+        "genshinimpact.exe",
+        "starrail.exe",
+        "honkaistarrail.exe",
+        "zenlesszonezero.exe",
+        "robloxplayerbeta.exe",
+        "minecraft.exe",
+        "javaw.exe",
+        "rainbowsix.exe",
+        "r6.exe",
+        "destiny2.exe",
+        "warframe.x64.exe",
+        "pubg.exe",
+        "tslgame.exe",
+        "helldivers2.exe",
+        "eldenring.exe",
+        "cyberpunk2077.exe"
     }
 
     _instance = None

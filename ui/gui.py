@@ -367,7 +367,7 @@ class VoiceAssistantWorker(QThread):
             self.status_changed.emit("SPEAKING... [CTRL+SPACE TO STOP]")
             self.visualizer_state.emit(True)
             try:
-                if hasattr(self, "audio_ducker"):
+                if hasattr(self, "audio_ducker") and not getattr(self, "is_game_active", False):
                     self.audio_ducker.duck_background_audio(target_level=0.15)
             except Exception:
                 pass
@@ -571,7 +571,7 @@ class VoiceAssistantWorker(QThread):
             self.log_received.emit("LIBRA", missed_summary)
             speak_interruptible(missed_summary)
 
-        ww_booster = WakeWordBooster(default_threshold=0.50, vad_assisted_threshold=0.32)
+        ww_booster = WakeWordBooster(default_threshold=0.58, vad_assisted_threshold=0.46, gaming_threshold=0.78)
         in_followup_mode = False
         followup_turn_count = 0
 
@@ -596,7 +596,9 @@ class VoiceAssistantWorker(QThread):
             if user_text is None:
                 # Context inspection: Check if foreground window is a game or game_mode active
                 is_game_active = False
-                if hasattr(llm, "window_engine") and llm.window_engine:
+                if hasattr(llm, "vram_governor") and llm.vram_governor and llm.vram_governor.is_gaming_lite_mode():
+                    is_game_active = True
+                elif hasattr(llm, "window_engine") and llm.window_engine:
                     try:
                         w_info = llm.window_engine.get_active_window_info()
                         is_game_active = (
@@ -605,6 +607,7 @@ class VoiceAssistantWorker(QThread):
                         )
                     except Exception:
                         pass
+                ww_booster.set_game_mode(is_game_active)
 
                 if is_game_active:
                     # In game context, strictly forbid follow-up listening to prevent eavesdropping
@@ -645,6 +648,34 @@ class VoiceAssistantWorker(QThread):
                                 user_text = None
                             if user_text:
                                 break
+
+                        # Dynamic 1.0s game detection poll during standby listening
+                        now_tick = time.time()
+                        if now_tick - getattr(self, "_last_game_check", 0.0) > 1.0:
+                            self._last_game_check = now_tick
+                            curr_game = False
+                            if hasattr(llm, "vram_governor") and llm.vram_governor and llm.vram_governor.is_gaming_lite_mode():
+                                curr_game = True
+                            elif hasattr(llm, "window_engine") and llm.window_engine:
+                                try:
+                                    w_info = llm.window_engine.get_active_window_info()
+                                    curr_game = (
+                                        w_info.get("app_category") == "game"
+                                        or getattr(llm.model_mgr, "game_mode", False)
+                                    )
+                                except Exception:
+                                    pass
+                            self.is_game_active = curr_game
+                            if curr_game != is_game_active:
+                                is_game_active = curr_game
+                                ww_booster.set_game_mode(is_game_active)
+                                if is_game_active:
+                                    try:
+                                        if hasattr(self, "audio_ducker"):
+                                            self.audio_ducker.restore_background_audio()
+                                    except Exception:
+                                        pass
+                                    print("[Gaming Shield] Game window active. Activated high-threshold shield (0.78), restored game volume to 100%, and disabled AGC.")
 
                         if self.input_stream is None:
                             time.sleep(0.1)
@@ -705,20 +736,21 @@ class VoiceAssistantWorker(QThread):
 
                             for model_name, score in prediction.items():
                                 if "libra" in str(model_name).lower():
-                                    if ww_booster.is_wakeword_triggered(score, vad_prob=vad_prob):
-                                        # In gaming context, require higher confidence score (>=0.68) to filter out gamer callouts
-                                        if is_game_active and score < 0.68:
-                                            continue
-                                        thresh = ww_booster.get_threshold(vad_prob=vad_prob)
-                                        print(f"\n[Worker] Wake word triggered! Score: {score:.3f} (thresh: {thresh:.2f}, vad: {vad_prob:.2f})")
-                                        try:
-                                            if hasattr(self, "audio_ducker"):
-                                                self.audio_ducker.duck_background_audio(target_level=0.15)
-                                        except Exception:
-                                            pass
-                                        # 0ms Auditory Acknowledgment: Push pre-cached chime straight to PyAudio output
+                                    if ww_booster.is_wakeword_triggered(score, vad_prob=vad_prob, in_game=is_game_active):
+                                        thresh = ww_booster.get_threshold(vad_prob=vad_prob, in_game=is_game_active)
+                                        mode_tag = " [GAME SHIELD]" if is_game_active else ""
+                                        print(f"\n[Worker]{mode_tag} Wake word triggered! Score: {score:.3f} (thresh: {thresh:.2f}, vad: {vad_prob:.2f})")
+                                        # In gaming mode, preserve combat audio (no ducking)
+                                        if not is_game_active:
+                                            try:
+                                                if hasattr(self, "audio_ducker"):
+                                                    self.audio_ducker.duck_background_audio(target_level=0.15)
+                                            except Exception:
+                                                pass
+                                        # Auditory Acknowledgment: Subtle chime in gaming mode
                                         if self.raw_chime_pcm:
-                                            scaled_chime = get_dynamic_chime_pcm(self.raw_chime_pcm, base_gain=0.35)
+                                            chime_gain = 0.15 if is_game_active else 0.35
+                                            scaled_chime = get_dynamic_chime_pcm(self.raw_chime_pcm, base_gain=chime_gain)
                                             play_chime_async(scaled_chime)
                                         triggered = True
                                         followup_turn_count = 0
@@ -823,6 +855,20 @@ class VoiceAssistantWorker(QThread):
                 self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
                 continue
 
+            # Gaming Shield Post-STT Verification:
+            # When gaming, verify that the transcription actually addressed "Libra"
+            # to filter out ambient teammate/Discord callouts or conversational chatter.
+            if is_game_active and not in_followup_mode:
+                text_lower = user_text.lower()
+                has_wake_address = bool(re.search(r"\b(?:hey\s+)?libra\b", text_lower)) or "libra" in text_lower
+                if not has_wake_address:
+                    print(f"[Gaming Shield] Discarded ambient in-game chatter: '{user_text}'. (Wake word 'Libra' not verified)")
+                    self.log_received.emit("SYSTEM", f"Gaming Shield: Suppressed in-game chatter '{user_text}'.")
+                    ww_booster.clear_followup_window()
+                    in_followup_mode = False
+                    self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
+                    continue
+
             print(f"[Captured Input]: {user_text}")
             self.log_received.emit("USER", user_text)
 
@@ -913,7 +959,9 @@ class VoiceAssistantWorker(QThread):
 
             # Check if active window is a game or in game_mode
             is_game_active = False
-            if hasattr(llm, "window_engine") and llm.window_engine:
+            if hasattr(llm, "vram_governor") and llm.vram_governor and llm.vram_governor.is_gaming_lite_mode():
+                is_game_active = True
+            elif hasattr(llm, "window_engine") and llm.window_engine:
                 try:
                     w_info = llm.window_engine.get_active_window_info()
                     is_game_active = (
@@ -922,6 +970,7 @@ class VoiceAssistantWorker(QThread):
                     )
                 except Exception:
                     pass
+            ww_booster.set_game_mode(is_game_active)
 
             if is_game_active:
                 # Strictly suppress follow-up listening in games to protect gamer voice chat / Discord
@@ -1023,7 +1072,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             elif arg.startswith("--reloaded-at="):
                 self.reloaded_at = arg.split("=", 1)[1]
 
-        if self.reload_count == 0:
+        if self.reload_count == 0 and start_worker:
             state_file = os.path.join(PROJECT_ROOT, "logs", "reloader_state.json")
             if os.path.exists(state_file):
                 try:
@@ -1037,23 +1086,26 @@ class FuturisticVoiceAssistantUI(QMainWindow):
                     pass
 
         self.memory_vault_dialog = None
-        try:
-            self.spotlight_bar = SpotlightBar(parent=None)
-        except Exception as e:
-            print(f"[GUI Warning] SpotlightBar init: {e}")
-            self.spotlight_bar = None
-        try:
-            self.dictation_controller = get_dictation_controller()
-            self.dictation_controller.start()
-        except Exception as e:
-            print(f"[GUI Warning] DictationController init: {e}")
-            self.dictation_controller = None
+        self.spotlight_bar = None
+        self.dictation_controller = None
+        if start_worker:
+            try:
+                self.spotlight_bar = SpotlightBar(parent=None)
+            except Exception as e:
+                print(f"[GUI Warning] SpotlightBar init: {e}")
+                self.spotlight_bar = None
+            try:
+                self.dictation_controller = get_dictation_controller()
+                self.dictation_controller.start()
+            except Exception as e:
+                print(f"[GUI Warning] DictationController init: {e}")
+                self.dictation_controller = None
 
         self.init_ui()
         _ = self.winId()
         self.init_tray_icon()
-        self.init_code_reloader()
         if start_worker:
+            self.init_code_reloader()
             self.init_worker()
 
     def init_ui(self):
@@ -1767,6 +1819,19 @@ class FuturisticVoiceAssistantUI(QMainWindow):
     def _quit_application(self):
         if self.code_reloader is not None:
             self.code_reloader.stop()
+        if getattr(self, "spotlight_bar", None) is not None:
+            try:
+                if hasattr(self.spotlight_bar, "cleanup"):
+                    self.spotlight_bar.cleanup()
+                elif hasattr(self.spotlight_bar, "hotkey_thread") and self.spotlight_bar.hotkey_thread:
+                    self.spotlight_bar.hotkey_thread.stop()
+            except Exception:
+                pass
+        if getattr(self, "dictation_controller", None) is not None:
+            try:
+                self.dictation_controller.stop()
+            except Exception:
+                pass
         if self.tray_icon:
             self.tray_icon.hide()
         if self.worker is not None:

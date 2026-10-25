@@ -97,6 +97,21 @@ def geocode_location(city_name: str) -> dict:
 
     clean = str(city_name).strip().strip("'\"").rstrip(".?!")
     norm = clean.lower().strip()
+    import re
+    # Extract location if a full natural language query was passed
+    m_loc = re.search(r"\b(?:in|for|at)\s+([a-zA-Z\s,]+?)[\.\?!]*$", clean, re.IGNORECASE)
+    if m_loc:
+        extracted = m_loc.group(1).strip()
+        extracted = re.sub(r"\b(?:today|tomorrow|now|right\s+now|this\s+weekend|tonight|please|for\s+me)\b", "", extracted, flags=re.IGNORECASE).strip()
+        if extracted and extracted.lower() not in ["me", "here", "my area", "outside"]:
+            clean = extracted
+            norm = clean.lower().strip()
+    else:
+        for key in BUILT_IN_LOCATIONS:
+            if re.search(rf"\b{re.escape(key)}\b", norm):
+                norm = key
+                clean = BUILT_IN_LOCATIONS[key][0]
+                break
 
     # Check exact match in built-in lookup
     if norm in BUILT_IN_LOCATIONS:

@@ -113,5 +113,9 @@ def run_dispatcher_and_normalizer_tests():
         sys.exit(1)
 
 
+
+def test_suite():
+    run_dispatcher_and_normalizer_tests()
+
 if __name__ == "__main__":
     run_dispatcher_and_normalizer_tests()

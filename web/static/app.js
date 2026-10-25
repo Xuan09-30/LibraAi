@@ -24,6 +24,13 @@
   if (urlParams.has('token')) {
     authToken = urlParams.get('token');
     localStorage.setItem('libra_token', authToken);
+    document.cookie = `libra_auth=${authToken}; path=/; max-age=2592000; SameSite=Lax`;
+    try {
+      const cleanUrl = window.location.pathname;
+      window.history.replaceState({}, document.title, cleanUrl);
+    } catch (e) {}
+  } else if (authToken) {
+    document.cookie = `libra_auth=${authToken}; path=/; max-age=2592000; SameSite=Lax`;
   }
 
 
@@ -392,11 +399,18 @@
     // Restore fenced code blocks with Copy Button
     codeBlocks.forEach((block, idx) => {
       const escapedCode = escapeHtml(block.code);
+      const isPreviewable = ['html', 'svg', 'xml'].includes((block.lang || '').toLowerCase());
+      const previewBtnHtml = isPreviewable
+        ? `<button class="preview-code-btn" data-code="${encodeURIComponent(block.code)}">▶ Preview</button>`
+        : '';
       const replacement = `
         <div class="code-block-wrap">
           <div class="code-block-header">
             <span>${block.lang.toUpperCase()}</span>
-            <button class="copy-code-btn" data-code="${encodeURIComponent(block.code)}">Copy</button>
+            <div>
+              ${previewBtnHtml}
+              <button class="copy-code-btn" data-code="${encodeURIComponent(block.code)}">Copy</button>
+            </div>
           </div>
           <pre><code>${escapedCode}</code></pre>
         </div>
@@ -714,6 +728,9 @@
         const msgs = data.messages || [];
         if (msgs.length === 0) {
           appendMessage(`Initialized session "${activeSessionTitle}". How can I help you?`, false);
+          if (typeof renderStarterChips === 'function') {
+            renderStarterChips();
+          }
         } else {
           msgs.forEach((m) => {
             const isUser = m.role === 'user';
@@ -1773,10 +1790,549 @@
   }
 
   // --------------------------------------------------------------------------
+  // ROLE-BASED ACCESS CONTROL & GUEST TOKENS ENGINE (PHASE 11)
+  // --------------------------------------------------------------------------
+  let currentUserRole = 'guest';
+  let currentUserInfo = null;
+
+  async function initAuthAndRole() {
+    try {
+      const res = await fetch('/api/auth/me', {
+        headers: getAuthHeaders({ 'Content-Type': 'application/json' })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        currentUserInfo = data;
+        currentUserRole = data.role || 'guest';
+        updateRoleBadge(data);
+      } else if (res.status === 401 || res.status === 403) {
+        promptForToken();
+      }
+    } catch (err) {
+      console.warn('Failed to fetch auth info:', err);
+    }
+  }
+
+  function updateRoleBadge(info) {
+    const badge = document.getElementById('role-badge');
+    const inviteBtn = document.getElementById('invite-nav-btn');
+    if (!badge) return;
+
+    if (info.role === 'host') {
+      badge.textContent = '👑 HOST';
+      badge.className = 'role-badge host';
+      badge.title = `Host Owner (${info.email || 'chenxuanchuah@gmail.com'})`;
+      if (inviteBtn) inviteBtn.style.display = 'inline-flex';
+    } else {
+      badge.textContent = `👤 ${info.label || 'GUEST'}`;
+      badge.className = 'role-badge guest';
+      badge.title = 'Guest Mode: Desktop OS control is restricted to host owner.';
+      if (inviteBtn) inviteBtn.style.display = 'none';
+      const vaultBtn = document.getElementById('vault-nav-btn');
+      if (vaultBtn) vaultBtn.style.display = 'none';
+    }
+  }
+
+  function promptForToken() {
+    const entered = window.prompt("Project Libra Access Protected.\nPlease enter your Access or Guest Token:");
+    if (entered) {
+      authToken = entered.trim();
+      localStorage.setItem('libra_token', authToken);
+      document.cookie = `libra_auth=${authToken}; path=/; max-age=2592000; SameSite=Lax`;
+      window.location.reload();
+    }
+  }
+
+  const inviteModal = document.getElementById('invite-modal');
+  const inviteNavBtn = document.getElementById('invite-nav-btn');
+  const closeInviteModalBtn = document.getElementById('close-invite-modal');
+  const createGuestTokenBtn = document.getElementById('create-guest-token-btn');
+  const guestLabelInput = document.getElementById('guest-label-input');
+  const guestTokenCreatedBox = document.getElementById('guest-token-created-box');
+  const guestInviteUrlField = document.getElementById('guest-invite-url-field');
+  const copyGuestUrlBtn = document.getElementById('copy-guest-url-btn');
+  const enableFunnelBtn = document.getElementById('enable-funnel-btn');
+
+  if (inviteNavBtn) {
+    inviteNavBtn.addEventListener('click', () => {
+      openInviteModal();
+    });
+  }
+
+  if (closeInviteModalBtn) {
+    closeInviteModalBtn.addEventListener('click', () => {
+      if (inviteModal) inviteModal.classList.remove('active');
+    });
+  }
+
+  async function openInviteModal() {
+    if (!inviteModal) return;
+    inviteModal.classList.add('active');
+    refreshFunnelStatus();
+    loadGuestTokens();
+  }
+
+  async function refreshFunnelStatus() {
+    try {
+      const res = await fetch('/api/auth/me', { headers: getAuthHeaders() });
+      if (res.ok) {
+        const data = await res.json();
+        const fBadge = document.getElementById('funnel-badge');
+        const fBox = document.getElementById('funnel-status-box');
+        const fDesc = document.getElementById('funnel-status-desc');
+        const cfField = document.getElementById('cloudflare-base-url-field');
+
+        if (data.cloudflare_active && data.cloudflare_url) {
+          if (fBadge) {
+            fBadge.textContent = 'CLOUDFLARE + TAILSCALE LIVE';
+            fBadge.className = 'funnel-badge-indicator active';
+          }
+          if (fBox) fBox.className = 'funnel-notice-box active';
+          if (fDesc) {
+            fDesc.innerHTML = '✅ <strong>Cloudflare Public Tunnel + Tailscale Active!</strong> Your friends can open the Cloudflare link from any phone/laptop without needing Tailscale.';
+          }
+          if (cfField) cfField.value = data.cloudflare_url;
+        } else {
+          if (fBadge) {
+            fBadge.textContent = 'TAILNET ONLY';
+            fBadge.className = 'funnel-badge-indicator';
+          }
+          if (fDesc) {
+            fDesc.innerHTML = '⚠️ Cloudflare Tunnel is starting or offline. Click <strong>↻ Restart Cloudflare</strong> to generate a public link for friends.';
+          }
+          if (cfField) cfField.value = data.serve_url || 'https://libra-beta.note-loggerhead.ts.net/';
+        }
+      }
+    } catch (e) {
+      console.warn('Error refreshing tunnel status:', e);
+    }
+  }
+
+  const restartCfBtn = document.getElementById('restart-cf-btn');
+  if (restartCfBtn) {
+    restartCfBtn.addEventListener('click', async () => {
+      restartCfBtn.disabled = true;
+      restartCfBtn.textContent = 'Starting...';
+      try {
+        await fetch('/api/cloudflare/restart', {
+          method: 'POST',
+          headers: getAuthHeaders({ 'Content-Type': 'application/json' })
+        });
+        await refreshFunnelStatus();
+      } catch (e) {
+        console.warn('Cloudflare restart error:', e);
+      } finally {
+        restartCfBtn.disabled = false;
+        restartCfBtn.textContent = '↻ Restart Cloudflare';
+      }
+    });
+  }
+
+  if (enableFunnelBtn) {
+    enableFunnelBtn.addEventListener('click', async () => {
+      enableFunnelBtn.disabled = true;
+      enableFunnelBtn.textContent = 'Enabling...';
+      try {
+        const res = await fetch('/api/tailscale/funnel/enable', {
+          method: 'POST',
+          headers: getAuthHeaders({ 'Content-Type': 'application/json' })
+        });
+        const data = await res.json();
+        if (data.funnel_active) {
+          alert('Tailscale Funnel enabled successfully! Your server is now accessible to guest invite links from any network.');
+        } else {
+          alert('Tailscale Funnel requested!\n\nIf you see a Tailscale authorization prompt, please approve node funnel access at:\n' + data.enable_url);
+          window.open(data.enable_url, '_blank');
+        }
+        refreshFunnelStatus();
+      } catch (err) {
+        alert('Failed to enable funnel: ' + err.message);
+      } finally {
+        enableFunnelBtn.disabled = false;
+        enableFunnelBtn.textContent = '⚡ ENABLE FUNNEL';
+      }
+    });
+  }
+
+  if (createGuestTokenBtn) {
+    createGuestTokenBtn.addEventListener('click', async () => {
+      const label = guestLabelInput ? (guestLabelInput.value.trim() || 'Guest Friend') : 'Guest Friend';
+      createGuestTokenBtn.disabled = true;
+      createGuestTokenBtn.textContent = 'Generating...';
+      try {
+        const res = await fetch('/api/tokens/guests', {
+          method: 'POST',
+          headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ label: label, expires_in_days: 7 })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const tsField = document.getElementById('guest-ts-invite-url-field');
+          if (guestTokenCreatedBox && guestInviteUrlField) {
+            guestInviteUrlField.value = data.cloudflare_invite_url || data.invite_url;
+            if (tsField) tsField.value = data.tailscale_invite_url || data.invite_url;
+            guestTokenCreatedBox.style.display = 'block';
+          }
+          if (guestLabelInput) guestLabelInput.value = '';
+          loadGuestTokens();
+          refreshFunnelStatus();
+        } else {
+          const errData = await res.json();
+          alert('Failed to create guest token: ' + (errData.detail || res.statusText));
+        }
+      } catch (err) {
+        alert('Network error creating token: ' + err.message);
+      } finally {
+        createGuestTokenBtn.disabled = false;
+        createGuestTokenBtn.textContent = '+ GENERATE';
+      }
+    });
+  }
+
+  if (copyGuestUrlBtn) {
+    copyGuestUrlBtn.addEventListener('click', () => {
+      if (guestInviteUrlField) {
+        navigator.clipboard.writeText(guestInviteUrlField.value).then(() => {
+          copyGuestUrlBtn.textContent = 'COPIED!';
+          setTimeout(() => { copyGuestUrlBtn.textContent = 'COPY'; }, 2000);
+        });
+      }
+    });
+  }
+
+  async function loadGuestTokens() {
+    const listEl = document.getElementById('guest-tokens-list');
+    if (!listEl) return;
+    try {
+      const res = await fetch('/api/tokens/guests', { headers: getAuthHeaders() });
+      if (!res.ok) {
+        listEl.innerHTML = '<div style="color: #64748b; font-size: 12px; padding: 10px;">Guest tokens only available to host.</div>';
+        return;
+      }
+      const data = await res.json();
+      const tokens = data.tokens || [];
+      if (tokens.length === 0) {
+        listEl.innerHTML = '<div style="color: #64748b; font-size: 12px; padding: 10px;">No active guest tokens yet. Generate one above!</div>';
+        return;
+      }
+      let html = '';
+      tokens.forEach(t => {
+        const expiresStr = t.expires_at ? t.expires_at.split('T')[0] : 'Never';
+        html += `
+          <div class="guest-token-row" id="tok-row-${t.token}">
+            <div class="guest-token-meta">
+              <span class="guest-token-label">${t.label || 'Guest'}</span>
+              <span class="guest-token-sub">${t.token.slice(0, 18)}... | Expires: ${expiresStr}</span>
+            </div>
+            <div class="guest-token-actions">
+              <button class="guest-btn-small" onclick="window.libraCopyInvite('${t.token}')">Copy Link</button>
+              <button class="guest-btn-small guest-btn-revoke" onclick="window.libraRevokeToken('${t.token}')">Revoke</button>
+            </div>
+          </div>
+        `;
+      });
+      listEl.innerHTML = html;
+    } catch (e) {
+      listEl.innerHTML = '<div style="color: #f87171; font-size: 12px; padding: 10px;">Error loading guest tokens.</div>';
+    }
+  }
+
+  window.libraCopyInvite = function(token) {
+    const base = window.location.origin;
+    const url = `${base}/?token=${token}`;
+    navigator.clipboard.writeText(url).then(() => {
+      alert(`Invite link copied to clipboard!\n\n${url}`);
+    });
+  };
+
+  window.libraRevokeToken = async function(token) {
+    if (!confirm('Are you sure you want to revoke this guest access token?')) return;
+    try {
+      const res = await fetch(`/api/tokens/guests/${token}`, {
+        method: 'DELETE',
+        headers: getAuthHeaders()
+      });
+      if (res.ok) {
+        loadGuestTokens();
+      } else {
+        alert('Failed to revoke token');
+      }
+    } catch (e) {
+      alert('Error revoking token: ' + e.message);
+    }
+  };
+
+
+  // --------------------------------------------------------------------------
+  // 12.5 PHASE 12: COMMAND PALETTE (CTRL+K), GAME SHIELD, STARTER CHIPS & EXPORT
+  // --------------------------------------------------------------------------
+  const cmdPaletteBtn = document.getElementById('cmd-palette-btn');
+  const cmdPaletteModal = document.getElementById('cmd-palette-modal');
+  const cmdPaletteInput = document.getElementById('cmd-palette-input');
+  const cmdPaletteList = document.getElementById('cmd-palette-list');
+
+  const gameShieldBtn = document.getElementById('game-shield-btn');
+  const gameShieldModal = document.getElementById('game-shield-modal');
+  const closeGameShieldBtn = document.getElementById('close-game-shield-modal');
+  const gameShieldBadge = document.getElementById('game-shield-badge');
+  const gameShieldCards = document.getElementById('game-shield-status-cards');
+  const gameAudioList = document.getElementById('game-audio-sessions-list');
+  const healAudioBtn = document.getElementById('heal-audio-btn');
+
+  const artifactPreviewModal = document.getElementById('artifact-preview-modal');
+  const closeArtifactPreviewBtn = document.getElementById('close-artifact-preview-modal');
+  const artifactPreviewIframe = document.getElementById('artifact-preview-iframe');
+
+  if (localStorage.getItem('libra_zen_mode') === '1') {
+    document.body.classList.add('zen-mode');
+  }
+
+  function toggleZenMode() {
+    document.body.classList.toggle('zen-mode');
+    const isZen = document.body.classList.contains('zen-mode');
+    localStorage.setItem('libra_zen_mode', isZen ? '1' : '0');
+  }
+
+  function exportCurrentSessionMarkdown() {
+    if (!activeSessionId) return;
+    window.open(`/api/sessions/${encodeURIComponent(activeSessionId)}/export`, '_blank');
+  }
+
+  async function openGameShieldModal() {
+    if (!gameShieldModal) return;
+    gameShieldModal.style.display = 'flex';
+    await refreshGameShieldStatus();
+  }
+
+  async function refreshGameShieldStatus() {
+    if (!gameShieldCards || !gameAudioList) return;
+    try {
+      const res = await fetch('/api/gaming/status', { headers: getAuthHeaders() });
+      if (!res.ok) return;
+      const data = await res.json();
+      const activeGame = data.active_game;
+      const isShield = data.gaming_shield_active;
+
+      if (gameShieldBadge) {
+        gameShieldBadge.textContent = isShield ? '🛡️ SHIELD ACTIVE' : 'DESKTOP MODE';
+        gameShieldBadge.style.color = isShield ? '#10b981' : '#38bdf8';
+      }
+
+      const gameTitle = activeGame ? `${activeGame.app_label}` : 'No Active Game';
+      const gameSub = activeGame ? `${activeGame.process_name} (${activeGame.memory_mb || 0} MB RAM)` : 'Scanning 30+ game engines';
+
+      gameShieldCards.innerHTML = `
+        <div class="token-card highlight">
+          <div class="token-card-header">DETECTED GAME</div>
+          <div class="token-card-value" style="font-size: 18px; color: ${activeGame ? '#10b981' : '#94a3b8'};">${escapeHtml(gameTitle)}</div>
+          <div class="token-card-sub">${escapeHtml(gameSub)}</div>
+        </div>
+        <div class="token-card">
+          <div class="token-card-header">WAKE-WORD SHIELD</div>
+          <div class="token-card-value" style="font-size: 18px;">${data.wake_threshold}</div>
+          <div class="token-card-sub">${escapeHtml(data.agc_status)}</div>
+        </div>
+      `;
+
+      const sessions = data.audio_sessions || [];
+      if (sessions.length === 0) {
+        gameAudioList.innerHTML = '<div style="color: #64748b; font-size: 12px;">No active audio sessions found.</div>';
+      } else {
+        gameAudioList.innerHTML = sessions.map(s => `
+          <div class="audio-session-row">
+            <div>
+              <strong style="color: ${s.protected ? '#10b981' : '#f1f5f9'};">${escapeHtml(s.process)}</strong>
+              ${s.protected ? '<span style="font-size: 10px; color: #10b981; margin-left: 6px;">[GAME PROTECTED]</span>' : ''}
+            </div>
+            <span style="font-family: monospace; color: ${s.volume_percent < 100 ? '#f59e0b' : '#00f2fe'};">${s.volume_percent}%</span>
+          </div>
+        `).join('');
+      }
+    } catch (e) {
+      console.warn('Error loading gaming status:', e);
+    }
+  }
+
+  if (gameShieldBtn) gameShieldBtn.addEventListener('click', openGameShieldModal);
+  if (closeGameShieldBtn) {
+    closeGameShieldBtn.addEventListener('click', () => {
+      if (gameShieldModal) gameShieldModal.style.display = 'none';
+    });
+  }
+  if (healAudioBtn) {
+    healAudioBtn.addEventListener('click', async () => {
+      healAudioBtn.textContent = 'RESTORING...';
+      try {
+        await fetch('/api/gaming/heal-audio', { method: 'POST', headers: getAuthHeaders() });
+        await refreshGameShieldStatus();
+        healAudioBtn.textContent = '✓ ALL AT 100%';
+        setTimeout(() => { healAudioBtn.textContent = '🔊 RESTORE ALL TO 100%'; }, 1800);
+      } catch (e) {
+        healAudioBtn.textContent = '🔊 RESTORE ALL TO 100%';
+      }
+    });
+  }
+
+  // Live HTML/SVG Code Block Artifact Preview
+  document.addEventListener('click', (e) => {
+    if (e.target && e.target.classList.contains('preview-code-btn')) {
+      const encoded = e.target.getAttribute('data-code');
+      if (encoded && artifactPreviewModal && artifactPreviewIframe) {
+        artifactPreviewIframe.srcdoc = decodeURIComponent(encoded);
+        artifactPreviewModal.style.display = 'flex';
+      }
+    }
+  });
+  if (closeArtifactPreviewBtn) {
+    closeArtifactPreviewBtn.addEventListener('click', () => {
+      if (artifactPreviewModal) artifactPreviewModal.style.display = 'none';
+    });
+  }
+
+  // Command Palette Actions (Inspired by Raycast AI / Open WebUI)
+  const COMMAND_ACTIONS = [
+    { icon: '🎮', title: 'Gaming & Audio Shield Control', desc: 'Inspect active game (Valorant, CS2) & lock 100% game volume', shortcut: '/game', run: () => openGameShieldModal() },
+    { icon: '🔊', title: 'Heal & Restore All App Audio to 100%', desc: 'Immediately restore all Windows WASAPI audio sessions to 100%', shortcut: '/heal', run: async () => { await fetch('/api/gaming/heal-audio', { method: 'POST', headers: getAuthHeaders() }); openGameShieldModal(); } },
+    { icon: '⚡', title: 'Daily Tactical Briefing', desc: 'Weather rain forecast, RTX GPU vitals & schedule summary', shortcut: '/briefing', run: () => { if (briefingNavBtn) briefingNavBtn.click(); } },
+    { icon: '◈', title: 'Obsidian Memory Vault', desc: 'Search, pin, or add persistent markdown memories (BM25 FTS5)', shortcut: '/vault', run: () => { if (vaultNavBtn) vaultNavBtn.click(); } },
+    { icon: '✈', title: 'AirDrop Bridge (Phone ⟷ PC)', desc: 'Send files from mobile directly to PC Downloads/LibraDrop', shortcut: '/drop', run: () => { if (airdropNavBtn) airdropNavBtn.click(); } },
+    { icon: '📥', title: 'Export Conversation to Markdown (.md)', desc: 'Download current chat thread with tool badges & metrics', shortcut: '/export', run: () => exportCurrentSessionMarkdown() },
+    { icon: '🧘', title: 'Toggle Zen Focus Mode', desc: 'Collapse/expand the 3D WebGL Orb for maximum reading space', shortcut: '/zen', run: () => toggleZenMode() },
+    { icon: '📊', title: 'GPU Token Telemetry HUD', desc: 'Inspect qwen3:8b tokens/sec and Markovian saved tokens', shortcut: '/tokens', run: () => { if (tokenHudBtn) tokenHudBtn.click(); } },
+    { icon: '➕', title: 'Start New Conversation Thread', desc: 'Create a fresh isolated chat session', shortcut: '/new', run: () => createNewSession() }
+  ];
+
+  let selectedCmdIdx = 0;
+  let filteredCommands = [...COMMAND_ACTIONS];
+
+  function renderCommandPalette(filterText = '') {
+    if (!cmdPaletteList) return;
+    const q = (filterText || '').toLowerCase().trim();
+    filteredCommands = COMMAND_ACTIONS.filter(c =>
+      !q || c.title.toLowerCase().includes(q) || c.desc.toLowerCase().includes(q) || c.shortcut.toLowerCase().includes(q)
+    );
+    selectedCmdIdx = 0;
+    cmdPaletteList.innerHTML = filteredCommands.map((c, idx) => `
+      <div class="cmd-item ${idx === selectedCmdIdx ? 'selected' : ''}" data-idx="${idx}">
+        <div class="cmd-item-left">
+          <span class="cmd-item-icon">${c.icon}</span>
+          <div>
+            <div class="cmd-item-title">${escapeHtml(c.title)}</div>
+            <div class="cmd-item-desc">${escapeHtml(c.desc)}</div>
+          </div>
+        </div>
+        <span class="cmd-item-shortcut">${escapeHtml(c.shortcut)}</span>
+      </div>
+    `).join('');
+
+    cmdPaletteList.querySelectorAll('.cmd-item').forEach(el => {
+      el.addEventListener('click', () => {
+        const i = parseInt(el.getAttribute('data-idx'), 10);
+        if (filteredCommands[i]) {
+          closeCommandPalette();
+          filteredCommands[i].run();
+        }
+      });
+    });
+  }
+
+  function openCommandPalette(initialFilter = '') {
+    if (!cmdPaletteModal) return;
+    cmdPaletteModal.style.display = 'flex';
+    if (cmdPaletteInput) {
+      cmdPaletteInput.value = initialFilter;
+      renderCommandPalette(initialFilter);
+      setTimeout(() => cmdPaletteInput.focus(), 50);
+    }
+  }
+
+  function closeCommandPalette() {
+    if (cmdPaletteModal) cmdPaletteModal.style.display = 'none';
+  }
+
+  if (cmdPaletteBtn) cmdPaletteBtn.addEventListener('click', () => openCommandPalette(''));
+  if (cmdPaletteModal) {
+    cmdPaletteModal.addEventListener('click', (e) => {
+      if (e.target === cmdPaletteModal) closeCommandPalette();
+    });
+  }
+  if (cmdPaletteInput) {
+    cmdPaletteInput.addEventListener('input', (e) => renderCommandPalette(e.target.value));
+    cmdPaletteInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        closeCommandPalette();
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (filteredCommands.length > 0) {
+          selectedCmdIdx = (selectedCmdIdx + 1) % filteredCommands.length;
+          cmdPaletteList.querySelectorAll('.cmd-item').forEach((el, i) => el.classList.toggle('selected', i === selectedCmdIdx));
+        }
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (filteredCommands.length > 0) {
+          selectedCmdIdx = (selectedCmdIdx - 1 + filteredCommands.length) % filteredCommands.length;
+          cmdPaletteList.querySelectorAll('.cmd-item').forEach((el, i) => el.classList.toggle('selected', i === selectedCmdIdx));
+        }
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (filteredCommands[selectedCmdIdx]) {
+          const act = filteredCommands[selectedCmdIdx];
+          closeCommandPalette();
+          act.run();
+        }
+      }
+    });
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      if (cmdPaletteModal && cmdPaletteModal.style.display === 'flex') {
+        closeCommandPalette();
+      } else {
+        openCommandPalette('');
+      }
+    }
+  });
+
+  function renderStarterChips() {
+    if (!chatContainer) return;
+    const wrap = document.createElement('div');
+    wrap.className = 'starter-hero-wrap';
+    wrap.innerHTML = `
+      <div class="starter-hero-title">⚡ Quick Tactical Actions &amp; Prompts</div>
+      <div class="starter-chips-grid">
+        <button class="starter-chip-btn" data-prompt="What game am I playing right now?">🎮 What game am I playing right now?</button>
+        <button class="starter-chip-btn" data-prompt="Good morning Libra, give me my daily briefing">⚡ Generate my Daily Tactical Briefing</button>
+        <button class="starter-chip-btn" data-prompt="What is the current weather and rain forecast?">🌦️ Current weather &amp; rain forecast</button>
+        <button class="starter-chip-btn" data-prompt="Check my system vitals and GPU temperature">🖥️ Check RTX GPU temp &amp; system vitals</button>
+        <button class="starter-chip-btn" data-action="game-shield">🛡️ Open Gaming &amp; Audio Shield Control</button>
+        <button class="starter-chip-btn" data-action="cmd-palette">⌘ Open Command Palette (Ctrl + K)</button>
+      </div>
+    `;
+    wrap.querySelectorAll('.starter-chip-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const act = btn.getAttribute('data-action');
+        const p = btn.getAttribute('data-prompt');
+        if (act === 'game-shield') {
+          openGameShieldModal();
+        } else if (act === 'cmd-palette') {
+          openCommandPalette('');
+        } else if (p && promptInput && sendBtn) {
+          promptInput.value = p;
+          sendBtn.click();
+        }
+      });
+    });
+    chatContainer.appendChild(wrap);
+  }
+
+  // --------------------------------------------------------------------------
   // 13. BOOTSTRAP INITIALIZATION
   // --------------------------------------------------------------------------
   initOrb();
   fetchVitals();
+  initAuthAndRole();
   fetchSessions().then(() => {
     // Switch to active session or the newest session
     if (sessionsList.length > 0) {

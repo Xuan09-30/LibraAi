@@ -14,6 +14,11 @@ def get_entity_summary(entity_name: str) -> str:
     if not entity_name or not entity_name.strip():
         return ""
 
+    # Guard against weather queries polluting Wikipedia knowledge searches
+    weather_keywords = {"weather", "forecast", "rain", "temperature", "cloudy", "sunny", "precipitation"}
+    if any(k in entity_name.lower() for k in weather_keywords):
+        return ""
+
     clean_entity = entity_name.strip().replace(" ", "_")
     encoded_title = urllib.parse.quote(clean_entity)
     url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded_title}"

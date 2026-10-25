@@ -87,7 +87,7 @@ def test_briefing_and_workspace_routes():
     briefing_plan = llm.plan("Good morning Libra, give me my briefing", dry_run=True)
     assert briefing_plan.get("action") == "daily_briefing", f"Expected 'daily_briefing', got {briefing_plan.get('action')}"
     voice = briefing_plan.get("voice_response", "")
-    assert any(w in voice for w in ["Celsius", "degrees", "forecast", "weather"]), f"Weather missing from briefing: {voice}"
+    assert any(w in voice.lower() for w in ["celsius", "degrees", "forecast", "weather", "°c", "rain"]), f"Weather missing from briefing: {voice}"
     assert any(w in voice for w in ["reminder", "schedule"]), f"Reminders missing from briefing: {voice}"
     assert any(w in voice for w in ["CPU", "RAM", "GPU", "system"]), f"System telemetry missing from briefing: {voice}"
     print(f"  [PASS] 'Good morning Libra, give me my briefing' -> action='daily_briefing'")

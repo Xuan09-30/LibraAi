@@ -536,6 +536,15 @@ class DocumentRAGEngine:
         clean_file_q = (file_query or "").strip()
         clean_question = (question or "").strip()
 
+        # Guard against weather queries polluting document RAG
+        if re.search(r"\b(?:weather|forecast|rain\s+forecast|rain\s+chance|temperature)\b", clean_question, re.IGNORECASE):
+            return {
+                "file_path": None,
+                "chunks": [],
+                "voice_response": "Weather queries are handled by live weather telemetry, not document search.",
+                "status": "error"
+            }
+
         # 1. Locate file
         target_path = None
         if os.path.isfile(clean_file_q):

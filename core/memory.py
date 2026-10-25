@@ -235,13 +235,8 @@ class SemanticMemory:
                     VALUES (new.id, new.value, new.entity, new.relation, new.category);
                 END;
             """)
-            # Populate FTS if empty and facts exist
-            fts_cnt = cursor.execute("SELECT count(*) FROM semantic_facts_fts").fetchone()[0]
-            if fts_cnt == 0:
-                cursor.execute("""
-                    INSERT INTO semantic_facts_fts(rowid, value, entity, relation, category)
-                    SELECT id, value, entity, relation, category FROM semantic_facts
-                """)
+            # Rebuild external-content FTS5 index so triggers never fail with malformed index
+            cursor.execute("INSERT INTO semantic_facts_fts(semantic_facts_fts) VALUES('rebuild')")
         except Exception as e:
             print(f"[SemanticMemory FTS Warning]: {e}")
 
@@ -306,6 +301,18 @@ class SemanticMemory:
                 tool_used TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(session_id) REFERENCES chat_sessions(session_id) ON DELETE CASCADE
+            )
+        """)
+
+        # 14. Guest Access Tokens Table (Role-Based Access Control)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS guest_tokens (
+                token TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NULL,
+                revoked INTEGER DEFAULT 0,
+                created_by TEXT DEFAULT 'host'
             )
         """)
 
@@ -913,10 +920,24 @@ class SemanticMemory:
                 entities["browser"] = "Google Chrome"
             if "spotify" in lower:
                 entities["media_player"] = "Spotify"
-            if "league of legends" in lower or "league" in lower:
-                entities["active_game"] = "League of Legends"
-            if "roblox" in lower:
-                entities["game"] = "Roblox"
+            for g_key, g_val in [
+                ("valorant", "Valorant"),
+                ("counter-strike", "Counter-Strike 2"),
+                ("cs2", "Counter-Strike 2"),
+                ("overwatch", "Overwatch 2"),
+                ("apex legends", "Apex Legends"),
+                ("dota", "Dota 2"),
+                ("genshin", "Genshin Impact"),
+                ("star rail", "Honkai: Star Rail"),
+                ("minecraft", "Minecraft"),
+                ("elden ring", "Elden Ring"),
+                ("cyberpunk", "Cyberpunk 2077"),
+                ("league of legends", "League of Legends"),
+                ("roblox", "Roblox"),
+            ]:
+                if g_key in lower:
+                    entities["active_game"] = g_val
+                    entities["game"] = g_val
             if "discord" in lower:
                 entities["comm"] = "Discord"
             if "ayam gepuk" in lower:
@@ -1133,7 +1154,11 @@ class SemanticMemory:
 
             params.append(int(fact_id))
             sql = f"UPDATE semantic_facts SET {', '.join(updates)} WHERE id = ?"
-            cursor.execute(sql, tuple(params))
+            try:
+                cursor.execute(sql, tuple(params))
+            except sqlite3.DatabaseError:
+                cursor.execute("INSERT INTO semantic_facts_fts(semantic_facts_fts) VALUES('rebuild')")
+                cursor.execute(sql, tuple(params))
             conn.commit()
             success = cursor.rowcount > 0
         except Exception as e:
@@ -2108,6 +2133,120 @@ class SemanticMemory:
         finally:
             if self.db_path != ":memory:":
                 conn.close()
+
+    # -----------------------------------------------------------------------
+    # GUEST ACCESS TOKENS (ROLE-BASED ACCESS CONTROL)
+    # -----------------------------------------------------------------------
+    def create_guest_token(self, label: str = "Guest", expires_in_days: Optional[int] = None) -> dict:
+        """Generates a secure guest access token for temporary or non-host sharing."""
+        import secrets, datetime
+        raw_token = f"libra_guest_{secrets.token_hex(12)}"
+        exp_time = None
+        if expires_in_days and expires_in_days > 0:
+            exp_time = (datetime.datetime.utcnow() + datetime.timedelta(days=expires_in_days)).strftime("%Y-%m-%d %H:%M:%S")
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO guest_tokens (token, label, created_at, expires_at, revoked, created_by)
+                VALUES (?, ?, CURRENT_TIMESTAMP, ?, 0, 'host')
+            """, (raw_token, label.strip() or "Guest", exp_time))
+            conn.commit()
+            return {
+                "token": raw_token,
+                "label": label.strip() or "Guest",
+                "expires_at": exp_time,
+                "revoked": 0,
+                "role": "guest"
+            }
+        except Exception as e:
+            print(f"[MemoryCore create_guest_token Error]: {e}")
+            return {}
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def list_guest_tokens(self) -> list[dict]:
+        """Lists all guest access tokens with status."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT token, label, created_at, expires_at, revoked, created_by
+                FROM guest_tokens
+                ORDER BY created_at DESC
+            """)
+            rows = cursor.fetchall()
+            return [
+                {
+                    "token": r[0],
+                    "label": r[1],
+                    "created_at": r[2],
+                    "expires_at": r[3],
+                    "revoked": bool(r[4]),
+                    "created_by": r[5]
+                }
+                for r in rows
+            ]
+        except Exception as e:
+            print(f"[MemoryCore list_guest_tokens Error]: {e}")
+            return []
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def revoke_guest_token(self, token: str) -> bool:
+        """Revokes an existing guest access token."""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("UPDATE guest_tokens SET revoked = 1 WHERE token = ?", (token,))
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            print(f"[MemoryCore revoke_guest_token Error]: {e}")
+            return False
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def validate_guest_token(self, token: str) -> Optional[dict]:
+        """Validates if a token is an active, unrevoked, non-expired guest token."""
+        if not token or not token.startswith("libra_guest_"):
+            return None
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT token, label, expires_at, revoked
+                FROM guest_tokens
+                WHERE token = ? AND revoked = 0
+            """, (token,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            tok, label, expires_at, revoked = row
+            if expires_at:
+                import datetime
+                try:
+                    exp_dt = datetime.datetime.fromisoformat(str(expires_at).replace("Z", ""))
+                    if datetime.datetime.utcnow() > exp_dt:
+                        return None
+                except Exception:
+                    pass
+            return {
+                "token": tok,
+                "label": label,
+                "role": "guest"
+            }
+        except Exception as e:
+            print(f"[MemoryCore validate_guest_token Error]: {e}")
+            return None
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
 
 # Backward compatibility alias
 MemoryCore = SemanticMemory
