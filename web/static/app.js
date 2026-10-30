@@ -5046,6 +5046,8 @@
 
   function showUsersModal() {
 
+    if (typeof optionsModal !== 'undefined' && optionsModal) optionsModal.style.display = 'none';
+
     if (usersModal) {
 
       usersModal.style.display = 'flex';
@@ -5109,87 +5111,53 @@
       usersTableBody.innerHTML = '';
 
       users.forEach((u) => {
-
         const row = document.createElement('div');
-
-        row.className = 'user-row-item';
-
-        const initial = (u.display_name || u.email || 'U')[0].toUpperCase();
-
         const isMainHost = u.is_primary_host;
-
         const roleClass = u.role === 'host' ? 'role-host' : 'role-tester';
+        row.className = `user-row-item ${isMainHost ? 'is-main-host' : (u.role === 'host' ? 'is-host' : 'is-tester')}`;
+        const initial = (u.display_name || u.email || 'U')[0].toUpperCase();
+        const avatarClass = u.role === 'host' ? 'avatar-host' : 'avatar-tester';
 
         row.innerHTML = `
-
           <div class="user-row-left">
-
-            <div class="user-row-avatar">${initial}</div>
-
+            <div class="user-row-avatar ${avatarClass}">${initial}</div>
             <div class="user-row-info">
-
               <div class="user-row-name">
-
                 <span>${escapeHtml(u.display_name || u.email.split('@')[0])}</span>
-
                 ${isMainHost ? '<span class="primary-host-tag">MAIN HOST</span>' : ''}
-
               </div>
-
               <div class="user-row-email">${escapeHtml(u.email)}</div>
-
             </div>
-
           </div>
-
           <div class="user-row-right">
-
             <select class="user-role-select ${roleClass}" data-email="${escapeHtml(u.email)}" ${isMainHost ? 'disabled title="Primary Host cannot be changed"' : ''}>
-
               <option value="tester" ${u.role === 'tester' ? 'selected' : ''}>🧪 Tester</option>
-
               <option value="host" ${u.role === 'host' ? 'selected' : ''}>👑 Host</option>
-
             </select>
-
-            <button class="user-delete-btn" data-email="${escapeHtml(u.email)}" ${isMainHost ? 'disabled title="Primary Host cannot be deleted"' : ''}>Delete</button>
-
+            <button class="user-delete-btn" data-email="${escapeHtml(u.email)}" ${isMainHost ? 'disabled title="Primary Host cannot be deleted"' : ''}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="display:inline-block; vertical-align:middle; margin-right:3px;"><path d="M3 6h18m-2 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+              Delete
+            </button>
           </div>
-
         `;
 
         // Role select change listener
-
         const roleSelect = row.querySelector('.user-role-select');
-
         if (roleSelect && !isMainHost) {
-
           roleSelect.addEventListener('change', async (e) => {
-
             const newRole = e.target.value;
-
             await changeUserRole(u.email, newRole, roleSelect);
-
           });
-
         }
 
         // Delete button listener
-
         const delBtn = row.querySelector('.user-delete-btn');
-
         if (delBtn && !isMainHost) {
-
           delBtn.addEventListener('click', async () => {
-
             if (confirm(`Are you sure you want to remove user "${u.email}"?`)) {
-
               await deleteUser(u.email);
-
             }
-
           });
-
         }
 
         usersTableBody.appendChild(row);
@@ -5229,6 +5197,12 @@
         if (selectElem) {
 
           selectElem.className = `user-role-select ${newRole === 'host' ? 'role-host' : 'role-tester'}`;
+          const rowElem = selectElem.closest('.user-row-item');
+          if (rowElem) {
+            rowElem.className = `user-row-item ${newRole === 'host' ? 'is-host' : 'is-tester'}`;
+            const avatar = rowElem.querySelector('.user-row-avatar');
+            if (avatar) avatar.className = `user-row-avatar ${newRole === 'host' ? 'avatar-host' : 'avatar-tester'}`;
+          }
 
         }
 
