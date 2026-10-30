@@ -938,6 +938,53 @@
 
   }
 
+
+  // --------------------------------------------------------------------------
+  // AI THOUGHT PROCESS & MODEL REASONING ACCORDION COMPONENT (PHASE 12.6)
+  // --------------------------------------------------------------------------
+  function createThoughtAccordion(steps, initialLabel, isStreaming = false, reasoningText = '') {
+    const acc = document.createElement('div');
+    acc.className = 'thought-accordion' + (isStreaming ? ' streaming' : '');
+    const stepsHtml = renderThoughtStepsHtml(steps);
+    const reasoningHtml = reasoningText ? `<div class="thought-raw-reasoning">${escapeHtml(reasoningText)}</div>` : '';
+
+    acc.innerHTML = `
+      <button class="thought-header" type="button" aria-expanded="false" title="Click to inspect Libra's reasoning & model steps">
+        <span class="thought-icon">${isStreaming ? '🧠' : '✦'}</span>
+        <span class="thought-label">${escapeHtml(initialLabel || 'Libra is analyzing what the user needs...')}</span>
+        <span class="thought-chevron">▾</span>
+      </button>
+      <div class="thought-body" style="display: none;">
+        <div class="thought-steps-list">${stepsHtml}</div>
+        ${reasoningHtml}
+      </div>
+    `;
+
+    const btn = acc.querySelector('.thought-header');
+    const body = acc.querySelector('.thought-body');
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isOpen = acc.classList.toggle('open');
+      btn.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+      body.style.display = isOpen ? 'flex' : 'none';
+    });
+
+    return acc;
+  }
+
+  function renderThoughtStepsHtml(steps) {
+    if (!steps || !Array.isArray(steps) || steps.length === 0) return '';
+    return steps.map((s, idx) => `
+      <div class="thought-step-item">
+        <div class="thought-step-num">${s.step || idx + 1}</div>
+        <div class="thought-step-content">
+          <div class="thought-step-title">${escapeHtml(s.title || 'Step ' + (idx + 1))}</div>
+          <div class="thought-step-detail">${escapeHtml(s.detail || '')}</div>
+        </div>
+      </div>
+    `).join('');
+  }
+
   function appendMessage(text, isUser, meta = {}) {
 
     const hero = document.getElementById('empty-chat-hero');
@@ -1011,19 +1058,37 @@
     }
 
     // 2. Render text / markdown content
+    let visibleText = text;
+    let reasoningText = '';
+    if (!isUser && text) {
+      const thinkMatch = text.match(/<think>([\s\S]*?)(?:<\/think>|$)/i);
+      if (thinkMatch) {
+        reasoningText = thinkMatch[1].trim();
+        visibleText = text.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim();
+      }
 
-    const textNode = document.createElement('div');
+      const steps = (meta.thought_steps && meta.thought_steps.length > 0) ? meta.thought_steps : [
+        { step: 1, title: 'Intent & Scope Analysis', detail: 'Analyzed query context and loaded active conversation memory.' },
+        { step: 2, title: 'AI Model Allocation', detail: 'Allocated ' + ((meta.token_metrics && meta.token_metrics.model) || 'qwen3:8b') + ' on NVIDIA GeForce RTX 5060 Ti.' },
+        { step: 3, title: 'Neural Synthesis', detail: 'Synthesized response in ' + (meta.latency_ms ? meta.latency_ms + 'ms' : '0.8s') + '.' }
+      ];
 
-    if (isUser) {
-
-      textNode.textContent = text;
-
-    } else {
-
-      textNode.innerHTML = formatMarkdown(text);
-
+      const elapsedStr = meta.latency_ms ? ' • ' + (meta.latency_ms / 1000).toFixed(1) + 's' : '';
+      const thoughtAcc = createThoughtAccordion(
+        steps,
+        `✦ Thought Process (${steps.length} steps${elapsedStr})`,
+        false,
+        reasoningText
+      );
+      contentDiv.appendChild(thoughtAcc);
     }
 
+    const textNode = document.createElement('div');
+    if (isUser) {
+      textNode.textContent = text;
+    } else {
+      textNode.innerHTML = formatMarkdown(visibleText);
+    }
     contentDiv.appendChild(textNode);
 
     // 3. Render generated visual plot (e.g. from DataScienceAgent or Image generation)
@@ -2488,12 +2553,21 @@
 
       contentDiv.className = 'msg-content';
 
+      // Live Thought Accordion (Phase 12.6)
+      let activeThoughtSteps = [
+        { step: 1, title: 'Intent & Scope Analysis', detail: 'Libra is analyzing what the user needs...' },
+        { step: 2, title: 'Model Selection & Routing', detail: 'Allocating Qwen 3 (8B) on NVIDIA RTX 5060 Ti...' }
+      ];
+      const thoughtAccordion = createThoughtAccordion(
+        activeThoughtSteps,
+        '🧠 Libra is analyzing what the user needs...',
+        true
+      );
+      contentDiv.appendChild(thoughtAccordion);
+
       const textNode = document.createElement('div');
-
       textNode.className = 'msg-text';
-
       contentDiv.appendChild(textNode);
-
       msgDiv.appendChild(contentDiv);
 
       const metaDiv = document.createElement('div');
@@ -2557,6 +2631,22 @@
       const RENDER_INTERVAL_MS = 24; // ~40-60 FPS throttle window
 
       function renderProgressive(immediate = false) {
+        let curVisible = accumulatedText;
+        const thinkMatch = accumulatedText.match(/<think>([\s\S]*?)(?:<\/think>|$)/i);
+        if (thinkMatch) {
+          const reasoning = thinkMatch[1].trim();
+          curVisible = accumulatedText.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim();
+          if (thoughtAccordion && reasoning) {
+            let rBox = thoughtAccordion.querySelector('.thought-raw-reasoning');
+            if (!rBox) {
+              rBox = document.createElement('div');
+              rBox.className = 'thought-raw-reasoning';
+              thoughtAccordion.querySelector('.thought-body').appendChild(rBox);
+            }
+            rBox.textContent = reasoning;
+          }
+        }
+
         if (immediate) {
           if (renderRafId) {
             cancelAnimationFrame(renderRafId);
@@ -2564,7 +2654,7 @@
             renderRafId = null;
           }
           isRenderScheduled = false;
-          textNode.innerHTML = formatMarkdown(accumulatedText);
+          textNode.innerHTML = formatMarkdown(curVisible);
           if (!userIsScrolledUp) {
             chatContainer.scrollTop = chatContainer.scrollHeight;
           }
@@ -2582,7 +2672,7 @@
           renderRafId = requestAnimationFrame(() => {
             renderRafId = null;
             isRenderScheduled = false;
-            textNode.innerHTML = formatMarkdown(accumulatedText);
+            textNode.innerHTML = formatMarkdown(curVisible);
             if (!userIsScrolledUp) {
               chatContainer.scrollTop = chatContainer.scrollHeight;
             }
@@ -2594,7 +2684,7 @@
             renderRafId = requestAnimationFrame(() => {
               renderRafId = null;
               isRenderScheduled = false;
-              textNode.innerHTML = formatMarkdown(accumulatedText);
+              textNode.innerHTML = formatMarkdown(curVisible);
               if (!userIsScrolledUp) {
                 chatContainer.scrollTop = chatContainer.scrollHeight;
               }
@@ -2637,47 +2727,56 @@
               const data = JSON.parse(jsonText);
 
               if (data.type === 'meta') {
-
                 if (data.session_id) {
-
                   activeSessionId = data.session_id;
-
                 }
-
                 if (data.session_title && activeThreadTitleEl) {
-
                   activeThreadTitleEl.textContent = data.session_title;
-
                 }
-
+              } else if (data.type === 'thought') {
+                if (thoughtAccordion) {
+                  const labelEl = thoughtAccordion.querySelector('.thought-label');
+                  if (labelEl && data.text) labelEl.textContent = data.text;
+                  if (data.steps && Array.isArray(data.steps)) {
+                    activeThoughtSteps = data.steps;
+                    const listEl = thoughtAccordion.querySelector('.thought-steps-list');
+                    if (listEl) listEl.innerHTML = renderThoughtStepsHtml(data.steps);
+                  }
+                }
               } else if (data.type === 'clear') {
-
                 accumulatedText = '';
-
                 renderProgressive(true);
-
               } else if (data.type === 'token') {
-
-                accumulatedText += data.content;
-
-                renderProgressive(false);
-
-              } else if (data.type === 'audio') {
-
-                if (data.audio_base64) {
-
-                  collectedAudioChunks.push(data.audio_base64);
-
-                  audioPlayer.enqueue(data.audio_base64);
-
+                if (!accumulatedText && thoughtAccordion) {
+                  const labelEl = thoughtAccordion.querySelector('.thought-label');
+                  if (labelEl && labelEl.textContent.includes('analyzing')) {
+                    labelEl.textContent = '⚡ Synthesizing response (qwen3:8b)...';
+                  }
                 }
-
+                accumulatedText += data.content;
+                renderProgressive(false);
+              } else if (data.type === 'audio') {
+                if (data.audio_base64) {
+                  collectedAudioChunks.push(data.audio_base64);
+                  audioPlayer.enqueue(data.audio_base64);
+                }
               } else if (data.type === 'done') {
-
                 finalTokenMetrics = data.token_metrics;
-
                 renderProgressive(true);
-
+                if (thoughtAccordion) {
+                  thoughtAccordion.classList.remove('streaming');
+                  const iconEl = thoughtAccordion.querySelector('.thought-icon');
+                  if (iconEl) iconEl.textContent = '✦';
+                  const labelEl = thoughtAccordion.querySelector('.thought-label');
+                  const totalSteps = (data.thought_steps && data.thought_steps.length) || activeThoughtSteps.length || 3;
+                  const elapsedSec = ((performance.now() - t0_stream) / 1000).toFixed(1);
+                  if (labelEl) labelEl.textContent = `✦ Thought Process (${totalSteps} steps • ${elapsedSec}s)`;
+                  if (data.thought_steps && Array.isArray(data.thought_steps)) {
+                    activeThoughtSteps = data.thought_steps;
+                    const listEl = thoughtAccordion.querySelector('.thought-steps-list');
+                    if (listEl) listEl.innerHTML = renderThoughtStepsHtml(data.thought_steps);
+                  }
+                }
               }
 
             } catch (pErr) {

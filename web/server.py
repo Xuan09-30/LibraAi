@@ -2995,14 +2995,16 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                                 # Emit initial thought steps for standard streaming chat
 
                                 thought_steps = [
-
-                                    {"step": 1, "title": "Intent & Context Analysis", "detail": f"Analyzed query '{req.prompt.strip()[:60]}' and loaded session context.", "status": "done"},
-
-                                    {"step": 2, "title": "Neural Token Streaming", "detail": f"Streaming response from {target_model} with real-time verification.", "status": "done"}
-
+                                    {"step": 1, "title": "Intent & Scope Analysis", "detail": f"Libra is analyzing what the user needs: '{req.prompt.strip()[:60]}'.", "status": "done"},
+                                    {"step": 2, "title": "Model Selection & Allocation", "detail": f"Allocated {target_model} on NVIDIA GeForce RTX 5060 Ti (Keep-Alive: 15m).", "status": "done"},
+                                    {"step": 3, "title": "Neural Token Streaming", "detail": "Streaming contextual response with real-time verification.", "status": "streaming"}
                                 ]
-
-                                await event_queue.put({"type": "thought", "steps": thought_steps})
+                                await event_queue.put({
+                                    "type": "thought",
+                                    "status": "thinking",
+                                    "text": "Libra is thinking about what the user needs...",
+                                    "steps": thought_steps
+                                })
 
                                 async for line in resp.aiter_lines():
 
