@@ -1,3 +1,4 @@
+import re
 import os
 import sys
 import json
@@ -337,7 +338,8 @@ class BriefingAndWorkspaces:
                 "• Bullet 1: Weather & Environment in Kuala Lumpur (temperature, rain probability percentage).\n"
                 "• Bullet 2: Tactical Reminders & Schedule (count and status of overdue and due-today tasks).\n"
                 "• Bullet 3: Hardware Diagnostics & Workspaces (NVMe disk space, GPU temperature, uncommitted Git changes).\n"
-                "Rules: Output ONLY the 3 bullet points starting with '• '. Keep tone tactical, sharp, and confident."
+                "Rules: Output ONLY the 3 bullet points starting with '• '. Keep tone tactical, sharp, and confident. "
+                "Never fabricate or invent meetings, doctor appointments, or fictional tasks. Strictly report the task counts given in the telemetry data."
             )
             user_msg = f"Telemetry Data:\n{json.dumps(telemetry, indent=2)}"
 
@@ -352,13 +354,20 @@ class BriefingAndWorkspaces:
                     "stream": False,
                     "options": {"temperature": 0.3}
                 },
-                timeout=6.0
+                timeout=25.0
             )
             if resp.status_code == 200:
                 raw = resp.json().get("message", {}).get("content", "").strip()
-                lines = [l.strip() for l in raw.splitlines() if l.strip().startswith("•") or l.strip().startswith("-")]
+                lines = []
+                for l in raw.splitlines():
+                    s = l.strip()
+                    if not s or s.startswith("#") or s.startswith("---") or s.lower().startswith("here") or s.lower().startswith("sure"):
+                        continue
+                    cleaned = re.sub(r"^(?:[•\-\*]|\d+[\.\)])\s*", "", s).strip()
+                    if cleaned:
+                        lines.append(f"• {cleaned}")
                 if len(lines) >= 3:
-                    return [f"• {l.lstrip('•- ').strip()}" for l in lines[:3]]
+                    return lines[:3]
         except Exception as e:
             print(f"[Briefing LLM Warning]: {e}")
         return []

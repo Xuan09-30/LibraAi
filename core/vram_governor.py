@@ -40,6 +40,10 @@ class VRAMAutoGovernor:
         "overwatch 2.exe",
         "apex.exe",
         "r5apex.exe",
+        "r5apex_dx12.exe",
+        "start_protected_game.exe",
+        "easyanticheat_eos.exe",
+        "easyanticheat.exe",
         "cs2.exe",
         "csgo.exe",
         "league of legends.exe",
@@ -103,6 +107,38 @@ class VRAMAutoGovernor:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
 
+    def release_ephemeral_model(self, model_name: str, dry_run: bool = False) -> bool:
+        """Immediately unloads model from VRAM by setting keep_alive: 0."""
+        if dry_run:
+            return True
+        try:
+            resp = requests.post(
+                f"{self.ollama_url}/api/generate",
+                json={"model": model_name, "keep_alive": 0},
+                timeout=3.0
+            )
+            return resp.status_code == 200
+        except Exception as e:
+            print(f"[VRAM Governor Evict Notice]: {e}")
+            return False
+
+    def get_keep_alive(self, model_name: str, purpose: str = "chat") -> str:
+        """
+        Dynamic VRAM Keep-Alive Management (Task 6):
+        - Pass '15m' for primary conversational model (qwen3:8b).
+        - Pass '0s' for ephemeral routing/classification queries or secondary models
+          (qwen2.5-coder:7b, router, vision) so secondary models release their VRAM immediately.
+        """
+        clean_model = (model_name or "").lower().strip()
+        clean_purpose = (purpose or "").lower().strip()
+        if clean_purpose in ("routing", "classification", "ephemeral", "router", "classify"):
+            return "0s"
+        if any(sec in clean_model for sec in ["coder", "vl", "router"]):
+            return "0s"
+        if "qwen3:8b" in clean_model or clean_purpose == "chat":
+            return "15m"
+        return "0s"
+
     def is_gaming_lite_mode(self) -> bool:
         """Returns True if Gaming Lite Mode is currently active."""
         with self._lock:
@@ -130,7 +166,28 @@ class VRAMAutoGovernor:
         Immediately flushes qwen3:8b and qwen2.5vl:7b from GPU VRAM.
         """
         results = {}
-        models_to_flush = ["qwen3:8b", "qwen2.5vl:7b", "qwen2.5-coder:7b"]
+        has_large_vram = False
+        try:
+            import torch
+            if torch.cuda.is_available():
+                total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                if total_gb >= 11.5:
+                    has_large_vram = True
+        except Exception:
+            pass
+
+        if has_large_vram:
+            models_to_flush = ["qwen2.5vl:7b", "qwen2.5-coder:7b"]
+            try:
+                requests.post(
+                    f"{self.ollama_url}/api/generate",
+                    json={"model": "qwen3:8b", "keep_alive": "24h"},
+                    timeout=2.0
+                )
+            except Exception:
+                pass
+        else:
+            models_to_flush = ["qwen3:8b", "qwen2.5vl:7b", "qwen2.5-coder:7b"]
         for m in models_to_flush:
             if dry_run:
                 results[m] = "dry_run_flushed"

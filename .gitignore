@@ -3,6 +3,7 @@ venv/
 __pycache__/
 *.py[cod]
 .env
+config.local.json
 
 # Personal configuration & spatial anchors
 assets/user_profile.json

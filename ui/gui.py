@@ -54,6 +54,16 @@ def _handle_uncaught_exception(exc_type, exc_value, exc_traceback):
 
 sys.excepthook = _handle_uncaught_exception
 
+# GPU Angle / D3D11 Context Reset Resilience for QtWebEngine / WebGL Orb
+os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
+    "--disable-gpu-watchdog "
+    "--enable-webgl "
+    "--ignore-gpu-blocklist "
+    "--enable-gpu-rasterization "
+    "--disable-direct-composition "
+    "--use-angle=d3d11"
+)
+
 # =====================================================================
 # ATOMIC WINDOWS SINGLE-INSTANCE GUARD (ZERO IMPORT LATENCY)
 # =====================================================================
@@ -180,11 +190,11 @@ class CyberAudioVisualizer(QWidget):
 
             gradient = QLinearGradient(x, y, x, y + bar_h)
             if self.is_active:
-                gradient.setColorAt(0.0, QColor(0, 255, 204, 255))
-                gradient.setColorAt(1.0, QColor(138, 43, 226, 200))
+                gradient.setColorAt(0.0, QColor(56, 189, 248, 255))
+                gradient.setColorAt(1.0, QColor(129, 140, 248, 200))
             else:
-                gradient.setColorAt(0.0, QColor(0, 229, 255, 120))
-                gradient.setColorAt(1.0, QColor(15, 30, 60, 180))
+                gradient.setColorAt(0.0, QColor(148, 163, 184, 80))
+                gradient.setColorAt(1.0, QColor(39, 39, 42, 120))
 
             painter.setBrush(QBrush(gradient))
             painter.setPen(Qt.PenStyle.NoPen)
@@ -201,6 +211,7 @@ class VoiceAssistantWorker(QThread):
     orb_state_signal = pyqtSignal(str)
     core_response_signal = pyqtSignal(dict)
     notification_signal = pyqtSignal(str, str)
+    game_state_changed = pyqtSignal(bool)
 
     def __init__(self, raw_chime_pcm: bytes = b""):
         super().__init__()
@@ -266,6 +277,33 @@ class VoiceAssistantWorker(QThread):
         stt = SpeechToText()
         self.telemetry_update.emit("STT_ENGINE", f"WHISPER [{stt.device.upper()}]")
 
+        # Guarantee Ollama daemon is active before initializing LocalLLM
+        try:
+            import httpx
+            _ollama_ok = False
+            try:
+                _ollama_ok = (httpx.get("http://localhost:11434/api/tags", timeout=1.5).status_code == 200)
+            except Exception:
+                pass
+            if not _ollama_ok:
+                _local_app = os.environ.get("LOCALAPPDATA", "")
+                _ollama_exe = os.path.join(_local_app, "Programs", "Ollama", "ollama.exe")
+                if os.path.exists(_ollama_exe):
+                    import subprocess
+                    _cflags = 0x08000000 | 0x00000008  # CREATE_NO_WINDOW | DETACHED_PROCESS
+                    subprocess.Popen([_ollama_exe, "serve"], creationflags=_cflags, close_fds=True)
+                    print("[Ollama] Auto-launched Ollama daemon into background.")
+                    for _ in range(10):
+                        time.sleep(0.5)
+                        try:
+                            if httpx.get("http://localhost:11434/api/tags", timeout=1.0).status_code == 200:
+                                print("[Ollama] Daemon online verified.")
+                                break
+                        except Exception:
+                            pass
+        except Exception as _o_err:
+            print(f"[Ollama Auto-Start Notice]: {_o_err}")
+
         llm = LocalLLM()
         if self.attached_file_path:
             llm.attached_file_path = self.attached_file_path
@@ -276,6 +314,12 @@ class VoiceAssistantWorker(QThread):
         # Attach hardware engines to llm so remote web agent can access GPU Whisper and Kokoro
         llm.tts = tts
         llm.stt = stt
+        self.stt = stt
+        try:
+            from core.dictation import get_dictation_controller
+            get_dictation_controller(stt_engine=stt)
+        except Exception:
+            pass
 
         # Launch Remote Web Agent & Mobile PWA server in daemon thread (Phase 10)
         try:
@@ -669,6 +713,7 @@ class VoiceAssistantWorker(QThread):
                             if curr_game != is_game_active:
                                 is_game_active = curr_game
                                 ww_booster.set_game_mode(is_game_active)
+                                self.game_state_changed.emit(is_game_active)
                                 if is_game_active:
                                     try:
                                         if hasattr(self, "audio_ducker"):
@@ -947,6 +992,16 @@ class VoiceAssistantWorker(QThread):
             # Grab final voice response formulated and executed by LocalLLM
             voice_msg = response_data.get("voice_response", "Understood.")
 
+            # Emit live desktop step-by-step thought process and Computer-Use action trace
+            agent_trace = response_data.get("agent_trace") or []
+            t_steps = response_data.get("thought_steps") or []
+            if agent_trace:
+                for trace_item in agent_trace:
+                    self.log_received.emit("STEP", json.dumps(trace_item))
+            elif t_steps:
+                for s_item in t_steps:
+                    self.log_received.emit("THOUGHT_STEP", json.dumps(s_item))
+
             self.log_received.emit("LIBRA", voice_msg)
             if not self.mute_tts:
                 try:
@@ -1088,18 +1143,28 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.memory_vault_dialog = None
         self.spotlight_bar = None
         self.dictation_controller = None
+        # Dynamically check if a protected game is actually running
+        from core.vram_governor import get_vram_governor
+        gov = get_vram_governor()
+        self.anti_cheat_safe_mode = bool(gov and gov.is_gaming_lite_mode())
         if start_worker:
             try:
                 self.spotlight_bar = SpotlightBar(parent=None)
+                if self.anti_cheat_safe_mode:
+                    self.spotlight_bar.pause_hotkeys()
             except Exception as e:
                 print(f"[GUI Warning] SpotlightBar init: {e}")
                 self.spotlight_bar = None
             try:
                 self.dictation_controller = get_dictation_controller()
                 self.dictation_controller.start()
+                if self.anti_cheat_safe_mode:
+                    self.dictation_controller.pause()
             except Exception as e:
                 print(f"[GUI Warning] DictationController init: {e}")
                 self.dictation_controller = None
+            if self.anti_cheat_safe_mode:
+                print("[Anti-Cheat Safe Mode] Game active at startup. Hotkeys paused until game closes.")
 
         self.init_ui()
         _ = self.winId()
@@ -1109,64 +1174,67 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             self.init_worker()
 
     def init_ui(self):
-        self.setWindowTitle("LIBRA // CYBERNETIC NEURAL INTERFACE")
+        self.setWindowTitle("Project Libra")
         self.resize(1180, 780)
-        self.setStyleSheet("background-color: #04070f;")
+        self.setStyleSheet("background-color: #09090b; color: #f8fafc; font-family: 'Segoe UI', -apple-system, sans-serif;")
 
         central = QWidget(self)
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(20, 18, 20, 18)
-        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(20, 16, 20, 16)
+        main_layout.setSpacing(12)
 
-        # 1. Header
+        # 1. Header (High-Class Minimalist)
         header = QHBoxLayout()
+        header.setSpacing(12)
+
         title_box = QVBoxLayout()
-        title_label = QLabel("LIBRA AI // NEURAL TERMINAL")
-        title_label.setFont(QFont("Consolas", 14, QFont.Weight.Bold))
-        title_label.setStyleSheet("color: #00ffcc; letter-spacing: 3px;")
-        sub_label = QLabel(f"QUANTUM REASONING CORE // ARCHITECTURE V{LIBRA_VERSION}")
-        sub_label.setFont(QFont("Consolas", 8))
-        sub_label.setStyleSheet("color: #0088aa; letter-spacing: 1.5px;")
+        title_box.setSpacing(1)
+        title_label = QLabel("✦ Libra")
+        title_label.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        title_label.setStyleSheet("color: #ffffff; letter-spacing: -0.3px;")
+        sub_label = QLabel(f"Local AI Companion · Architecture v{LIBRA_VERSION}")
+        sub_label.setFont(QFont("Segoe UI", 9))
+        sub_label.setStyleSheet("color: #71717a;")
         title_box.addWidget(title_label)
         title_box.addWidget(sub_label)
         header.addLayout(title_box)
 
         header.addStretch()
 
-        self.stat_box = QLabel("INFERENCE: NOMINAL | VRAM: ACTIVE")
-        self.stat_box.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
-        self.stat_box.setStyleSheet(
-            "color: #00e5ff; background: #0c1524; border: 1px solid #142845; border-radius: 4px; padding: 6px 12px;"
-        )
-        self.vault_btn = QPushButton("◈ MEMORY VAULT")
-        self.vault_btn.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        self.vault_btn = QPushButton("◈ Memory Vault")
+        self.vault_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
         self.vault_btn.setStyleSheet("""
             QPushButton {
-                background: #091322; color: #00ffcc;
-                border: 1px solid #142845; border-radius: 4px; padding: 6px 12px;
+                background: #18181b; color: #f4f4f5;
+                border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 6px; padding: 6px 14px;
             }
-            QPushButton:hover { background: #12253f; border-color: #00ffcc; }
+            QPushButton:hover { background: #27272a; border-color: rgba(255, 255, 255, 0.16); }
         """)
         self.vault_btn.setToolTip("Inspect and edit Memory Vault (Obsidian Markdown Sync at assets/vault/)")
         self.vault_btn.clicked.connect(self.open_memory_vault)
         header.addWidget(self.vault_btn)
+
+        self.stat_box = QLabel("● Online · RTX 5060 Ti")
+        self.stat_box.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
+        self.stat_box.setStyleSheet(
+            "color: #34d399; background: rgba(52, 211, 153, 0.08); border: 1px solid rgba(52, 211, 153, 0.2); border-radius: 6px; padding: 6px 12px;"
+        )
         header.addWidget(self.stat_box)
 
         self.clock_label = QLabel()
-        self.clock_label.setFont(QFont("Consolas", 10, QFont.Weight.Bold))
-        self.clock_label.setStyleSheet("color: #64748b; margin-left: 10px;")
+        self.clock_label.setFont(QFont("Segoe UI", 9))
+        self.clock_label.setStyleSheet("color: #71717a; margin-left: 6px;")
         header.addWidget(self.clock_label)
         main_layout.addLayout(header)
 
         # 2. Status Banner
-        self.status_banner = QLabel("SYSTEM INITIALIZING...")
+        self.status_banner = QLabel("Ready")
         self.status_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_banner.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+        self.status_banner.setFont(QFont("Segoe UI", 10, QFont.Weight.Medium))
         self.status_banner.setStyleSheet("""
-            background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #091322, stop:0.5 #13243d, stop:1 #091322);
-            color: #00ffcc; border: 1px solid #00e5ff; border-radius: 6px;
-            padding: 9px; letter-spacing: 2px;
+            background: #18181b; color: #cbd5e1; border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 8px; padding: 8px;
         """)
         main_layout.addWidget(self.status_banner)
 
@@ -1175,9 +1243,9 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         workspace.setSpacing(14)
 
         orb_container = QFrame()
-        orb_container.setStyleSheet("background-color: #030708; border: 1px solid #142238; border-radius: 8px;")
+        orb_container.setStyleSheet("background-color: #121215; border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 12px;")
         orb_layout = QVBoxLayout(orb_container)
-        orb_layout.setContentsMargins(4, 4, 4, 4)
+        orb_layout.setContentsMargins(6, 6, 6, 6)
 
         self.orb_view = QWebEngineView()
         self.orb_view.setStyleSheet("background: transparent;")
@@ -1200,29 +1268,29 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
         self.terminal = QTextEdit()
         self.terminal.setReadOnly(True)
-        self.terminal.setFont(QFont("Consolas", 10))
+        self.terminal.setFont(QFont("Segoe UI", 10))
         self.terminal.setStyleSheet("""
-            background-color: #04060c; color: #cbd5e1;
-            border: 1px solid #152238; border-radius: 8px;
-            padding: 12px; line-height: 1.5;
+            background-color: #121215; color: #f1f5f9;
+            border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 12px;
+            padding: 14px; line-height: 1.6;
         """)
         chat_telemetry_row.addWidget(self.terminal, stretch=7)
 
         sidebar = QVBoxLayout()
         sidebar.setSpacing(6)
-        sidebar_title = QLabel("SYSTEM TELEMETRY")
-        sidebar_title.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-        sidebar_title.setStyleSheet("color: #00ffcc; border-bottom: 1px solid #152238; padding-bottom: 2px;")
+        sidebar_title = QLabel("SYSTEM METRICS")
+        sidebar_title.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        sidebar_title.setStyleSheet("color: #71717a; border-bottom: 1px solid rgba(255, 255, 255, 0.08); padding-bottom: 4px; text-transform: uppercase;")
         sidebar.addWidget(sidebar_title)
 
         self.telemetry_labels = {}
         for key in ["WAKEWORD", "STT_ENGINE", "STT_LATENCY", "LLM_CORE", "LLM_LATENCY", "TTS_ENGINE", "VAD_DETECTOR", "WEB_AGENT"]:
             k_lbl = QLabel(key.replace("_", " "))
-            k_lbl.setFont(QFont("Consolas", 7))
-            k_lbl.setStyleSheet("color: #475569;")
+            k_lbl.setFont(QFont("Segoe UI", 7))
+            k_lbl.setStyleSheet("color: #71717a;")
             v_lbl = QLabel("--")
-            v_lbl.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
-            v_lbl.setStyleSheet("color: #38bdf8; margin-bottom: 3px;")
+            v_lbl.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            v_lbl.setStyleSheet("color: #e2e8f0; margin-bottom: 3px;")
             sidebar.addWidget(k_lbl)
             sidebar.addWidget(v_lbl)
             self.telemetry_labels[key] = v_lbl
@@ -1230,9 +1298,9 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         sidebar.addStretch()
         space_badge = QLabel("[CTRL + SPACE] INTERRUPT")
         space_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        space_badge.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        space_badge.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         space_badge.setStyleSheet(
-            "background: #111d2e; color: #f59e0b; border: 1px dashed #d97706; border-radius: 4px; padding: 4px;"
+            "background: rgba(251, 191, 36, 0.08); color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.25); border-radius: 6px; padding: 5px;"
         )
         sidebar.addWidget(space_badge)
 
@@ -1243,65 +1311,65 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         main_layout.addLayout(workspace)
 
         # 4. Status/Transcript Subtitle Label
-        self.subtitle_label = QLabel("LIBRA // SYSTEM READY — AWAITING VOCAL PROMPT, COMMAND INPUT, OR FILE DROP")
-        self.subtitle_label.setFont(QFont("Consolas", 9))
+        self.subtitle_label = QLabel("Ready — Awaiting vocal prompt, typed command, or file drop")
+        self.subtitle_label.setFont(QFont("Segoe UI", 9))
         self.subtitle_label.setStyleSheet("""
-            background-color: #070c18; color: #38bdf8;
-            border: 1px solid #142845; border-radius: 4px;
-            padding: 6px 12px;
+            background-color: #121215; color: #94a3b8;
+            border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px;
+            padding: 8px 14px;
         """)
         main_layout.addWidget(self.subtitle_label)
 
-        # 5. Bottom Cyberpunk Command Bar: [📎 FILE] [ QLineEdit ] [🔊 AUDIO]
+        # 5. Bottom Modern Command Bar: [📎 Attach] [ QLineEdit ] [🔊 Mute]
         bottom_bar = QHBoxLayout()
         bottom_bar.setSpacing(8)
 
-        self.attach_btn = QPushButton("📎 FILE")
-        self.attach_btn.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        self.attach_btn = QPushButton("📎 Attach")
+        self.attach_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
         self.attach_btn.setToolTip("Attach a local file (.pdf, .docx, .txt, .py) for auto-security scanning and Q&A")
         self.attach_btn.setStyleSheet("""
             QPushButton {
-                background-color: #0c1829; color: #00ffcc;
-                border: 1px solid #142a47; border-radius: 5px;
-                padding: 8px 14px;
+                background-color: #18181b; color: #e2e8f0;
+                border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px;
+                padding: 8px 16px;
             }
             QPushButton:hover {
-                background-color: #12253f; border-color: #00ffcc;
+                background-color: #27272a; border-color: rgba(255, 255, 255, 0.16);
             }
         """)
         self.attach_btn.clicked.connect(self.open_file_dialog)
         bottom_bar.addWidget(self.attach_btn)
 
         self.input_box = QLineEdit()
-        self.input_box.setPlaceholderText("Type a command, ask a question, or drop a file here...")
-        self.input_box.setFont(QFont("Consolas", 10))
+        self.input_box.setPlaceholderText("Message Libra or drop a file here...")
+        self.input_box.setFont(QFont("Segoe UI", 10))
         self.input_box.setStyleSheet("""
             QLineEdit {
-                background-color: #050a14; color: #f1f5f9;
-                border: 1px solid #15263f; border-radius: 5px;
-                padding: 8px 12px; selection-background-color: #00ffcc;
-                selection-color: #050a14;
+                background-color: #18181b; color: #f8fafc;
+                border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 8px;
+                padding: 8px 14px; selection-background-color: #38bdf8;
+                selection-color: #09090b;
             }
             QLineEdit:focus {
-                border: 1px solid #00ffcc;
+                border: 1px solid #38bdf8;
             }
         """)
         self.input_box.returnPressed.connect(self.submit_typed_text)
         bottom_bar.addWidget(self.input_box, stretch=8)
 
-        self.mute_btn = QPushButton("🔊 AUDIO")
+        self.mute_btn = QPushButton("🔊 Audio")
         self.mute_btn.setCheckable(True)
-        self.mute_btn.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        self.mute_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
         self.mute_btn.setToolTip("Toggle silent text-only replies (Mute Kokoro TTS)")
         self.mute_btn.setStyleSheet("""
             QPushButton {
-                background-color: #0c1829; color: #38bdf8;
-                border: 1px solid #142a47; border-radius: 5px;
+                background-color: #18181b; color: #94a3b8;
+                border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px;
                 padding: 8px 14px;
             }
             QPushButton:checked {
-                background-color: #2a111b; color: #f43f5e;
-                border: 1px solid #e11d48;
+                background-color: rgba(248, 113, 113, 0.15); color: #f87171;
+                border: 1px solid rgba(248, 113, 113, 0.3);
             }
         """)
         self.mute_btn.toggled.connect(self.toggle_mute)
@@ -1315,21 +1383,17 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         footer_layout.setSpacing(10)
 
         self.version_label = QLabel()
-        self.version_label.setFont(QFont("Consolas", 8))
+        self.version_label.setFont(QFont("Segoe UI", 8))
         self.version_label.setTextFormat(Qt.TextFormat.RichText)
         self.version_label.setCursor(Qt.CursorShape.PointingHandCursor)
         footer_layout.addWidget(self.version_label)
 
         footer_layout.addStretch()
 
-        self.reloader_meta_label = QLabel("WATCHDOG: CODE RELOADER ACTIVE")
-        self.reloader_meta_label.setFont(QFont("Consolas", 8))
-        self.reloader_meta_label.setStyleSheet("color: #334155; letter-spacing: 1px;")
-        self.reloader_meta_label.setToolTip(
-            "Live source code observer powered by watchdog.\n"
-            "Any saved modifications to .py or .html files validate AST syntax\n"
-            "and automatically hot-reload Project Libra."
-        )
+        self.reloader_meta_label = QLabel("WATCHDOG ACTIVE")
+        self.reloader_meta_label.setFont(QFont("Segoe UI", 8))
+        self.reloader_meta_label.setStyleSheet("color: #52525b;")
+        self.reloader_meta_label.setToolTip("Live source code observer powered by watchdog. Any saved modifications to .py or .html files validate AST syntax and automatically hot-reload Project Libra.")
         footer_layout.addWidget(self.reloader_meta_label)
 
         main_layout.addLayout(footer_layout)
@@ -1511,6 +1575,51 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             color = "#38bdf8"
             bg = "#080d19"
             self.subtitle_label.setText(f"USER: {msg}")
+        elif sender == "STEP":
+            try:
+                st = json.loads(msg) if isinstance(msg, str) and msg.startswith("{") else {}
+            except Exception:
+                st = {}
+            step_i = st.get("step", 1)
+            action = str(st.get("action", "act")).upper()
+            thought = st.get("thought", msg)
+            status = st.get("status", "completed")
+            badge_color = "#38bdf8" if action == "CLICK" else ("#a855f7" if action == "TYPE" else ("#ec4899" if action == "PRESS" else "#10b981"))
+            if status == "corrected":
+                badge_color = "#f59e0b"
+
+            html_step = f"""
+            <div style='margin-bottom: 6px; padding: 6px 10px; background: #0b1120; border-left: 3px solid {badge_color}; border-radius: 4px;'>
+                <span style='color: {badge_color}; font-weight: bold; font-size: 11px;'>[STEP {step_i}: {action}]</span>
+                <span style='color: #f1f5f9; font-size: 12px; margin-left: 6px;'>{html.escape(thought)}</span>
+            </div>
+            """
+            self.terminal.append(html_step)
+            self.terminal.verticalScrollBar().setValue(self.terminal.verticalScrollBar().maximum())
+            self.subtitle_label.setText(f"LIBRA [STEP {step_i}]: {thought[:100]}")
+            return
+        elif sender == "THOUGHT_STEP":
+            try:
+                st = json.loads(msg) if isinstance(msg, str) and msg.startswith("{") else {}
+            except Exception:
+                st = {}
+            title = st.get("title", "THOUGHT")
+            detail = st.get("detail", msg)
+            status = st.get("status", "completed")
+            border_c = "#f59e0b" if status == "corrected" else "#a855f7"
+
+            html_thought = f"""
+            <div style='margin-bottom: 6px; padding: 6px 10px; background: #0e0a1e; border-left: 3px solid {border_c}; border-radius: 4px;'>
+                <span style='color: {border_c}; font-weight: bold; font-size: 11px;'>🧠 {html.escape(title)}</span>
+                <span style='color: #e2e8f0; font-size: 12px; margin-left: 6px;'>{html.escape(detail)}</span>
+            </div>
+            """
+            self.terminal.append(html_thought)
+            self.terminal.verticalScrollBar().setValue(self.terminal.verticalScrollBar().maximum())
+            return
+        elif sender == "THOUGHT":
+            color = "#a855f7"
+            bg = "#0f091d"
         elif sender == "SECURITY":
             color = "#f43f5e"
             bg = "#1f0a10"
@@ -1543,6 +1652,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.worker.orb_state_signal.connect(self.set_orb_state)
         self.worker.core_response_signal.connect(self.handle_core_response)
         self.worker.notification_signal.connect(self.show_notification)
+        self.worker.game_state_changed.connect(self._on_game_state_changed)
         self.worker.start()
 
     def _create_default_tray_icon(self) -> QIcon:
@@ -1666,10 +1776,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
                 attached = bool(user32.AttachThreadInput(cur_thread, fg_thread, True))
 
             try:
-                # VK_MENU (Alt key) pulse to acquire foreground lock
-                user32.keybd_event(0x12, 0, 0, 0)
-                user32.keybd_event(0x12, 0, 2, 0)
-
+                # Anti-Cheat Safe Mode: Never call user32.keybd_event when bringing window to top
                 user32.BringWindowToTop(hwnd)
                 user32.SetForegroundWindow(hwnd)
             finally:
@@ -1838,6 +1945,34 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             self.worker.stop()
             self.worker.wait()
         QApplication.quit()
+
+    def _on_game_state_changed(self, is_game_active: bool):
+        self.anti_cheat_safe_mode = is_game_active
+        if is_game_active:
+            print("[Anti-Cheat Safe Mode] Game detected. Pausing global hotkeys to ensure 0 anti-cheat hooks.")
+            if self.spotlight_bar and hasattr(self.spotlight_bar, "pause_hotkeys"):
+                self.spotlight_bar.pause_hotkeys()
+            if self.dictation_controller and hasattr(self.dictation_controller, "pause"):
+                self.dictation_controller.pause()
+        else:
+            print("[Anti-Cheat Safe Mode] Game closed. Restoring global hotkeys [Alt+Space], [Ctrl+Shift+L], [Ctrl+Alt+D].")
+            if self.spotlight_bar is None:
+                try:
+                    self.spotlight_bar = SpotlightBar(parent=None)
+                except Exception as e:
+                    print(f"[SpotlightBar Restore Warning]: {e}")
+            elif hasattr(self.spotlight_bar, "resume_hotkeys"):
+                self.spotlight_bar.resume_hotkeys()
+
+            if self.dictation_controller is None:
+                try:
+                    stt_inst = getattr(self.worker, "stt", None) if hasattr(self, "worker") else None
+                    self.dictation_controller = get_dictation_controller(stt_engine=stt_inst)
+                    self.dictation_controller.start()
+                except Exception as e:
+                    print(f"[DictationController Restore Warning]: {e}")
+            elif hasattr(self.dictation_controller, "resume"):
+                self.dictation_controller.resume()
 
     def closeEvent(self, event):
         if self.tray_icon and self.tray_icon.isVisible():

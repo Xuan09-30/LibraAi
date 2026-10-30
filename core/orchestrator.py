@@ -9,6 +9,7 @@ from core.llm import LocalLLM
 from core.text_cleaner import normalize_for_tts
 from core.telemetry import profiler
 from core.dispatcher import is_weather_intent, dispatch_weather
+from tools.computer_use_agent import AutonomousComputerUseAgent
 
 
 def normalize_trigger(text: str) -> str:
@@ -22,6 +23,7 @@ def normalize_trigger(text: str) -> str:
 
 BLOCKED_REMOTE_ACTIONS = {
     "gui_action",
+    "computer_use_agent",
     "open_app",
     "close_app",
     "shutdown",
@@ -163,7 +165,9 @@ class SupervisorHub:
         single complex requests (e.g., explicit web searches, relative clauses).
         Capped at MAX_STEPS (4).
         """
-        # Preserve explicit compound web search idioms, Spotify play idioms, and unified data science requests
+        # Preserve multi-step Computer-Use ReAct prompts and explicit compound web search idioms
+        if AutonomousComputerUseAgent.is_computer_use_prompt(prompt):
+            return [prompt]
         if re.search(r"open\s+(?:my\s+)?(?:google|chrome|browser)\s+and\s+search", prompt, re.IGNORECASE):
             return [prompt]
         if re.search(r"\b(?:open|launch|start|play)\s+(?:my\s+)?spotify\s+(?:and|to)\s+(?:play|place)\b", prompt, re.IGNORECASE):
@@ -237,6 +241,18 @@ class SupervisorHub:
             if hasattr(self.llm, "monitor"):
                 metrics = self.llm.monitor.get_system_metrics()
                 return {"action": "system_status", "status": "success", "voice_response": f"Current system status: {metrics['summary']}", "metrics": metrics}
+        elif action == "daily_briefing":
+            brief = getattr(self.llm, "briefing_and_workspaces", None) or getattr(self.llm, "briefing_engine", None)
+            if brief:
+                res_b = brief.generate_briefing(dry_run=dry_run)
+                voice_str = str(res_b)
+                return {
+                    "action": "daily_briefing",
+                    "status": "success",
+                    "voice_response": voice_str,
+                    "briefing": voice_str,
+                    "components": res_b.get("components", {}) if hasattr(res_b, "get") else {}
+                }
         step_prompt = args.get("prompt") or action
         res = self.llm.plan(step_prompt, dry_run=dry_run)
         if isinstance(res, tuple):
@@ -336,7 +352,7 @@ class SupervisorHub:
         sub_steps = self.split_compound_intent(prompt)
 
         # PREACT DETERMINISTIC ACTION MACRO FAST-PATH (<5ms)
-        _DYNAMIC_NO_MACRO_ACTIONS = {"chat", "clarify", "error", "active_window", "weather", "world_time", "time", "run_learned_skill"}
+        _DYNAMIC_NO_MACRO_ACTIONS = {"chat", "clarify", "error", "active_window", "weather", "world_time", "time", "run_learned_skill", "lookup_entity", "web_search", "deep_research", "computer_use_agent", "daily_briefing"}
         if len(sub_steps) == 1 and hasattr(self.llm, "memory") and hasattr(self.llm.memory, "get_action_macro"):
             cached_macro = self.llm.memory.get_action_macro(norm_trigger)
             if cached_macro and cached_macro.get("success_count", 0) >= 2:
@@ -487,7 +503,7 @@ class SupervisorHub:
             successful_chain = [
                 {"action": r.get("action"), "args": r.get("args", {})}
                 for r in step_results
-                if r.get("action") and r.get("action") not in ["chat", "clarify", "error", "active_window", "weather"] and r.get("status") != "error"
+                if r.get("action") and r.get("action") not in ["chat", "clarify", "error", "active_window", "weather", "daily_briefing"] and r.get("status") != "error"
             ]
             if successful_chain and len(successful_chain) == len(step_results):
                 if hasattr(self.llm, "memory") and hasattr(self.llm.memory, "record_action_macro"):

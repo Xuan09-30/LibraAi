@@ -19,7 +19,7 @@ If Not fso.FileExists(pythonwPath) Then
 End If
 
 wsh.CurrentDirectory = projectDir
-cmd = """" & pythonwPath & """ -m ui.gui --hidden"
+cmd = """" & pythonwPath & """ """ & projectDir & "\ui\gui.py"" --hidden"
 
 wsh.Run cmd, 0, False
 

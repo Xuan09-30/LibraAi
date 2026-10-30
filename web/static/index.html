@@ -9,7 +9,8 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="icon" type="image/png" href="/static/icon.png">
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=10.2.5">
+  <link rel="stylesheet" href="/static/prism.css?v=10.2.5">
   <script src="/static/three.min.js"></script>
 </head>
 <body>
@@ -21,7 +22,7 @@
     <aside id="drawer">
       <div class="drawer-header">
         <div class="drawer-branding">
-          <span class="brand-title">LIBRA AI</span>
+          <span class="brand-title">Libra</span>
           <button id="close-drawer-btn" class="close-drawer-btn" title="Close Drawer">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <line x1="18" y1="6" x2="6" y2="18"/>
@@ -30,11 +31,14 @@
           </button>
         </div>
         <button id="new-chat-btn" class="new-chat-btn">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <line x1="12" y1="5" x2="12" y2="19"/>
-            <line x1="5" y1="12" x2="19" y2="12"/>
-          </svg>
-          <span>New Chat</span>
+          <div class="new-chat-left">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <line x1="12" y1="5" x2="12" y2="19"/>
+              <line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+            <span>New chat</span>
+          </div>
+          <span class="kbd-hint">Ctrl K</span>
         </button>
       </div>
 
@@ -43,9 +47,64 @@
         <!-- Injected dynamically by app.js -->
       </div>
 
+      <!-- HOST QUICK WORKSPACE TOOLS (ORGANIZED IN DRAWER) -->
+      <div id="drawer-host-tools" class="drawer-host-tools host-only-btn" style="display: none;">
+        <div class="drawer-section-title">⚡ HOST CONTROL DECK</div>
+        <div class="drawer-tools-grid">
+          <button id="briefing-nav-btn" class="drawer-tool-btn" title="Daily Tactical Briefing">
+            <span>⚡ Daily Briefing</span>
+          </button>
+          <button id="vault-nav-btn" class="drawer-tool-btn" title="Memory Vault (Obsidian Sync)">
+            <span>◈ Memory Vault</span>
+          </button>
+          <button id="airdrop-nav-btn" class="drawer-tool-btn" title="AirDrop Bridge (Phone <-> PC)">
+            <span>✈ AirDrop Bridge</span>
+          </button>
+          <button id="game-shield-btn" class="drawer-tool-btn" title="Live Gaming & Audio Shield Control">
+            <span>🎮 Gaming Shield</span>
+          </button>
+          <button id="cmd-palette-btn" class="drawer-tool-btn" title="Command Palette (Ctrl + K)">
+            <span>⌘ Command Palette</span>
+          </button>
+          <button id="invite-nav-btn" class="drawer-tool-btn" title="Guest Invites & Public Access Tunnel">
+            <span>🔑 Guest Invites</span>
+          </button>
+          <button id="users-nav-btn" class="drawer-tool-btn" title="User Management & Role Permissions">
+            <span>👥 User Permissions</span>
+          </button>
+          <button id="drawer-token-telemetry-btn" class="drawer-tool-btn" title="GPU Token Telemetry & Context Stats">
+            <span>📊 GPU Telemetry</span>
+          </button>
+        </div>
+      </div>
+
       <div class="drawer-footer">
-        <span>V10.2.0</span>
-        <span class="scope-pill">REMOTE WEB</span>
+        <div class="user-profile-badge" id="user-profile-badge">
+          <div class="user-avatar-circle" id="user-avatar-initial">U</div>
+          <div class="user-meta-block">
+            <span class="user-email-text" id="user-email-text">Guest User</span>
+            <span class="user-role-label" id="user-role-label">Guest</span>
+          </div>
+          <button id="manage-users-drawer-btn" class="manage-users-icon-btn host-only-btn" title="User Management (Host Only)" style="display: none;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+              <circle cx="9" cy="7" r="4"></circle>
+              <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+              <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+            </svg>
+          </button>
+          <button id="sign-out-btn" class="sign-out-btn" title="Sign Out">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path>
+              <polyline points="16 17 21 12 16 7"></polyline>
+              <line x1="21" y1="12" x2="9" y2="12"></line>
+            </svg>
+          </button>
+        </div>
+        <div class="drawer-version-row">
+          <span>V10.2.0</span>
+          <span class="scope-pill">REMOTE WEB</span>
+        </div>
       </div>
     </aside>
 
@@ -74,31 +133,19 @@
         </div>
 
         <div class="header-right">
-          <!-- PHASE 12 COMMAND PALETTE & GAME SHIELD -->
-          <button id="cmd-palette-btn" class="header-action-btn" title="Command Palette (Ctrl + K)">
-            <span>⌘ Cmd</span>
-          </button>
-          <button id="game-shield-btn" class="header-action-btn" title="Live Gaming & Audio Shield Control">
-            <span>🎮 Shield</span>
-          </button>
-          <!-- PHASE 11 QUICK NAV BUTTONS -->
-          <button id="briefing-nav-btn" class="header-action-btn" title="Daily Tactical Briefing">
-            <span>⚡ Brief</span>
-          </button>
-          <button id="vault-nav-btn" class="header-action-btn" title="Memory Vault (Obsidian Sync)">
-            <span>◈ Vault</span>
-          </button>
-          <button id="airdrop-nav-btn" class="header-action-btn" title="AirDrop Bridge (Phone <-> PC)">
-            <span>✈ Drop</span>
-          </button>
-          <button id="bug-nav-btn" class="header-action-btn" title="Report a Bug or View Friend Feedback">
+          <!-- BUG REPORT BUTTON (AVAILABLE TO ALL TESTERS & HOST) -->
+          <button id="bug-nav-btn" class="header-action-btn" title="Report a Bug / Host Bug Reports">
             <span>🐞 Bug</span>
+            <span id="bug-badge" class="nav-counter-badge" style="display: none;">0</span>
           </button>
-          <button id="invite-nav-btn" class="header-action-btn" title="Guest Invites & Dual-Tunnel (Cloudflare + Tailscale)">
-            <span>🔑 Invite</span>
+
+          <!-- OPTIONS & SETTINGS BUTTON -->
+          <button id="options-nav-btn" class="header-action-btn" title="System Options, Custom Instructions & Host Tools">
+            <span>⚙️ Options</span>
           </button>
-          <!-- TOKEN TELEMETRY HUD BUTTON -->
-          <button id="token-hud-btn" class="token-hud-btn" title="View Real-Time GPU Token Telemetry">
+
+          <!-- HIDDEN TELEMETRY ANCHOR (ACCESSIBLE VIA HOST DRAWER & OPTIONS MODAL) -->
+          <button id="token-hud-btn" class="token-hud-btn host-only-btn" title="View Real-Time GPU Token Telemetry" style="display: none !important;">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
               <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/>
             </svg>
@@ -113,21 +160,21 @@
             <span>STOP VOICE</span>
           </button>
 
-          <!-- HARDWARE VITALS -->
-          <div class="vitals-pill" id="vitals-container">
+          <!-- HARDWARE VITALS (HOST ONLY) -->
+          <div class="vitals-pill host-only-btn" id="vitals-container" style="display: none;">
             <div class="vitals-dot"></div>
             <span id="vitals-text">RTX 5060 Ti | CONNECTING...</span>
           </div>
         </div>
       </header>
 
-      <!-- 3D CYBERNETIC ORB DISPLAY -->
+      <!-- 3D AMBIENT ORB DISPLAY (ACTIVE VOICE / THINKING HEADER) -->
       <section id="orb-section">
         <canvas id="orb-canvas"></canvas>
-        <div class="orb-status-text" id="orb-status">STANDBY // READY</div>
+        <div class="orb-status-text" id="orb-status">Ready</div>
       </section>
 
-      <!-- CHAT MESSAGE STAGE -->
+      <!-- CHAT MESSAGE STAGE (CENTERED STREAM) -->
       <main id="chat-container">
         <!-- Dynamically populated by switchSession() -->
       </main>
@@ -135,47 +182,60 @@
       <!-- AUDIO ELEMENT FOR KOKORO TTS PLAYBACK -->
       <audio id="remote-audio" preload="auto"></audio>
 
-      <!-- ATTACHMENT PREVIEW TRAY (FOR IMAGES, PDFS & DOCS) -->
-      <div id="attachment-tray" class="attachment-tray" style="display: none;">
-        <div class="attachment-chip">
-          <div id="attachment-thumb" class="attachment-thumb"></div>
-          <div class="attachment-meta">
-            <span id="attachment-name" class="attachment-name">document.pdf</span>
-            <span id="attachment-status" class="attachment-status">Ready to analyze</span>
+      <!-- FLOATING INPUT WRAPPER (GEMINI / CLAUDE / CHATGPT CAPSULE) -->
+      <div id="input-stage-wrapper">
+        <!-- ATTACHMENT PREVIEW TRAY -->
+        <div id="attachment-tray" class="attachment-tray" style="display: none;">
+          <div class="attachment-chip">
+            <div id="attachment-thumb" class="attachment-thumb"></div>
+            <div class="attachment-meta">
+              <span id="attachment-name" class="attachment-name">document.pdf</span>
+              <span id="attachment-status" class="attachment-status">Ready to analyze</span>
+            </div>
+            <button id="remove-attachment-btn" class="remove-attachment-btn" title="Remove attachment">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="6" x2="6" y2="18"/>
+                <line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
           </div>
-          <button id="remove-attachment-btn" class="remove-attachment-btn" title="Remove attachment">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <line x1="18" y1="6" x2="6" y2="18"/>
-              <line x1="6" y1="6" x2="18" y2="18"/>
+        </div>
+
+        <footer id="input-bar">
+          <input type="file" id="file-input" style="display: none;" accept="image/*,.pdf,.doc,.docx,.txt,.md,.py,.csv,.json">
+          <button id="attach-btn" title="Attach Image or Document">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="12" y1="5" x2="12" y2="19"/>
+              <line x1="5" y1="12" x2="19" y2="12"/>
             </svg>
           </button>
-        </div>
+          <button id="mic-btn" title="Voice Input (Tap to Speak)">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+              <line x1="12" y1="19" x2="12" y2="23"/>
+              <line x1="8" y1="23" x2="16" y2="23"/>
+            </svg>
+          </button>
+          <input type="text" id="prompt-input" placeholder="Message Libra..." autocomplete="off">
+          <button id="send-btn" title="Send Message">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <line x1="12" y1="19" x2="12" y2="5"/>
+              <polyline points="5 12 12 5 19 12"/>
+            </svg>
+          </button>
+        </footer>
+        <div class="input-disclaimer">Libra can make mistakes. Verify important facts.</div>
       </div>
 
-      <!-- INPUT BAR -->
-      <footer id="input-bar">
-        <input type="file" id="file-input" style="display: none;" accept="image/*,.pdf,.doc,.docx,.txt,.md,.py,.csv,.json">
-        <button id="attach-btn" title="Attach Image or Document (PDF, Word, Code)">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-          </svg>
-        </button>
-        <button id="mic-btn" title="Tap to Record Voice">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-            <line x1="12" y1="19" x2="12" y2="23"/>
-            <line x1="8" y1="23" x2="16" y2="23"/>
-          </svg>
-        </button>
-        <input type="text" id="prompt-input" placeholder="Type message, upload photo/PDF, or tap mic..." autocomplete="off">
-        <button id="send-btn" title="Send Message">
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-            <line x1="22" y1="2" x2="11" y2="13"/>
-            <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-          </svg>
-        </button>
-      </footer>
+      <!-- FLOATING JUMP TO LATEST SCROLL BUTTON -->
+      <button id="scroll-to-bottom-btn" class="scroll-to-bottom-btn" title="Jump to latest message" style="display: none;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <line x1="12" y1="5" x2="12" y2="19"></line>
+          <polyline points="19 12 12 19 5 12"></polyline>
+        </svg>
+        <span>Latest</span>
+      </button>
     </div>
   </div>
 
@@ -231,6 +291,173 @@
             <div id="tok-saved-desc" class="token-card-sub">
               Bypassed via Markovian H-MEM context window &amp; Fast-Path PreAct macros
             </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ========================================================================
+       MODAL: OPTIONS, CUSTOM INSTRUCTIONS & SYSTEM CONTROL (PHASE 12)
+       ======================================================================== -->
+  <div id="options-modal" class="modal-overlay">
+    <div class="modal-content" style="max-width: 650px; width: 94%;">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span style="color: var(--neon-cyan);">⚙️ OPTIONS &amp; CUSTOM INSTRUCTIONS</span>
+        </div>
+        <button id="close-options-modal" class="modal-close-btn" title="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
+      <!-- OPTIONS TAB NAVIGATION -->
+      <div class="options-tab-bar">
+        <button class="options-tab-btn active" data-tab="tab-profile">👤 Profile &amp; Instructions</button>
+        <button class="options-tab-btn host-only-btn" data-tab="tab-invites" style="display: none;">🔑 Invites &amp; Tunnel</button>
+        <button class="options-tab-btn host-only-btn" data-tab="tab-github" style="display: none;">🐙 GitHub Sync</button>
+        <button class="options-tab-btn host-only-btn" data-tab="tab-users" style="display: none;">👥 Users</button>
+      </div>
+
+      <div class="modal-body" style="max-height: 440px; overflow-y: auto;">
+        <!-- TAB 1: USER PROFILE & CUSTOM INSTRUCTIONS & VOICE -->
+        <div id="tab-profile" class="options-tab-content active">
+          <!-- CARD A: VOICE OUTPUT SPEECH SETTING -->
+          <div class="options-settings-card">
+            <div class="options-card-left">
+              <span class="options-card-title">🔊 Voice Output (Speech Aloud)</span>
+              <span class="options-card-desc">Choose if Libra speaks aloud with neural voice (Kokoro-82M) or replies silently with text.</span>
+            </div>
+            <div class="options-card-right">
+              <label class="clean-switch">
+                <input type="checkbox" id="voice-speech-toggle" checked>
+                <span class="clean-slider"></span>
+              </label>
+            </div>
+          </div>
+          <div id="voice-status-note" class="voice-status-note">
+            🔊 <strong>Speaking Aloud:</strong> Libra speaks every answer using high-speed neural voice.
+          </div>
+
+          <!-- CARD B: PREFERENCES & IDENTITY -->
+          <div class="options-settings-section-title">👤 Personal Profile</div>
+          <p style="font-size: 12px; color: #a1a1aa; margin-bottom: 12px; line-height: 1.5;">
+            Personalize how Libra addresses you and customizes daily weather &amp; briefings.
+          </p>
+
+          <div style="display: flex; gap: 10px; margin-bottom: 12px;">
+            <div style="flex: 1;">
+              <label class="options-input-label">Preferred Name / Nickname</label>
+              <input type="text" id="prof-name-input" class="auth-input" placeholder="e.g. Alex, Chief, or Commander" style="margin: 0; width: 100%;">
+            </div>
+            <div style="width: 170px;">
+              <label class="options-input-label">Location (Weather/Time)</label>
+              <input type="text" id="prof-location-input" class="auth-input" placeholder="e.g. Kuala Lumpur" style="margin: 0; width: 100%;">
+            </div>
+          </div>
+
+          <!-- CARD C: CUSTOM INSTRUCTIONS -->
+          <div class="options-settings-section-title" style="margin-top: 16px;">✨ Custom Instructions</div>
+          <div style="margin-bottom: 12px;">
+            <label class="options-input-label">What should Libra know about you to provide better responses?</label>
+            <textarea id="prof-about-input" class="auth-input" rows="3" placeholder="e.g. Preferred languages, daily workflow, hobbies, or personal background." style="margin: 0; width: 100%; resize: vertical;"></textarea>
+          </div>
+
+          <div style="margin-bottom: 12px;">
+            <label class="options-input-label">How would you like Libra to respond? (Tone, Directives &amp; Style)</label>
+            <textarea id="prof-instructions-input" class="auth-input" rows="3" placeholder="e.g. Be concise, sharp, witty, articulate. Provide code examples with clear step-by-step reasoning. Don't be corporate." style="margin: 0; width: 100%; resize: vertical;"></textarea>
+          </div>
+
+          <div style="margin-bottom: 16px;">
+            <label class="options-input-label">Key Interests &amp; Topics</label>
+            <input type="text" id="prof-interests-input" class="auth-input" placeholder="e.g. Artificial Intelligence, Python, Gaming, Robotics, GPU Hardware" style="margin: 0; width: 100%;">
+          </div>
+
+                    <!-- VOICE OUTPUT (KOKORO-82M TTS) TOGGLE -->
+          <div class="options-voice-toggle-row">
+            <div class="options-voice-toggle-meta">
+              <span class="options-voice-toggle-title">🔊 Neural Voice Responses (Kokoro-82M TTS)</span>
+              <span class="options-voice-toggle-sub">Speak responses aloud using local CUDA neural voice synthesis</span>
+            </div>
+            <label class="libra-switch">
+              <input type="checkbox" id="options-voice-toggle" checked>
+              <span class="libra-slider"></span>
+            </label>
+          </div>
+
+          <div id="prof-status-msg" style="display: none; font-size: 12px; margin-bottom: 8px;"></div>
+          <button id="save-profile-btn" class="modal-btn primary" style="width: 100%;">💾 SAVE PREFERENCES &amp; INSTRUCTIONS</button>
+          <button id="options-token-telemetry-btn" type="button" class="modal-btn secondary" style="margin-top: 10px; width: 100%;">📊 View Real-Time GPU Token Telemetry</button>
+        </div>
+
+        <!-- TAB 2: GUEST INVITES & CLOUDFLARE/NGROK TUNNEL -->
+        <div id="tab-invites" class="options-tab-content" style="display: none;">
+          <p style="font-size: 12px; color: #94a3b8; margin-bottom: 10px;">
+            Share your private Libra AI server with friends safely. Generate isolated access tokens with 1-click links:
+          </p>
+
+          <div style="background: rgba(0, 242, 254, 0.05); border: 1px solid rgba(0, 242, 254, 0.2); border-radius: 8px; padding: 10px; margin-bottom: 12px;">
+            <div style="font-size: 11px; color: #cbd5e1; font-weight: 600; margin-bottom: 4px;">🌐 Public Server Address (ngrok):</div>
+            <div style="display: flex; gap: 6px;">
+              <input type="text" id="options-public-url" class="auth-input" value="https://smokiness-edition-overhaul.ngrok-free.dev" readonly style="margin: 0; flex: 1; font-family: monospace; font-size: 11px;">
+              <button id="copy-public-url-btn" class="modal-btn" style="padding: 0 12px; font-size: 11px;">Copy</button>
+            </div>
+          </div>
+
+          <div style="margin-bottom: 12px;">
+            <button id="quick-create-invite-btn" class="modal-btn primary" style="width: 100%;">⚡ GENERATE NEW GUEST INVITE LINK</button>
+          </div>
+
+          <div id="options-new-invite-box" style="display: none; background: rgba(34, 197, 94, 0.1); border: 1px solid rgba(34, 197, 94, 0.3); border-radius: 8px; padding: 10px; margin-bottom: 12px;">
+            <div style="font-size: 11px; color: #4ade80; font-weight: 700; margin-bottom: 4px;">🎉 Link Generated! Send this to your friend:</div>
+            <div style="display: flex; gap: 6px;">
+              <input type="text" id="options-generated-invite-url" class="auth-input" readonly style="margin: 0; flex: 1; font-family: monospace; font-size: 11px;">
+              <button id="options-copy-generated-btn" class="modal-btn" style="padding: 0 12px; font-size: 11px; background: #22c55e; color: #000; font-weight: 700;">Copy</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 3: GITHUB ISSUE INTEGRATION -->
+        <div id="tab-github" class="options-tab-content" style="display: none;">
+          <p style="font-size: 12px; color: #94a3b8; margin-bottom: 10px; line-height: 1.5;">
+            Connect your GitHub repository so bug reports and tester feedback automatically create live issues on <strong>Xuan09-30/LibraAi</strong> without manual approval.
+          </p>
+
+          <div style="background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 10px; margin-bottom: 12px; font-size: 11.5px; color: #cbd5e1; line-height: 1.5;">
+            <div style="font-weight: 700; color: #38bdf8; margin-bottom: 4px;">ℹ️ How to get your GitHub Token (30 seconds):</div>
+            1. Open <a href="https://github.com/settings/tokens/new" target="_blank" style="color: #38bdf8; text-decoration: underline;">GitHub Developer Settings &rarr; Tokens</a><br>
+            2. Name it <code>LibraBugReporter</code> and tick the <strong><code>repo</code></strong> scope (or <code>public_repo</code>).<br>
+            3. Copy the token (starts with <code>ghp_</code>) and paste below:
+          </div>
+
+          <div style="margin-bottom: 10px;">
+            <label style="font-size: 11px; color: #cbd5e1; font-weight: 600; display: block; margin-bottom: 4px;">GitHub Repository</label>
+            <input type="text" id="options-gh-repo-input" class="auth-input" value="Xuan09-30/LibraAi" style="margin: 0; width: 100%;">
+          </div>
+
+          <div style="margin-bottom: 12px;">
+            <label style="font-size: 11px; color: #cbd5e1; font-weight: 600; display: block; margin-bottom: 4px;">GitHub Personal Access Token (PAT)</label>
+            <input type="password" id="options-gh-token-input" class="auth-input" placeholder="ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" style="margin: 0; width: 100%;">
+            <div id="options-gh-status-indicator" style="font-size: 11px; color: #64748b; margin-top: 4px;">Status: Checking...</div>
+          </div>
+
+          <div id="options-gh-status-msg" style="display: none; font-size: 12px; margin-bottom: 8px;"></div>
+          <div style="display: flex; gap: 8px;">
+            <button id="save-gh-config-btn" class="modal-btn primary" style="flex: 1;">💾 SAVE GITHUB TOKEN</button>
+            <button id="sync-pending-gh-btn" class="modal-btn" style="padding: 0 14px; font-size: 11px; background: rgba(168, 85, 247, 0.15); border: 1px solid rgba(168, 85, 247, 0.4); color: #c084fc;">🚀 Push Reports to GitHub</button>
+          </div>
+        </div>
+
+        <!-- TAB 4: USERS & ROLES -->
+        <div id="tab-users" class="options-tab-content" style="display: none;">
+          <p style="font-size: 12px; color: #94a3b8; margin-bottom: 10px;">
+            Manage authorized users, promote/demote roles between Tester and Host:
+          </p>
+          <div id="options-users-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 250px; overflow-y: auto;">
+            <div style="color: #64748b; font-size: 12px;">Loading registered users...</div>
           </div>
         </div>
       </div>
@@ -313,21 +540,97 @@
   </div>
 
   <!-- ========================================================================
-       MODAL: AUTHENTICATION (TAILSCALE / ACCESS TOKEN)
+       MODAL: AUTHENTICATION (CLEAN SIGN IN WITH GOOGLE / TOKEN)
        ======================================================================== -->
   <div id="auth-modal" class="modal-overlay">
-    <div class="modal-content">
-      <div class="auth-title">AUTHENTICATION REQUIRED</div>
-      <p class="auth-desc">
-        Connect to your Home PC using your authorized Tailscale identity or enter your Libra Access Token.
-      </p>
-      <input type="password" id="token-input" class="auth-input" placeholder="Enter Access Token...">
-      <button id="save-token-btn" class="auth-btn">CONNECT</button>
+    <div class="modal-content auth-modal-clean">
+      <button id="close-auth-modal-btn" class="modal-close-btn" title="Close" style="position: absolute; top: 14px; right: 16px;">&times;</button>
+      <div class="auth-clean-header">
+        <div class="auth-clean-brand">
+          <span class="auth-brand-sparkle">✦</span>
+          <span class="auth-brand-text">Project Libra</span>
+        </div>
+        <h2 class="auth-clean-title" id="g-main-heading">Sign in</h2>
+        <p class="auth-clean-subtitle" id="g-sub-heading">to continue to Project Libra</p>
+      </div>
+
+      <div id="auth-status-msg" class="auth-status-msg" style="display: none;"></div>
+
+      <!-- VIEW A: GOOGLE SIGN-IN (CLEAN WHITE BUTTON) -->
+      <div id="auth-view-google" class="auth-view-google">
+        <a href="/auth/google/login" class="google-sign-in-clean-btn" id="real-google-oauth-btn" title="Sign in with your Google Account">
+          <svg class="google-svg-clean" viewBox="0 0 24 24" width="20" height="20">
+            <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.8-2.4 3.66v3.04h3.88c2.28-2.09 3.66-5.17 3.66-9.14z"/>
+            <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.04c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.13C3.26 21.36 7.33 24 12 24z"/>
+            <path fill="#FBBC05" d="M5.28 14.28c-.24-.72-.38-1.49-.38-2.28s.14-1.56.38-2.28V6.59H1.25C.45 8.18 0 9.99 0 12s.45 3.82 1.25 5.41l4.03-3.13z"/>
+            <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.33 0 3.26 2.64 1.25 6.59l4.03 3.13c.95-2.83 3.6-4.97 6.72-4.97z"/>
+          </svg>
+          <span>Continue with Google</span>
+        </a>
+
+        <!-- ALTERNATIVE AUTH METHODS -->
+        <div style="display: flex; align-items: center; margin: 18px 0 12px 0; width: 100%;">
+          <div style="flex: 1; height: 1px; background: rgba(255,255,255,0.1);"></div>
+          <span style="padding: 0 10px; font-size: 11px; color: #64748b; text-transform: uppercase;">or</span>
+          <div style="flex: 1; height: 1px; background: rgba(255,255,255,0.1);"></div>
+        </div>
+
+        <div style="width: 100%; display: flex; flex-direction: column; gap: 8px;">
+          <input type="password" id="auth-modal-token-input" class="auth-input" placeholder="Paste Master / Guest Token" style="margin: 0; width: 100%;">
+          <div style="display: flex; gap: 8px;">
+            <button id="auth-modal-token-btn" type="button" class="modal-btn primary" style="flex: 1; padding: 10px; font-size: 12px;">🔑 Sign in with Token</button>
+            <button id="auth-modal-guest-btn" type="button" class="modal-btn secondary" style="flex: 1; padding: 10px; font-size: 12px;">⚡ Enter as Guest</button>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
   <!-- ========================================================================
-       MODAL: MEMORY VAULT (PHASE 11 OBSIDIAN SYNC)
+       MODAL: USER & ROLE MANAGEMENT (HOST ONLY)
+       ======================================================================== -->
+  <div id="users-modal" class="modal-overlay">
+    <div class="modal-content users-modal-content">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span style="color: #00f2fe;">👥 USER & ROLE MANAGEMENT</span>
+          <span style="font-size: 11px; color: #64748b; margin-left: 8px;">HOST CONTROL PANEL</span>
+        </div>
+        <button id="close-users-modal-btn" class="modal-close-btn" title="Close">&times;</button>
+      </div>
+
+      <p class="modal-desc" style="color: #94a3b8; font-size: 13px; margin: 4px 0 16px 0;">
+        Assign permissions to registered accounts. <strong>Host</strong> has full system, shell, and hardware control. <strong>Tester</strong> has isolated, sandboxed chat workspace access.
+      </p>
+
+      <!-- INVITE / PRE-REGISTER USER CARD -->
+      <div class="user-invite-card">
+        <div class="user-card-heading">ADD / PRE-REGISTER USER</div>
+        <form id="invite-user-form" class="user-invite-form">
+          <input type="email" id="invite-user-email" class="user-input" placeholder="user@gmail.com" required>
+          <input type="text" id="invite-user-name" class="user-input" placeholder="Display Name (Optional)">
+          <select id="invite-user-role" class="user-select">
+            <option value="tester" selected>🧪 Tester</option>
+            <option value="host">👑 Host</option>
+          </select>
+          <button type="submit" class="user-btn-primary" id="invite-submit-btn">+ Save User</button>
+        </form>
+      </div>
+
+      <!-- USERS LIST -->
+      <div class="users-list-container">
+        <div class="users-list-header">
+          <span>REGISTERED USERS (<span id="users-count-badge">0</span>)</span>
+          <button id="refresh-users-btn" class="user-refresh-btn" type="button" title="Refresh Users">↻ Refresh</button>
+        </div>
+        <div id="users-table-body" class="users-table-body">
+          <div class="users-loading-state">Loading users...</div>
+        </div>
+      </div>
+
+      <div id="users-modal-status" class="auth-status-msg" style="display: none; margin-top: 14px;"></div>
+    </div>
+  </div>
        ======================================================================== -->
   <div id="vault-modal" class="modal-overlay">
     <div class="modal-content vault-modal-content">
@@ -429,14 +732,14 @@
   </div>
 
   <!-- ========================================================================
-       MODAL: GUEST ACCESS & TAILSCALE FUNNEL (ROLE-BASED ACCESS CONTROL)
+       MODAL: GUEST ACCESS & CLOUDFLARE PUBLIC TUNNEL (ROLE-BASED ACCESS CONTROL)
        ======================================================================== -->
   <div id="invite-modal" class="modal-overlay">
     <div class="modal-content invite-modal-content">
       <div class="modal-header">
         <div class="modal-header-title">
-          <span style="color: #a855f7;">🔑 GUEST INVITES & ACCESS</span>
-          <span id="funnel-badge" class="funnel-badge-indicator">TAILNET ONLY</span>
+          <span style="color: #a855f7;">🔑 GUEST INVITES &amp; CLOUDFLARE TUNNEL</span>
+          <span id="funnel-badge" class="funnel-badge-indicator active">CLOUDFLARE LIVE</span>
         </div>
         <button id="close-invite-modal" class="modal-close-btn" title="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -446,14 +749,14 @@
         </button>
       </div>
       <div class="modal-body">
-        <!-- DUAL-TUNNEL STATUS: CLOUDFLARE PUBLIC + TAILSCALE -->
+        <!-- CLOUDFLARE PUBLIC TUNNEL STATUS -->
         <div id="funnel-status-box" class="funnel-notice-box active">
           <div class="funnel-notice-header" style="display: flex; align-items: center; justify-content: space-between;">
-            <strong>☁️ Cloudflare + Tailscale Dual-Tunnel</strong>
+            <strong>☁️ Cloudflare Public Tunnel (Lightweight)</strong>
             <button id="restart-cf-btn" class="modal-btn secondary" style="font-size: 10px; padding: 4px 8px;">↻ Restart Cloudflare</button>
           </div>
           <p id="funnel-status-desc" style="font-size: 12px; color: #cbd5e1; margin: 6px 0;">
-            Checking Cloudflare Public Tunnel &amp; Tailscale status...
+            Checking Cloudflare Public Tunnel status...
           </p>
           <div style="display: flex; gap: 6px; align-items: center; margin-top: 6px;">
             <input type="text" id="cloudflare-base-url-field" readonly placeholder="Starting Cloudflare Tunnel..." style="flex: 1; background: #020617; border: 1px solid #334155; border-radius: 4px; padding: 5px 8px; color: #10b981; font-family: monospace; font-size: 11px;">
@@ -470,14 +773,10 @@
             <button id="create-guest-token-btn" class="modal-btn primary" style="white-space: nowrap;">+ GENERATE</button>
           </div>
           <div id="guest-token-created-box" style="display: none; margin-top: 10px; background: rgba(168, 85, 247, 0.1); border: 1px solid rgba(168, 85, 247, 0.3); border-radius: 8px; padding: 10px;">
-            <div style="font-size: 12px; color: #34d399; font-weight: 600; margin-bottom: 4px;">🌐 Cloudflare Friend Link (Works Anywhere — No Tailscale Needed):</div>
-            <div style="display: flex; gap: 6px; align-items: center; margin-bottom: 8px;">
+            <div style="font-size: 12px; color: #34d399; font-weight: 600; margin-bottom: 4px;">🌐 Cloudflare Friend Link (Works on Any Phone or Laptop):</div>
+            <div style="display: flex; gap: 6px; align-items: center;">
               <input type="text" id="guest-invite-url-field" readonly style="flex: 1; background: #020617; border: 1px solid #10b981; border-radius: 4px; padding: 6px 8px; color: #34d399; font-family: monospace; font-size: 12px;">
               <button id="copy-guest-url-btn" class="modal-btn primary" style="font-size: 11px; padding: 6px 10px;">COPY</button>
-            </div>
-            <div style="font-size: 11px; color: #38bdf8; font-weight: 600; margin-bottom: 4px;">🔒 Tailscale Link (Your Tailnet Devices):</div>
-            <div style="display: flex; gap: 6px; align-items: center;">
-              <input type="text" id="guest-ts-invite-url-field" readonly style="flex: 1; background: #020617; border: 1px solid #475569; border-radius: 4px; padding: 5px 8px; color: #38bdf8; font-family: monospace; font-size: 11px;">
             </div>
             <div style="font-size: 11px; color: #94a3b8; margin-top: 6px;">
               🛡️ <em>Guest is strictly sandboxed. Your friend can also click the <strong>🐞 Bug</strong> button on top to send bug reports directly to your PC!</em>
@@ -572,7 +871,7 @@
        MODAL: FRIEND BUG REPORT & TESTER FEEDBACK CENTER (PHASE 12)
        ======================================================================== -->
   <div id="bug-report-modal" class="modal-overlay">
-    <div class="modal-content" style="max-width: 560px; width: 92%;">
+    <div class="modal-content" style="max-width: 620px; width: 94%;">
       <div class="modal-header">
         <div class="modal-header-title">
           <span style="color: #fb7185;">🐞 BUG REPORT &amp; TESTER FEEDBACK</span>
@@ -585,33 +884,72 @@
         </button>
       </div>
       <div class="modal-body">
-        <p style="font-size: 12px; color: #94a3b8; margin-bottom: 10px;">
-          Found a bug or have an idea while testing Project Libra? Submit it below—it goes straight to the Host PC!
-        </p>
-        <div style="display: flex; gap: 8px; margin-bottom: 8px;">
-          <input type="text" id="bug-reporter-input" class="auth-input" placeholder="Your Name (e.g. Alex)" style="flex: 1; margin: 0;">
-          <select id="bug-category-select" class="auth-input" style="width: 155px; margin: 0;">
-            <option value="UI / Mobile Layout">UI / Mobile Layout</option>
-            <option value="AI Response / Chat">AI Response / Chat</option>
-            <option value="Voice / Audio">Voice / Audio</option>
-            <option value="File / Vision Upload">File / Vision Upload</option>
-            <option value="Feature Idea">Feature Idea</option>
-          </select>
-        </div>
-        <textarea id="bug-desc-input" class="auth-input" rows="3" placeholder="Describe what happened or what you expected..." style="width: 100%; resize: vertical; font-family: inherit; margin-bottom: 8px;"></textarea>
-        <div id="bug-submit-status" style="display: none; font-size: 12px; color: #34d399; margin-bottom: 8px;"></div>
-        <button id="submit-bug-btn" class="modal-btn primary" style="width: 100%;">🚀 SEND BUG REPORT TO HOST PC</button>
+        <!-- HOST-ONLY BUG REPORT INBOX (TOP VIEW FOR HOST) -->
+        <div id="host-bug-inbox-section" style="display: none; margin-bottom: 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <div style="font-size: 13px; font-weight: 700; color: #f1f5f9;">📥 TESTER BUG INBOX <span id="host-bug-inbox-count" style="color: #fb7185; font-size: 11px;">(0 Reports)</span></div>
+            <button id="refresh-bugs-btn" class="modal-btn" style="padding: 3px 10px; font-size: 11px; background: rgba(0, 242, 254, 0.1); border: 1px solid rgba(0, 242, 254, 0.3); color: var(--neon-cyan); border-radius: 4px; cursor: pointer;">🔄 Refresh</button>
+          </div>
 
-        <!-- HOST-ONLY BUG REPORT INBOX -->
-        <div id="host-bug-inbox-section" style="display: none; margin-top: 16px; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 12px;">
-          <div style="font-size: 12px; font-weight: 700; color: #cbd5e1; margin-bottom: 8px;">📥 SUBMITTED TESTER BUG REPORTS</div>
-          <div id="bug-reports-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 190px; overflow-y: auto;"></div>
+          <!-- Bug Tracker Telemetry Strip -->
+          <div id="host-bug-telemetry" style="display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 7px 12px; font-size: 11px; align-items: center; justify-content: space-between;">
+            <div><span style="color: #94a3b8;">Total Logged:</span> <strong id="bug-stat-total" style="color: #38bdf8;">0</strong></div>
+            <div><span style="color: #94a3b8;">Active:</span> <strong id="bug-stat-active" style="color: #fb7185;">0</strong></div>
+            <div><span style="color: #94a3b8;">Resolved:</span> <strong id="bug-stat-resolved" style="color: #34d399;">0</strong></div>
+            <div><span style="color: #94a3b8;">Tracking Since:</span> <span id="bug-stat-since" style="color: #cbd5e1; font-family: monospace;">-</span></div>
+          </div>
+
+          <!-- Bug Inbox Tabs -->
+          <div class="bug-tab-bar" style="display: flex; gap: 6px; margin-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 6px;">
+            <button id="bug-tab-active-btn" type="button" style="padding: 4px 12px; font-size: 11px; background: rgba(251, 113, 133, 0.15); border: 1px solid rgba(251, 113, 133, 0.4); color: #fb7185; border-radius: 6px; cursor: pointer; font-weight: 600;">🔴 Active Reports (<span id="bug-tab-active-count">0</span>)</button>
+            <button id="bug-tab-resolved-btn" type="button" style="padding: 4px 12px; font-size: 11px; background: transparent; border: 1px solid rgba(255, 255, 255, 0.15); color: #94a3b8; border-radius: 6px; cursor: pointer; font-weight: 600;">🟢 Resolved History (<span id="bug-tab-resolved-count">0</span>)</button>
+          </div>
+
+          <div id="bug-reports-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 270px; overflow-y: auto;"></div>
+          <div id="bug-resolved-list" style="display: none; flex-direction: column; gap: 8px; max-height: 270px; overflow-y: auto;"></div>
+          
+          <div style="margin-top: 14px; text-align: center;">
+            <button id="toggle-host-submit-form" style="background: none; border: 1px dashed rgba(255, 255, 255, 0.2); color: #94a3b8; font-size: 11px; padding: 5px 12px; border-radius: 6px; cursor: pointer; transition: all 0.15s ease;">➕ File a New Bug / Feedback as Host</button>
+          </div>
+        </div>
+
+        <!-- TESTER BUG FORM (PRIMARY FOR TESTERS) -->
+        <div id="tester-bug-form-section">
+          <p id="bug-form-lead-text" style="font-size: 12px; color: #94a3b8; margin-bottom: 10px;">
+            Found a bug or have an idea while testing Project Libra? Submit it below—a screenshot is captured automatically and submitted to GitHub / Host PC!
+          </p>
+          <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+            <input type="text" id="bug-reporter-input" class="auth-input" placeholder="Your Name or Email" style="flex: 1; margin: 0;">
+            <select id="bug-category-select" class="auth-input" style="width: 155px; margin: 0;">
+              <option value="UI / Mobile Layout">UI / Mobile Layout</option>
+              <option value="AI Response / Chat">AI Response / Chat</option>
+              <option value="Voice / Audio">Voice / Audio</option>
+              <option value="File / Vision Upload">File / Vision Upload</option>
+              <option value="Feature Idea">Feature Idea</option>
+            </select>
+          </div>
+          <textarea id="bug-desc-input" class="auth-input" rows="3" placeholder="Describe what happened or what you expected..." style="width: 100%; resize: vertical; font-family: inherit; margin-bottom: 8px;"></textarea>
+
+          <!-- AUTO-CAPTURED SCREENSHOT PREVIEW -->
+          <div id="bug-screenshot-preview-box" style="margin-bottom: 10px; display: flex; align-items: center; gap: 10px; background: rgba(255,255,255,0.04); padding: 8px 10px; border-radius: 8px; border: 1px dashed rgba(0, 242, 254, 0.3);">
+            <img id="bug-screenshot-thumb" style="width: 70px; height: 42px; object-fit: cover; border-radius: 4px; border: 1px solid rgba(0, 242, 254, 0.4); cursor: pointer; display: none;" alt="Captured Page Screenshot" title="Click to view full screenshot">
+            <div style="flex: 1; font-size: 11px; color: #94a3b8;">
+              <span style="color: #38bdf8; font-weight: 600;">📸 Page Screenshot Auto-Captured</span><br>
+              <span id="bug-screenshot-status-text">Your current screen state is attached to this report.</span>
+            </div>
+          </div>
+
+          <div id="bug-submit-status" style="display: none; font-size: 12px; margin-bottom: 8px;"></div>
+          <button id="submit-bug-btn" class="modal-btn primary" style="width: 100%;">🚀 SUBMIT BUG REPORT &amp; SCREENSHOT</button>
         </div>
       </div>
     </div>
   </div>
 
+  <!-- OFFLINE SCREENSHOT ENGINE -->
+  <script src="/static/html2canvas.min.js"></script>
   <!-- MAIN SCRIPT -->
-  <script src="/static/app.js"></script>
+  <script src="/static/prism.min.js?v=10.2.5"></script>
+  <script src="/static/app.js?v=10.2.5"></script>
 </body>
 </html>

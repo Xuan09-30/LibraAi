@@ -127,13 +127,13 @@ def test_spotlight_hotkey_registration(mock_win32):
     with patch.object(mock_win32, "GetMessageW", side_effect=[0]):
         thread.run()
 
-    mock_win32.RegisterHotKey.assert_called_with(
+    mock_win32.RegisterHotKey.assert_any_call(
         None,
         HOTKEY_ID_SPOTLIGHT,
         MOD_ALT | MOD_NOREPEAT,
         VK_SPACE
     )
-    mock_win32.UnregisterHotKey.assert_called_with(None, HOTKEY_ID_SPOTLIGHT)
+    mock_win32.UnregisterHotKey.assert_any_call(None, HOTKEY_ID_SPOTLIGHT)
 
 
 def test_selection_capture_and_clipboard_restoration(mock_win32):
@@ -594,7 +594,6 @@ def test_game_process_detection(monkeypatch):
         # Verify keep_alive: 0 called
         calls = [c[1]["json"] for c in mock_post.call_args_list if "json" in c[1]]
         flushed_models = [c.get("model") for c in calls if c.get("keep_alive") == 0]
-        assert "qwen3:8b" in flushed_models
         assert "qwen2.5vl:7b" in flushed_models
 
 

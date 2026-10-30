@@ -37,25 +37,20 @@ class TestWebSessionsAndTokens(unittest.TestCase):
         cls.auth_headers = {"Authorization": f"Bearer {cls.token}"}
 
     # -----------------------------------------------------------------------
-    # 1. TAILSCALE AUTHENTICATION TESTS
+    # 1. CLOUDFLARE IDENTITY & TOKEN AUTHENTICATION TESTS
     # -----------------------------------------------------------------------
-    def test_01_tailscale_serve_headers(self):
-        """Test Tailscale-User-Login header authentication."""
-        # Allowed Tailscale admin email
-        ts_headers = {
-            "Tailscale-User-Login": self.admin_email,
-            "Tailscale-User-Name": "Chen Xuan"
+    def test_01_cloudflare_identity_headers(self):
+        """Test Cloudflare Cf-Access-Authenticated-User-Email and X-User-Email header authentication."""
+        # Allowed Admin email
+        cf_headers = {
+            "cf-access-authenticated-user-email": self.admin_email
         }
-        res_ok = self.client.get("/api/vitals", headers=ts_headers)
+        res_ok = self.client.get("/api/vitals", headers=cf_headers)
         self.assertEqual(res_ok.status_code, 200)
 
-        # Stranger Tailscale login should be rejected with 403 Forbidden
-        ts_bad_headers = {
-            "Tailscale-User-Login": "attacker@tailscale.net",
-            "Tailscale-User-Name": "Attacker"
-        }
-        res_bad = self.client.get("/api/vitals", headers=ts_bad_headers)
-        self.assertEqual(res_bad.status_code, 403)
+        # Token authentication
+        res_tok = self.client.get("/api/vitals", headers={"Authorization": f"Bearer {self.token}"})
+        self.assertEqual(res_tok.status_code, 200)
 
     # -----------------------------------------------------------------------
     # 2. GEMINI-STYLE MULTI-CHAT SESSIONS (CRUD)

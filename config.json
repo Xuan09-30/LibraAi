@@ -1,18 +1,33 @@
 {
-  "city": "Kuala Lumpur",
-  "ollama_base_url": "http://localhost:11434",
-  "default_model": "qwen3:8b",
-  "models": {
-    "router": "qwen3:8b",
-    "web_research": "qwen3:8b",
-    "coding": "qwen2.5-coder:7b",
-    "chat": "qwen3:8b"
-  },
   "web_server": {
-    "enabled": true,
     "host": "0.0.0.0",
     "port": 8765,
     "admin_email": "chenxuanchuah@gmail.com",
     "access_token": "libra_access_token_phase10_secure"
+  },
+  "smtp": {
+    "enabled": false,
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "user": "YOUR_SMTP_EMAIL@gmail.com",
+    "password": "YOUR_SMTP_PASSWORD",
+    "sender_email": "YOUR_SMTP_EMAIL@gmail.com",
+    "sender_name": "Project Libra Security"
+  },
+  "google_oauth": {
+    "enabled": false,
+    "client_id": "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com",
+    "client_secret": "YOUR_GOOGLE_CLIENT_SECRET",
+    "project_id": "libra-project"
+  },
+  "ngrok": {
+    "enabled": false,
+    "authtoken": "YOUR_NGROK_AUTHTOKEN",
+    "domain": ""
+  },
+  "github": {
+    "enabled": false,
+    "repo": "Xuan09-30/LibraAi",
+    "token": "YOUR_GITHUB_TOKEN"
   }
 }

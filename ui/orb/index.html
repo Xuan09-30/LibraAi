@@ -5,28 +5,28 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body {
-      background-color: #030708;
+      background-color: #09090b;
       overflow: hidden;
       width: 100vw;
       height: 100vh;
       display: flex;
       justify-content: center;
       align-items: center;
-      font-family: 'Consolas', 'Courier New', monospace;
-      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", sans-serif;
+      color: #f8fafc;
     }
     canvas { display: block; outline: none; position: absolute; top: 0; left: 0; z-index: 1; }
     .hud-overlay {
       position: absolute;
       z-index: 10;
-      background: rgba(10, 14, 23, 0.78);
-      backdrop-filter: blur(8px);
-      border: 1px solid rgba(0, 242, 254, 0.32);
-      border-radius: 8px;
-      padding: 10px 12px;
-      max-width: 260px;
-      font-size: 11px;
-      box-shadow: 0 0 18px rgba(0, 242, 254, 0.12);
+      background: rgba(24, 24, 27, 0.85);
+      backdrop-filter: blur(12px);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      padding: 10px 14px;
+      max-width: 280px;
+      font-size: 11.5px;
+      box-shadow: 0 8px 30px rgba(0, 0, 0, 0.45);
       transition: all 0.25s ease;
       pointer-events: auto;
     }
@@ -42,45 +42,49 @@
       display: none;
     }
     .hud-title {
-      color: #00f2fe;
-      font-weight: bold;
+      color: #f8fafc;
+      font-weight: 600;
       font-size: 11px;
-      letter-spacing: 1.5px;
-      border-bottom: 1px solid rgba(0, 242, 254, 0.25);
-      padding-bottom: 4px;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      padding-bottom: 5px;
       margin-bottom: 6px;
-      text-transform: uppercase;
     }
     .hud-step { margin: 3px 0; color: #cbd5e1; }
     .hud-plot-img {
       width: 100%;
       max-height: 170px;
       object-fit: contain;
-      border-radius: 4px;
-      border: 1px solid rgba(168, 85, 247, 0.4);
+      border-radius: 6px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
       margin-top: 6px;
     }
     .hud-code-box {
-      background: rgba(3, 7, 12, 0.9);
-      border: 1px solid #1e293b;
-      border-radius: 4px;
-      padding: 6px;
+      background: #111114;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 6px;
+      padding: 8px;
       max-height: 110px;
       overflow-y: auto;
-      font-size: 10px;
+      font-size: 10.5px;
       color: #38bdf8;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
       white-space: pre-wrap;
       margin-top: 4px;
     }
     .hud-copy-btn {
       margin-top: 6px;
-      background: #0c1829;
-      color: #00f2fe;
-      border: 1px solid #00f2fe;
+      background: rgba(255, 255, 255, 0.06);
+      color: #f8fafc;
+      border: 1px solid rgba(255, 255, 255, 0.12);
       border-radius: 4px;
-      padding: 3px 8px;
-      font-size: 10px;
+      padding: 4px 9px;
+      font-size: 10.5px;
       cursor: pointer;
+      transition: background 0.15s;
+    }
+    .hud-copy-btn:hover {
+      background: rgba(255, 255, 255, 0.15);
     }
   </style>
   <script src="three.min.js"></script>
@@ -135,7 +139,7 @@
   const pGeo = new THREE.BufferGeometry();
   pGeo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   const pMat = new THREE.PointsMaterial({
-    color: 0x00f2fe,
+    color: 0x38bdf8,
     size: 0.22,
     transparent: true,
     opacity: 0.85
@@ -144,7 +148,7 @@
   scene.add(pointCloud);
 
   const lineMat = new THREE.LineBasicMaterial({
-    color: 0x00a3cc,
+    color: 0x0284c7,
     transparent: true,
     opacity: 0.22,
     blending: THREE.AdditiveBlending
@@ -156,7 +160,7 @@
   // Outer orbital HUD ring
   const ringGeo = new THREE.RingGeometry(8.0, 8.05, 64);
   const ringMat = new THREE.MeshBasicMaterial({ 
-    color: 0x00ffff, 
+    color: 0x38bdf8, 
     side: THREE.DoubleSide, 
     transparent: true, 
     opacity: 0.25 
@@ -168,7 +172,7 @@
   // Inner pulsing energy core
   const coreGeo = new THREE.IcosahedronGeometry(2.4, 2);
   const coreMat = new THREE.MeshBasicMaterial({
-    color: 0x0077aa,
+    color: 0x0369a1,
     wireframe: true,
     transparent: true,
     opacity: 0.35
@@ -185,15 +189,15 @@
   let currentMicAmplitude = 0.0;
 
   const ORB_PALETTES = {
-    normal:       new THREE.Color(0x00f2fe),
-    idle:         new THREE.Color(0x00f2fe),
-    research:     new THREE.Color(0xd946ef),
-    data_science: new THREE.Color(0xd946ef),
-    urgent:       new THREE.Color(0xef4444),
-    security:     new THREE.Color(0xef4444),
-    gaming:       new THREE.Color(0x10b981),
-    clarify:      new THREE.Color(0xf59e0b),
-    night:        new THREE.Color(0x4338ca)
+    normal:       new THREE.Color(0x38bdf8),
+    idle:         new THREE.Color(0x38bdf8),
+    research:     new THREE.Color(0x818cf8),
+    data_science: new THREE.Color(0x818cf8),
+    urgent:       new THREE.Color(0xf87171),
+    security:     new THREE.Color(0xf87171),
+    gaming:       new THREE.Color(0x34d399),
+    clarify:      new THREE.Color(0xfbbf24),
+    night:        new THREE.Color(0x6366f1)
   };
 
   const ORB_SPEED_PRESETS = {
@@ -208,9 +212,9 @@
     night:        0.65
   };
 
-  let defaultColor = new THREE.Color(0x00f2fe);
-  let targetModeColor = new THREE.Color(0x00f2fe);
-  const peakColor = new THREE.Color(0xd946ef);
+  let defaultColor = new THREE.Color(0x38bdf8);
+  let targetModeColor = new THREE.Color(0x38bdf8);
+  const peakColor = new THREE.Color(0x818cf8);
   const currentColor = new THREE.Color();
 
   // Accelerated orbital spin while TTS is actively speaking
