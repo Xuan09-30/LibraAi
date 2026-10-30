@@ -396,12 +396,22 @@ class TrustUndoRequest(BaseModel):
 
     file_path: Optional[str] = Field(None, description="Optional target file path to revert")
 
-# ---------------------------------------------------------------------------
+def send_local_ipc_command(cmd: str):
+    """Sends IPC commands ('show', 'hide', 'toggle') to the running PyQt6 GUI instance."""
+    try:
+        from PyQt6.QtNetwork import QLocalSocket
+        sock = QLocalSocket()
+        sock.connectToServer("libra_instance_ipc")
+        if sock.waitForConnected(250):
+            sock.write(f"{cmd}\n".encode("utf-8"))
+            sock.waitForBytesWritten(500)
+            sock.disconnectFromServer()
+    except Exception:
+        pass
 
+# ---------------------------------------------------------------------------
 # FASTAPI APPLICATION FACTORY
-
 # ---------------------------------------------------------------------------
-
 def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.json") -> FastAPI:
 
     cfg = load_web_config(config_path)
@@ -410,6 +420,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
     access_token = cfg.get("access_token", "libra_access_token_phase10_secure")
 
+    
     app = FastAPI(
 
         title="Project Libra Remote Web Agent",
@@ -2305,6 +2316,22 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
     # -----------------------------------------------------------------------
 
+
+    @app.post("/api/gui/show")
+    async def post_gui_show(auth: Dict[str, Any] = Depends(authenticate_request)):
+        send_local_ipc_command("show")
+        return {"status": "success", "message": "Showing PC GUI"}
+
+    @app.post("/api/gui/hide")
+    async def post_gui_hide(auth: Dict[str, Any] = Depends(authenticate_request)):
+        send_local_ipc_command("hide")
+        return {"status": "success", "message": "Hiding PC GUI"}
+
+    @app.post("/api/gui/toggle")
+    async def post_gui_toggle(auth: Dict[str, Any] = Depends(authenticate_request)):
+        send_local_ipc_command("toggle")
+        return {"status": "success", "message": "Toggled PC GUI visibility"}
+
     @app.post("/api/chat")
 
     async def post_chat(
@@ -2879,6 +2906,10 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                     )
 
                     thought_steps = list(res_proc.get("thought_steps") or [])
+                    if res_proc.get("action") == "show_ui":
+                        send_local_ipc_command("show")
+                    elif res_proc.get("action") == "hide_ui":
+                        send_local_ipc_command("hide")
 
                     if reason_note and not any(s.get("status") == "corrected" for s in thought_steps):
 
@@ -3683,6 +3714,10 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         reply_text = result.get("voice_response") or "Command processed."
 
         action = result.get("action")
+        if action == "show_ui":
+            send_local_ipc_command("show")
+        elif action == "hide_ui":
+            send_local_ipc_command("hide")
 
         raw_tm = result.get("token_metrics") or getattr(supervisor.llm, "last_token_metrics", {}) or {}
 

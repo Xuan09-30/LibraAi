@@ -1089,6 +1089,89 @@ class VoiceAssistantWorker(QThread):
                 pass
 
 
+
+# -----------------------------------------------------------------------------
+# MAIN WINDOW GLOBAL HOTKEY THREAD (ALT + ENTER TOGGLE)
+# -----------------------------------------------------------------------------
+HOTKEY_ID_MAIN_WINDOW = 9015
+VK_RETURN = 0x0D
+
+class MainWindowHotkeyThread(QThread):
+    hotkey_triggered = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._running = True
+        self._keyboard_handle = None
+        self._last_trigger_time = 0.0
+
+    def _safe_trigger(self):
+        now = time.time()
+        if now - self._last_trigger_time < 0.35:
+            return
+        self._last_trigger_time = now
+        self.hotkey_triggered.emit()
+
+    def run(self):
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.windll.user32
+            MOD_ALT = 0x0001
+            MOD_NOREPEAT = 0x4000
+            VK_RETURN = 0x0D
+
+            # 1. Win32 RegisterHotKey: Alt + Enter
+            success = user32.RegisterHotKey(
+                None,
+                HOTKEY_ID_MAIN_WINDOW,
+                MOD_ALT | MOD_NOREPEAT,
+                VK_RETURN
+            )
+            if success:
+                print("[GUI] Global hotkey registered: [Alt + Enter] -> Toggle Libra UI.")
+            else:
+                print("[GUI Info] Alt + Enter hotkey registered via low-level keyboard hook.")
+
+            # 2. Also register via keyboard module for OS-level reliability
+            try:
+                import keyboard
+                self._keyboard_handle = keyboard.add_hotkey("alt+enter", lambda: self._safe_trigger(), suppress=False)
+            except Exception:
+                pass
+
+            msg = wintypes.MSG()
+            while self._running:
+                res = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if not isinstance(res, int) or res <= 0:
+                    break
+                if msg.message == 0x0312 and msg.wParam == HOTKEY_ID_MAIN_WINDOW:
+                    self._safe_trigger()
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+
+            user32.UnregisterHotKey(None, HOTKEY_ID_MAIN_WINDOW)
+        except Exception as e:
+            print(f"[MainWindowHotkeyThread Error]: {e}")
+
+    def stop(self):
+        self._running = False
+        if self._keyboard_handle:
+            try:
+                import keyboard
+                keyboard.remove_hotkey(self._keyboard_handle)
+            except Exception:
+                pass
+            self._keyboard_handle = None
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.user32.PostQuitMessage(0)
+            except Exception:
+                pass
+
 class FuturisticVoiceAssistantUI(QMainWindow):
     reload_requested = pyqtSignal(str)
 
@@ -1169,6 +1252,12 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.init_ui()
         _ = self.winId()
         self.init_tray_icon()
+        try:
+            self.main_hotkey_thread = MainWindowHotkeyThread(self)
+            self.main_hotkey_thread.hotkey_triggered.connect(self.toggle_interface)
+            self.main_hotkey_thread.start()
+        except Exception as hk_err:
+            print(f"[Main Hotkey Init Warning]: {hk_err}")
         if start_worker:
             self.init_code_reloader()
             self.init_worker()
@@ -2019,6 +2108,10 @@ if __name__ == "__main__":
             msg = bytes(conn.readAll()).decode("utf-8", errors="ignore")
             if "show" in msg:
                 window.show_interface()
+            elif "hide" in msg:
+                window.hide_interface()
+            elif "toggle" in msg:
+                window.toggle_interface()
 
     ipc_server.newConnection.connect(handle_incoming_ipc)
 
