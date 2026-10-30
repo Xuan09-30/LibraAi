@@ -22,14 +22,14 @@ class CodeChangeHandler(FileSystemEventHandler):
 
     EXCLUDED_DIRS = {
         "logs", "venv", ".git", "__pycache__", ".pytest_cache", ".vscode", ".idea",
-        "assets/memory", ".user_uploaded", "temp", "tmp"
+        "assets/memory", ".user_uploaded", "temp", "tmp", "static", "web/static"
     }
 
     EXCLUDED_FILES = {
-        "three.min.js", "three.js", "vconsole.min.js"
+        "three.min.js", "three.js", "vconsole.min.js", "html2canvas.min.js", "prism.min.js"
     }
 
-    WATCHED_EXTENSIONS = {".py", ".html"}
+    WATCHED_EXTENSIONS = {".py"}
 
     def __init__(self, reload_callback: Callable[[str], None], debounce_sec: float = 1.5):
         super().__init__()

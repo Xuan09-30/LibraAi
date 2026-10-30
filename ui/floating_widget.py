@@ -72,8 +72,8 @@ class FloatingHUDPill(QWidget):
         container.setGeometry(0, 0, 520, 48)
         container.setStyleSheet("""
             QWidget {
-                background-color: rgba(8, 13, 25, 230);
-                border: 1px solid #00f2fe;
+                background-color: rgba(24, 24, 27, 0.96);
+                border: 1px solid rgba(255, 255, 255, 0.12);
                 border-radius: 24px;
             }
         """)
@@ -85,14 +85,14 @@ class FloatingHUDPill(QWidget):
         self.orb_dot = MiniOrbIndicator(container)
         layout.addWidget(self.orb_dot)
 
-        badge = QLabel("LIBRA")
-        badge.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
-        badge.setStyleSheet("color: #00f2fe; border: none; background: transparent; letter-spacing: 1.5px;")
+        badge = QLabel("✦ Libra")
+        badge.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        badge.setStyleSheet("color: #ffffff; border: none; background: transparent; letter-spacing: -0.2px;")
         layout.addWidget(badge)
 
         self.input_field = QLineEdit(container)
         self.input_field.setPlaceholderText("Ask Libra or run a command... (Alt+Space)")
-        self.input_field.setFont(QFont("Consolas", 10))
+        self.input_field.setFont(QFont("Segoe UI", 10))
         self.input_field.setStyleSheet("""
             QLineEdit {
                 background: transparent;
@@ -106,7 +106,7 @@ class FloatingHUDPill(QWidget):
 
         close_btn = QPushButton("×", container)
         close_btn.setFixedSize(24, 24)
-        close_btn.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+        close_btn.setFont(QFont("Segoe UI", 11))
         close_btn.setStyleSheet("""
             QPushButton {
                 background: transparent;

@@ -20,6 +20,12 @@ except ImportError:
     pyaudio = None
     PYAUDIO_AVAILABLE = False
 
+try:
+    import keyboard
+    KEYBOARD_AVAILABLE = True
+except ImportError:
+    KEYBOARD_AVAILABLE = False
+
 VK_RCONTROL = 0xA3
 KEYEVENTF_UNICODE = 0x0004
 KEYEVENTF_KEYUP = 0x0002
@@ -108,31 +114,76 @@ class WhisperDictationController:
         self.on_state_change = on_state_change
 
         self._running = False
+        self._paused_for_anticheat = False
         self._is_recording = False
         self._audio_buffer = bytearray()
         self._thread: Optional[threading.Thread] = None
         self._mic_stream = None
         self._pa: Optional[pyaudio.PyAudio] = None
         self._lock = threading.Lock()
+        self._keyboard_handle = None
 
     def set_stt(self, stt_engine: Any):
         self.stt = stt_engine
 
     def start(self):
-        """Starts the background VK_RCONTROL polling daemon thread."""
+        """Starts the background VK_RCONTROL polling daemon thread & universal hotkey."""
         if self._running:
             return
         self._running = True
         self._thread = threading.Thread(target=self._poll_loop, daemon=True, name="DictationHookWorker")
         self._thread.start()
-        print("[Dictation] Whisper Dictation Mode online (Hold Right Control to dictate).")
+        if KEYBOARD_AVAILABLE:
+            try:
+                self._keyboard_handle = keyboard.add_hotkey("ctrl+alt+d", lambda: self.toggle_dictation())
+            except Exception:
+                self._keyboard_handle = None
+        print("[Dictation] Whisper Dictation Mode online (Hold Right Control or press Ctrl + Alt + D to dictate).")
 
     def stop(self):
         """Stops the daemon thread."""
         self._running = False
+        if KEYBOARD_AVAILABLE and self._keyboard_handle:
+            try:
+                keyboard.remove_hotkey(self._keyboard_handle)
+            except Exception:
+                pass
+            self._keyboard_handle = None
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
         self._cleanup_audio()
+
+    def toggle_dictation(self):
+        """Universal toggle for dictation (Ctrl + Alt + D)."""
+        if self._paused_for_anticheat:
+            return
+        if not self._is_recording:
+            print("[Dictation] Recording started via [Ctrl + Alt + D]...")
+            self._on_key_down()
+        else:
+            print("[Dictation] Recording finished via [Ctrl + Alt + D]. Transcribing...")
+            self._on_key_up()
+
+    def pause(self):
+        """Pauses dictation during gaming/anti-cheat."""
+        self._paused_for_anticheat = True
+        if self._is_recording:
+            self._on_key_up()
+        if KEYBOARD_AVAILABLE and self._keyboard_handle:
+            try:
+                keyboard.remove_hotkey(self._keyboard_handle)
+            except Exception:
+                pass
+            self._keyboard_handle = None
+
+    def resume(self):
+        """Resumes dictation after gaming ends."""
+        self._paused_for_anticheat = False
+        if KEYBOARD_AVAILABLE and not self._keyboard_handle:
+            try:
+                self._keyboard_handle = keyboard.add_hotkey("ctrl+alt+d", lambda: self.toggle_dictation())
+            except Exception:
+                pass
 
     def _cleanup_audio(self):
         try:
@@ -174,8 +225,26 @@ class WhisperDictationController:
 
         user32 = ctypes.windll.user32
         was_pressed = False
+        last_ac_check = 0.0
 
         while self._running:
+            now_t = time.time()
+            if now_t - last_ac_check > 1.0:
+                last_ac_check = now_t
+                try:
+                    from core.vram_governor import get_vram_governor
+                    if get_vram_governor().is_gaming_lite_mode():
+                        self._paused_for_anticheat = True
+                    else:
+                        self._paused_for_anticheat = False
+                except Exception:
+                    pass
+
+            if self._paused_for_anticheat:
+                was_pressed = False
+                time.sleep(0.5)
+                continue
+
             # Check if VK_RCONTROL (0xA3) is pressed down (high bit set)
             state = user32.GetAsyncKeyState(VK_RCONTROL)
             is_pressed = bool(state & 0x8000)

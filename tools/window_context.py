@@ -48,6 +48,12 @@ APP_FRIENDLY_NAMES = {
     "cs2.exe": ("Counter-Strike 2", "game"),
     "csgo.exe": ("Counter-Strike", "game"),
     "r5apex.exe": ("Apex Legends", "game"),
+    "r5apex_dx12.exe": ("Apex Legends", "game"),
+    "start_protected_game.exe": ("Apex Legends", "game"),
+    "easyanticheat_eos.exe": ("EasyAntiCheat", "anticheat"),
+    "easyanticheat.exe": ("EasyAntiCheat", "anticheat"),
+    "vgc.exe": ("Riot Vanguard", "anticheat"),
+    "beservice.exe": ("BattlEye", "anticheat"),
     "leagueclient.exe": ("League of Legends", "game"),
     "leagueclientux.exe": ("League of Legends", "game"),
     "leagueclientuxrender.exe": ("League of Legends", "game"),
@@ -83,8 +89,46 @@ APP_FRIENDLY_NAMES = {
 IGNORE_PROCESSES = {
     "python.exe", "pythonw.exe", "libra.exe", "TextInputHost.exe",
     "ShellExperienceHost.exe", "SearchHost.exe", "NVIDIA Overlay.exe",
-    "wallpaper64.exe", "vgtray.exe"
+    "wallpaper64.exe", "vgtray.exe", "easyanticheat_eos.exe", "easyanticheat.exe", "vgc.exe"
 }
+
+ANTI_CHEAT_PROCESSES = {
+    "easyanticheat_eos.exe", "easyanticheat.exe", "vgc.exe", "vgtray.exe",
+    "beservice.exe", "start_protected_game.exe"
+}
+
+_pid_name_cache: Dict[int, str] = {}
+_pid_cache_time: float = 0.0
+
+
+def _get_safe_process_name(target_pid: int) -> str:
+    """
+    Anti-Cheat Safe PID -> Process Name resolver.
+    Uses psutil.process_iter(['pid', 'name']) which invokes Win32 CreateToolhelp32Snapshot
+    (kernel snapshot table) and NEVER calls OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)
+    on protected game/anti-cheat processes (Apex Legends / EasyAntiCheat / Riot Vanguard).
+    """
+    global _pid_name_cache, _pid_cache_time
+    if target_pid <= 0 or not PSUTIL_AVAILABLE:
+        return ""
+    now = __import__("time").time()
+    if now - _pid_cache_time > 1.5 or target_pid not in _pid_name_cache:
+        try:
+            snap = {}
+            for p in psutil.process_iter(["pid", "name"]):
+                try:
+                    p_id = int(p.info.get("pid") or 0)
+                    p_nm = str(p.info.get("name") or "")
+                    if p_id > 0 and p_nm:
+                        snap[p_id] = p_nm
+                except Exception:
+                    continue
+            if snap:
+                _pid_name_cache = snap
+                _pid_cache_time = now
+        except Exception:
+            pass
+    return _pid_name_cache.get(target_pid, "")
 
 _poller_thread = None
 _poller_lock = __import__("threading").Lock()
@@ -112,13 +156,7 @@ def _poll_foreground_window():
                         pid = wintypes.DWORD(0)
                         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
                         p_pid = pid.value
-                        proc_name = ""
-                        if p_pid > 0 and PSUTIL_AVAILABLE:
-                            try:
-                                proc = psutil.Process(p_pid)
-                                proc_name = proc.name()
-                            except Exception:
-                                pass
+                        proc_name = _get_safe_process_name(int(p_pid))
 
                         proc_lower = proc_name.lower()
                         title_upper = title.upper()
@@ -243,15 +281,9 @@ class ActiveWindowEngine:
             user32.GetWindowThreadProcessId(h, ctypes.byref(w_pid))
             if w_pid.value in libra_pids:
                 return False
-            if PSUTIL_AVAILABLE:
-                try:
-                    p = psutil.Process(w_pid.value)
-                    p_name = p.name().lower()
-                    if p_name in ("python.exe", "pythonw.exe", "conhost.exe"):
-                        if any("libra" in str(arg).lower() for arg in p.cmdline()):
-                            return False
-                except Exception:
-                    pass
+            p_name = _get_safe_process_name(int(w_pid.value)).lower()
+            if p_name in ("python.exe", "pythonw.exe", "conhost.exe"):
+                return False
             return True
 
         # 1. Native PyWin32 (win32gui) method - fully 64-bit clean
@@ -352,11 +384,8 @@ class ActiveWindowEngine:
                     buff = ctypes.create_unicode_buffer(length + 1)
                     user32.GetWindowTextW(hwnd, buff, length + 1)
                     title = buff.value.strip()
-                if pid.value > 0 and PSUTIL_AVAILABLE:
-                    try:
-                        proc_name = psutil.Process(pid.value).name()
-                    except Exception:
-                        pass
+                if pid.value > 0:
+                    proc_name = _get_safe_process_name(int(pid.value))
 
             ignore_set = {p.lower() for p in IGNORE_PROCESSES}
             is_self_or_ignored = (
@@ -387,11 +416,8 @@ class ActiveWindowEngine:
                             user32.GetWindowTextW(hwnd, buff, length + 1)
                             title = buff.value.strip()
                         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                        if pid.value > 0 and PSUTIL_AVAILABLE:
-                            try:
-                                proc_name = psutil.Process(pid.value).name()
-                            except Exception:
-                                pass
+                        if pid.value > 0:
+                            proc_name = _get_safe_process_name(int(pid.value))
                     elif not hwnd:
                         self.last_window_snapshot = info
                         return info
@@ -410,19 +436,23 @@ class ActiveWindowEngine:
             info["window_title"] = title
             info["pid"] = int(pid.value)
 
-            if info["pid"] > 0 and PSUTIL_AVAILABLE:
+            if info["pid"] > 0:
                 try:
-                    proc = psutil.Process(info["pid"])
-                    proc_name = proc.name()
-                    info["process_name"] = proc_name
-                    mem_bytes = proc.memory_info().rss
-                    info["memory_mb"] = round(mem_bytes / (1024 * 1024), 1)
-
-                    proc_lower = proc_name.lower()
-                    if proc_lower in APP_FRIENDLY_NAMES:
-                        info["app_label"], info["app_category"] = APP_FRIENDLY_NAMES[proc_lower]
-                    else:
-                        info["app_label"] = os.path.splitext(proc_name)[0].replace("_", " ").title()
+                    proc_name = _get_safe_process_name(info["pid"])
+                    if proc_name:
+                        info["process_name"] = proc_name
+                        proc_lower = proc_name.lower()
+                        if proc_lower in APP_FRIENDLY_NAMES:
+                            info["app_label"], info["app_category"] = APP_FRIENDLY_NAMES[proc_lower]
+                        else:
+                            info["app_label"] = os.path.splitext(proc_name)[0].replace("_", " ").title()
+                        # Anti-Cheat Safe Mode: NEVER call proc.memory_info() (OpenProcess) on game or anti-cheat processes
+                        if info["app_category"] not in ("game", "anticheat") and proc_lower not in ANTI_CHEAT_PROCESSES and PSUTIL_AVAILABLE:
+                            try:
+                                mem_bytes = psutil.Process(info["pid"]).memory_info().rss
+                                info["memory_mb"] = round(mem_bytes / (1024 * 1024), 1)
+                            except Exception:
+                                pass
                 except Exception:
                     pass
         except Exception as e:
@@ -554,23 +584,29 @@ class ActiveWindowEngine:
 
         candidates = []
         try:
-            for proc in psutil.process_iter(["pid", "name", "memory_info"]):
+            # Anti-Cheat Safe Mode: Query ONLY ["pid", "name"] via CreateToolhelp32Snapshot.
+            # NEVER request "memory_info" here because psutil calls OpenProcess(PROCESS_VM_READ)
+            # on every process, which EasyAntiCheat / Vanguard flags as a process probe!
+            for proc in psutil.process_iter(["pid", "name"]):
                 try:
                     pname = proc.info.get("name") or ""
                     p_low = pname.lower()
-                    if not p_low or p_low in self.LAUNCHER_PROCESSES:
+                    if not p_low or p_low in self.LAUNCHER_PROCESSES or p_low in ANTI_CHEAT_PROCESSES:
                         continue
                     label = None
+                    priority = 1
                     if p_low in APP_FRIENDLY_NAMES:
                         cand_label, cand_cat = APP_FRIENDLY_NAMES[p_low]
                         if cand_cat == "game":
                             label = cand_label
+                            if p_low in ("r5apex.exe", "r5apex_dx12.exe", "valorant-win64-shipping.exe", "cs2.exe", "overwatch.exe", "dota2.exe"):
+                                priority = 10
                     elif p_low.endswith("-shipping.exe"):
                         base = p_low.replace("-win64-shipping.exe", "").replace("-shipping.exe", "")
                         label = "Valorant" if "valorant" in base else base.replace("_", " ").title()
+                        priority = 10
 
                     if label:
-                        rss = proc.info.get("memory_info").rss if proc.info.get("memory_info") else 0
                         candidates.append({
                             "hwnd": 0,
                             "pid": int(proc.info.get("pid") or 0),
@@ -578,14 +614,17 @@ class ActiveWindowEngine:
                             "app_label": label,
                             "app_category": "game",
                             "window_title": label,
-                            "memory_mb": round(rss / (1024 * 1024), 1) if rss else 0.0,
+                            "memory_mb": 0.0,
+                            "_priority": priority,
                         })
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                     continue
         except Exception:
             pass
         if candidates:
-            return max(candidates, key=lambda c: c.get("memory_mb", 0.0))
+            best = max(candidates, key=lambda c: c.get("_priority", 1))
+            best.pop("_priority", None)
+            return best
         return None
 
     def summarize_active_window(self, dry_run: bool = False, prompt: str = "") -> Dict[str, Any]:
