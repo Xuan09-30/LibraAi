@@ -2418,7 +2418,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                 who_is_libra = r"\b(?:who\s+are\s+you|what\s+is\s+your\s+name|tell\s+me\s+about\s+yourself|who\s+is\s+libra)\b"
 
-                is_alibaba_query = r"\b(?:are\s+you\s+(?:made|created)\s+by\s+alibaba|alibaba\s+created\s+you|did\s+alibaba\s+make\s+you)\b"
+                is_alibaba_query = r"\b(?:(?:are\s+you\s+(?:made|created|built|developed)\s+by|did\s+alibaba\s+(?:make|create|build|develop)|alibaba\s+(?:created|made|built|developed)|tongyi\s+(?:lab|created|made))\s*(?:you|libra)?|alibaba|tongyi)\b"
 
                 q_clean = req.prompt.strip().lower()
 
@@ -3291,7 +3291,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         who_is_libra = r"\b(?:who\s+are\s+you|what\s+is\s+your\s+name|tell\s+me\s+about\s+yourself|who\s+is\s+libra)\b"
 
-        is_alibaba_query = r"\b(?:are\s+you\s+(?:made|created)\s+by\s+alibaba|alibaba\s+created\s+you|did\s+alibaba\s+make\s+you)\b"
+        is_alibaba_query = r"\b(?:(?:are\s+you\s+(?:made|created|built|developed)\s+by|did\s+alibaba\s+(?:make|create|build|develop)|alibaba\s+(?:created|made|built|developed)|tongyi\s+(?:lab|created|made))\s*(?:you|libra)?|alibaba|tongyi)\b"
 
         q_clean = req.prompt.strip().lower()
 
@@ -4491,111 +4491,113 @@ def ensure_ngrok_tunnel(port: int = 8765) -> Dict[str, Any]:
 
     ng_cfg = {}
 
-    for p in (cfg_file, local_cfg):
+    try:
 
-        if os.path.isfile(p):
+        for p in (cfg_file, local_cfg):
 
-            try:
+            if os.path.isfile(p):
 
-                with open(p, "r", encoding="utf-8") as f:
+                try:
 
-                    cdata = json.load(f)
+                    with open(p, "r", encoding="utf-8") as f:
 
-                part = cdata.get("ngrok", {})
+                        cdata = json.load(f)
 
-                if part.get("authtoken") and not part.get("authtoken", "").startswith("YOUR_"):
+                    part = cdata.get("ngrok", {})
 
-                    ng_cfg = part
+                    if part.get("authtoken") and not part.get("authtoken", "").startswith("YOUR_"):
 
-            except Exception:
+                        ng_cfg = part
 
-                pass
+                except Exception:
 
-    if ng_cfg.get("enabled") and ng_cfg.get("authtoken") and ng_cfg.get("domain"):
+                    pass
 
-                import ngrok, asyncio, threading, time
+        if ng_cfg.get("enabled") and ng_cfg.get("authtoken") and ng_cfg.get("domain"):
 
-                authtoken = ng_cfg["authtoken"].strip()
+            import ngrok, asyncio, threading, time
 
-                domain = ng_cfg["domain"].strip()
+            authtoken = ng_cfg["authtoken"].strip()
 
-                def _start_ngrok():
+            domain = ng_cfg["domain"].strip()
+
+            def _start_ngrok():
+
+                global _NGROK_SESSION
+
+                loop = asyncio.new_event_loop()
+
+                asyncio.set_event_loop(loop)
+
+                async def _run():
 
                     global _NGROK_SESSION
 
-                    loop = asyncio.new_event_loop()
+                    for attempt in range(5):
 
-                    asyncio.set_event_loop(loop)
+                        try:
 
-                    async def _run():
+                            _NGROK_SESSION = await ngrok.SessionBuilder().authtoken(authtoken).connect()
 
-                        global _NGROK_SESSION
+                            listener = await _NGROK_SESSION.http_endpoint().domain(domain).listen()
 
-                        for attempt in range(5):
+                            listener.forward(f"127.0.0.1:{port}")
 
-                            try:
+                            url = listener.url()
 
-                                _NGROK_SESSION = await ngrok.SessionBuilder().authtoken(authtoken).connect()
+                            _CLOUDFLARE_INFO.update({
 
-                                listener = await _NGROK_SESSION.http_endpoint().domain(domain).listen()
+                                "public_url": url,
 
-                                listener.forward(f"127.0.0.1:{port}")
+                                "pid": os.getpid(),
 
-                                url = listener.url()
+                                "status": "online",
 
-                                _CLOUDFLARE_INFO.update({
+                                "provider": "ngrok"
 
-                                    "public_url": url,
+                            })
 
-                                    "pid": os.getpid(),
+                            logger.info(f"[Ngrok] Permanent tunnel active: {url}")
 
-                                    "status": "online",
+                            break
 
-                                    "provider": "ngrok"
+                        except Exception as err:
 
-                                })
+                            if ("already online" in str(err) or "ERR_NGROK_334" in str(err)) and attempt < 4:
 
-                                logger.info(f"[Ngrok] Permanent tunnel active: {url}")
+                                logger.info(f"[Ngrok] Domain {domain} busy, waiting 2.5s for previous session to close (attempt {attempt+1}/5)...")
 
-                                break
+                                await asyncio.sleep(2.5)
 
-                            except Exception as err:
+                            else:
 
-                                if ("already online" in str(err) or "ERR_NGROK_334" in str(err)) and attempt < 4:
+                                logger.warning(f"[Ngrok Session Error]: {err}")
 
-                                    logger.info(f"[Ngrok] Domain {domain} busy, waiting 2.5s for previous session to close (attempt {attempt+1}/5)...")
+                                return
 
-                                    await asyncio.sleep(2.5)
+                    while True:
 
-                                else:
+                        await asyncio.sleep(3600)
 
-                                    logger.warning(f"[Ngrok Session Error]: {err}")
+                try:
 
-                                    return
+                    loop.run_until_complete(_run())
 
-                        while True:
+                except Exception as err:
 
-                            await asyncio.sleep(3600)
+                    logger.warning(f"[Ngrok Session Error]: {err}")
 
-                    try:
+            th = threading.Thread(target=_start_ngrok, daemon=True, name="NgrokTunnelThread")
 
-                        loop.run_until_complete(_run())
+            th.start()
 
-                    except Exception as err:
+            time.sleep(1.8)
 
-                        logger.warning(f"[Ngrok Session Error]: {err}")
+            return _CLOUDFLARE_INFO
 
-                th = threading.Thread(target=_start_ngrok, daemon=True, name="NgrokTunnelThread")
+    except Exception as e:
 
-                th.start()
-
-                time.sleep(1.8)
-
-                return _CLOUDFLARE_INFO
-
-        except Exception as e:
-
-            logger.warning(f"[Ngrok init exception]: {e}")
+        logger.warning(f"[Ngrok init exception]: {e}")
 
     return {}
 

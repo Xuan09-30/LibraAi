@@ -981,7 +981,7 @@ class LocalLLM:
             r"\b(?:who\s+(?:is\s+your\s+creator|is\s+the\s+creator\s+of\s+libra|created\s+(?:you|libra)|made\s+(?:you|libra)|built\s+(?:you|libra)|developed\s+(?:you|libra)|programmed\s+(?:you|libra)|designed\s+(?:you|libra))|tell\s+me\s+about\s+your\s+creator)\b",
             r"\b(?:who\s+are\s+you|what\s+is\s+your\s+name|tell\s+me\s+about\s+yourself|who\s+is\s+libra)\b",
             r"(?:(?:who\s+(?:is|was)|tell\s+me\s+about|do\s+you\s+know|what\s+do\s+you\s+know\s+about)\s+(?:chuah\s+)?chen\s*xuan\b|(?:^|\b)(?:chuah\s+)?chen\s*xuan\b|who\s+is\s+(?:your\s+)?(?:boss|master|commander|architect|founder|creator|lead|author|engineer|developer))\b",
-            r"\b(?:are\s+you\s+(?:made|created)\s+by\s+alibaba|alibaba\s+created\s+you|did\s+alibaba\s+make\s+you)\b"
+            r"\b(?:(?:are\s+you\s+(?:made|created|built|developed)\s+by|did\s+alibaba\s+(?:make|create|build|develop)|alibaba\s+(?:created|made|built|developed)|tongyi\s+(?:lab|created|made))\s*(?:you|libra)?|alibaba|tongyi)\b"
         ]
         if any(re.search(pat, q_lower) for pat in creator_patterns):
             plan_res = {"action": "chat", "args": {}}
