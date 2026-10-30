@@ -9,8 +9,8 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="icon" type="image/png" href="/static/icon.png">
-  <link rel="stylesheet" href="/static/style.css?v=10.2.6">
-  <link rel="stylesheet" href="/static/prism.css?v=10.2.6">
+  <link rel="stylesheet" href="/static/style.css?v=10.2.7">
+  <link rel="stylesheet" href="/static/prism.css?v=10.2.7">
   <script src="/static/three.min.js"></script>
 </head>
 <body>
@@ -55,7 +55,7 @@
             <span>⚡ Daily Briefing</span>
           </button>
           <button id="vault-nav-btn" class="drawer-tool-btn" title="Memory Vault (Obsidian Sync)">
-            <span>◈ Memory Vault</span>
+            <span>🧠 Core Memory</span>
           </button>
           <button id="airdrop-nav-btn" class="drawer-tool-btn" title="AirDrop Bridge (Phone <-> PC)">
             <span>✈ AirDrop Bridge</span>
@@ -102,7 +102,7 @@
           </button>
         </div>
         <div class="drawer-version-row">
-          <span>V10.2.0</span>
+          <span>V10.2.7</span>
           <span class="scope-pill">REMOTE WEB</span>
         </div>
       </div>
@@ -201,6 +201,16 @@
           </div>
         </div>
 
+                <!-- ANTIGRAVITY-STYLE SLASH COMMAND POPUP MENU -->
+        <div id="slash-command-popover" class="slash-command-popover" style="display: none;">
+          <div class="slash-popover-header">
+            <span>⚡ SLASH COMMANDS &amp; SKILLS</span>
+            <span class="slash-popover-hint">↑↓ Navigate · ↵ Select · Esc Dismiss</span>
+          </div>
+          <div id="slash-command-list" class="slash-command-list">
+            <!-- Populated dynamically by app.js -->
+          </div>
+        </div>
         <footer id="input-bar">
           <input type="file" id="file-input" style="display: none;" accept="image/*,.pdf,.doc,.docx,.txt,.md,.py,.csv,.json">
           <button id="attach-btn" title="Attach Image or Document">
@@ -259,7 +269,34 @@
         </button>
       </div>
 
-      <div class="modal-body">
+            <div class="modal-body">
+        <!-- LIVE GPU HARDWARE TELEMETRY BANNER -->
+        <div class="gpu-hardware-banner" id="gpu-hardware-banner">
+          <div class="gpu-banner-header">
+            <div class="gpu-banner-title">
+              <span class="gpu-indicator-dot"></span>
+              <span id="gpu-device-name">NVIDIA GeForce RTX 5060 Ti</span>
+              <span class="gpu-badge-vram">16 GB GDDR7</span>
+            </div>
+            <div class="gpu-live-temp" id="gpu-live-temp">48°C | 9% Load</div>
+          </div>
+          <div class="gpu-vram-bar-wrap">
+            <div class="gpu-vram-bar-label">
+              <span>GPU VRAM UTILIZATION</span>
+              <span id="gpu-vram-numbers">11.7 GB / 16.3 GB (72%)</span>
+            </div>
+            <div class="gpu-vram-bar-track">
+              <div class="gpu-vram-bar-fill" id="gpu-vram-fill" style="width: 72%;"></div>
+            </div>
+          </div>
+          <div class="gpu-sub-tags">
+            <span class="gpu-tag">CUDA 12.8</span>
+            <span class="gpu-tag">Tensor Cores Active</span>
+            <span class="gpu-tag">Zero-Stutter Gaming Shield</span>
+            <span class="gpu-tag">Kokoro-82M (CUDA)</span>
+            <span class="gpu-tag">Whisper Turbo</span>
+          </div>
+        </div>
         <div class="token-grid">
           <!-- CARD 1: LAST TURN SPEED -->
           <div class="token-card highlight">
@@ -636,8 +673,8 @@
     <div class="modal-content vault-modal-content">
       <div class="modal-header">
         <div class="modal-header-title">
-          <span style="color: #00ffcc;">◈ MEMORY VAULT</span>
-          <span style="font-size: 11px; color: #64748b; margin-left: 8px;">OBSIDIAN SYNC (assets/vault/*.md)</span>
+          <span style="color: #00ffcc;">🧠 CORE MEMORY & KNOWLEDGE</span>
+          <span style="font-size: 11px; color: #64748b; margin-left: 8px;">FACTS, HABITS & WORKSPACE PREFERENCES</span>
         </div>
         <button id="close-vault-modal" class="modal-close-btn" title="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -949,7 +986,7 @@
   <!-- OFFLINE SCREENSHOT ENGINE -->
   <script src="/static/html2canvas.min.js"></script>
   <!-- MAIN SCRIPT -->
-  <script src="/static/prism.min.js?v=10.2.6"></script>
-  <script src="/static/app.js?v=10.2.6"></script>
+  <script src="/static/prism.min.js?v=10.2.7"></script>
+  <script src="/static/app.js?v=10.2.7"></script>
 </body>
 </html>

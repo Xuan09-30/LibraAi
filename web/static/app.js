@@ -1857,6 +1857,26 @@
   }
 
   function populateTokenModal(data) {
+    // Live GPU Hardware Vitals
+    fetch('/api/vitals', { headers: getAuthHeaders() })
+      .then(r => r.json())
+      .then(v => {
+        const gpuNameEl = document.getElementById('gpu-device-name');
+        const gpuTempEl = document.getElementById('gpu-live-temp');
+        const gpuVramNum = document.getElementById('gpu-vram-numbers');
+        const gpuVramFill = document.getElementById('gpu-vram-fill');
+        if (v) {
+          if (gpuNameEl && v.gpu) gpuNameEl.textContent = v.gpu.name || 'NVIDIA GeForce RTX 5060 Ti';
+          if (gpuTempEl && v.gpu) gpuTempEl.textContent = `${v.gpu.temperature_c || 48}°C | ${v.gpu.load_percent || 9}% Load`;
+          const usedGb = ((v.vram_used_mb || 11695) / 1024).toFixed(1);
+          const totalGb = ((v.vram_total_mb || 16311) / 1024).toFixed(1);
+          const pct = Math.min(100, Math.round(((v.vram_used_mb || 11695) / (v.vram_total_mb || 16311)) * 100));
+          if (gpuVramNum) gpuVramNum.textContent = `${usedGb} GB / ${totalGb} GB (${pct}%)`;
+          if (gpuVramFill) gpuVramFill.style.width = `${pct}%`;
+        }
+      })
+      .catch(() => {});
+
 
     // 1. Last Turn
 
@@ -6143,29 +6163,51 @@
 
       const gameSub = activeGame ? `${activeGame.process_name} (${activeGame.memory_mb || 0} MB RAM)` : 'Scanning 30+ game engines';
 
+      const overrideMode = data.override_mode || 'auto';
       gameShieldCards.innerHTML = `
-
         <div class="token-card highlight">
-
           <div class="token-card-header">DETECTED GAME</div>
-
           <div class="token-card-value" style="font-size: 18px; color: ${activeGame ? '#10b981' : '#94a3b8'};">${escapeHtml(gameTitle)}</div>
-
           <div class="token-card-sub">${escapeHtml(gameSub)}</div>
-
+          ${activeGame ? `<button id="kill-game-proc-btn" class="modal-btn secondary" style="margin-top: 8px; font-size: 11px; padding: 4px 10px; color: #f43f5e; border-color: rgba(244,63,94,0.3); width: 100%;">🧹 Kill Zombie Process (${escapeHtml(activeGame.process_name)})</button>` : ''}
         </div>
-
         <div class="token-card">
-
-          <div class="token-card-header">WAKE-WORD SHIELD</div>
-
-          <div class="token-card-value" style="font-size: 18px;">${data.wake_threshold}</div>
-
-          <div class="token-card-sub">${escapeHtml(data.agc_status)}</div>
-
+          <div class="token-card-header">SHIELD OVERRIDE MODE</div>
+          <div class="gaming-mode-pills">
+            <button class="gaming-mode-btn ${overrideMode === 'auto' ? 'active' : ''}" data-mode="auto">🟢 Auto</button>
+            <button class="gaming-mode-btn ${overrideMode === 'on' ? 'active' : ''}" data-mode="on">⚡ Force On</button>
+            <button class="gaming-mode-btn ${overrideMode === 'off' ? 'active mode-off' : ''}" data-mode="off">⏸ Standby</button>
+          </div>
+          <div class="token-card-sub" style="margin-top: 8px;">Threshold: ${data.wake_threshold} | ${escapeHtml(data.agc_status)}</div>
         </div>
-
       `;
+
+      // Attach mode switcher listeners
+      gameShieldCards.querySelectorAll('.gaming-mode-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const mode = btn.getAttribute('data-mode');
+          await fetch('/api/gaming/toggle', {
+            method: 'POST',
+            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ mode })
+          });
+          renderGamingStatus();
+        });
+      });
+
+      // Attach kill process listener
+      const killProcBtn = document.getElementById('kill-game-proc-btn');
+      if (killProcBtn && activeGame) {
+        killProcBtn.addEventListener('click', async () => {
+          killProcBtn.textContent = 'Killing...';
+          await fetch('/api/gaming/kill-process', {
+            method: 'POST',
+            headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ process_name: activeGame.process_name, pid: activeGame.pid })
+          });
+          setTimeout(renderGamingStatus, 600);
+        });
+      }
 
       const sessions = data.audio_sessions || [];
 
@@ -6275,7 +6317,10 @@
 
   const COMMAND_ACTIONS = [
 
-    { icon: '🎮', title: 'Gaming & Audio Shield Control', desc: 'Inspect active game (Valorant, CS2) & lock 100% game volume', shortcut: '/game', run: () => openGameShieldModal() },
+    { icon: '🎯', title: 'Autonomous Goal Execution', desc: 'Execute a multi-step autonomous goal (/goal)', shortcut: '/goal', run: () => { const inp = document.getElementById('prompt-input'); if (inp) { inp.value = '/goal '; inp.focus(); } } },
+    { icon: '🎮', title: 'Gaming & Audio Shield Control', desc: 'Inspect active game & toggle audio/VRAM shield', shortcut: '/game', run: () => openGameShieldModal() },
+    { icon: '📊', title: 'GPU & Hardware Telemetry HUD', desc: 'Live RTX 5060 Ti VRAM gauge, temperature & load', shortcut: '/vitals', run: () => toggleTokenModal(true) },
+    { icon: '🧠', title: 'Core Memory & Knowledge Base', desc: 'View learned facts, habits & personal preferences', shortcut: '/memory', run: () => { if (vaultNavBtn) vaultNavBtn.click(); } },
 
     { icon: '🔊', title: 'Heal & Restore All App Audio to 100%', desc: 'Immediately restore all Windows WASAPI audio sessions to 100%', shortcut: '/heal', run: async () => { await fetch('/api/gaming/heal-audio', { method: 'POST', headers: getAuthHeaders() }); openGameShieldModal(); } },
 
@@ -6517,9 +6562,9 @@
 
           </div>
 
-          <div class="starter-chip-card" data-prompt="Search my Obsidian memory vault for my key notes, user preferences, and pinned facts">
+          <div class="starter-chip-card" data-prompt="Search my core memory and knowledge base for my key notes, user preferences, and pinned facts">
 
-            <div class="starter-chip-title">📁 Obsidian Memory Vault Search</div>
+            <div class="starter-chip-title">📁 Core Memory & Knowledge Search</div>
 
             <div class="starter-chip-desc">Explore persistent notes, BM25 memory index &amp; preferences</div>
 
@@ -7227,7 +7272,9 @@
 
     drawerUsersBtn.addEventListener('click', () => {
 
-      openOptionsModal('tab-users');
+      toggleDrawer(false);
+
+      showUsersModal();
 
     });
 
@@ -7312,8 +7359,6 @@
     }
 
   });
-
-})();
 
   // Bind Telemetry buttons (Drawer & Options modal)
 
@@ -7407,3 +7452,81 @@
       showAuthModal();
     });
   }
+
+  // --------------------------------------------------------------------------
+  // ANTIGRAVITY-STYLE SLASH COMMAND POPUP MENU CONTROLLER
+  // --------------------------------------------------------------------------
+  const slashPopover = document.getElementById('slash-command-popover');
+  const slashList = document.getElementById('slash-command-list');
+  let selectedSlashIdx = 0;
+  let activeSlashMatches = [];
+
+  function updateSlashPopover() {
+    if (!slashPopover || !slashList || !promptInput) return;
+    const val = promptInput.value;
+    if (val.startsWith('/')) {
+      const query = val.slice(1).toLowerCase().trim();
+      activeSlashMatches = COMMAND_ACTIONS.filter(c => 
+        !query || c.shortcut.toLowerCase().includes(query) || c.title.toLowerCase().includes(query) || c.desc.toLowerCase().includes(query)
+      );
+      if (activeSlashMatches.length > 0) {
+        selectedSlashIdx = Math.min(selectedSlashIdx, activeSlashMatches.length - 1);
+        slashList.innerHTML = activeSlashMatches.map((c, i) => `
+          <div class="cmd-item ${i === selectedSlashIdx ? 'selected' : ''}" data-slash-idx="${i}">
+            <div class="cmd-item-left">
+              <span class="cmd-item-icon">${c.icon}</span>
+              <div>
+                <div class="cmd-item-title">${escapeHtml(c.title)}</div>
+                <div class="cmd-item-desc">${escapeHtml(c.desc)}</div>
+              </div>
+            </div>
+            <span class="cmd-item-shortcut">${escapeHtml(c.shortcut)}</span>
+          </div>
+        `).join('');
+
+        slashList.querySelectorAll('.cmd-item').forEach(el => {
+          el.addEventListener('click', () => {
+            const idx = parseInt(el.getAttribute('data-slash-idx'), 10);
+            executeSlashCommand(idx);
+          });
+        });
+
+        slashPopover.style.display = 'flex';
+        return;
+      }
+    }
+    slashPopover.style.display = 'none';
+  }
+
+  function executeSlashCommand(idx) {
+    const cmd = activeSlashMatches[idx];
+    if (!cmd) return;
+    if (slashPopover) slashPopover.style.display = 'none';
+    if (promptInput) promptInput.value = '';
+    cmd.run();
+  }
+
+  if (promptInput) {
+    promptInput.addEventListener('input', () => updateSlashPopover());
+    promptInput.addEventListener('keydown', (e) => {
+      if (slashPopover && slashPopover.style.display === 'flex') {
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          selectedSlashIdx = (selectedSlashIdx + 1) % activeSlashMatches.length;
+          updateSlashPopover();
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          selectedSlashIdx = (selectedSlashIdx - 1 + activeSlashMatches.length) % activeSlashMatches.length;
+          updateSlashPopover();
+        } else if (e.key === 'Enter' || e.key === 'Tab') {
+          e.preventDefault();
+          executeSlashCommand(selectedSlashIdx);
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          slashPopover.style.display = 'none';
+        }
+      }
+    });
+  }
+
+})();

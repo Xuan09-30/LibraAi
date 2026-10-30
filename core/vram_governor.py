@@ -86,6 +86,7 @@ class VRAMAutoGovernor:
         self.ollama_url = ollama_url.rstrip("/")
         self.poll_interval = poll_interval
         self.gaming_lite_mode = False
+        self.override_mode = "auto"  # "auto", "on", "off"
         self.active_games: List[str] = []
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -142,18 +143,57 @@ class VRAMAutoGovernor:
     def is_gaming_lite_mode(self) -> bool:
         """Returns True if Gaming Lite Mode is currently active."""
         with self._lock:
+            if getattr(self, "override_mode", "auto") == "off":
+                return False
+            if getattr(self, "override_mode", "auto") == "on":
+                return True
             return self.gaming_lite_mode
 
+    def set_override_mode(self, mode: str):
+        """Manually controls Gaming Shield mode: 'auto', 'on', or 'off'."""
+        clean_mode = (mode or "auto").lower().strip()
+        with self._lock:
+            self.override_mode = clean_mode
+            if clean_mode == "off":
+                self.gaming_lite_mode = False
+                self.active_games = []
+                self.warmup_models_after_gaming()
+            elif clean_mode == "on":
+                self.gaming_lite_mode = True
+                self.active_games = ["manual_game_mode"]
+                self.flush_vram_for_gaming()
+
     def check_running_games(self) -> List[str]:
-        """Scans system processes for target games."""
-        if not PSUTIL_AVAILABLE:
+        """Scans system processes for target games, filtering out hung/crashed zombie processes."""
+        if not PSUTIL_AVAILABLE or getattr(self, "override_mode", "auto") == "off":
             return []
+        if getattr(self, "override_mode", "auto") == "on":
+            return ["manual_game_mode"]
+
         found = []
         try:
+            crash_handlers = set()
             for proc in psutil.process_iter(["name"]):
+                try:
+                    cname = (proc.info.get("name") or "").lower()
+                    if "crashhandler" in cname or "werfault" in cname:
+                        crash_handlers.add(cname)
+                except Exception:
+                    pass
+
+            for proc in psutil.process_iter(["name", "memory_info"]):
                 try:
                     pname = (proc.info.get("name") or "").lower().strip()
                     if pname in self.TARGET_GAMES:
+                        # Ignore crashed roblox/game processes lingering with a crash handler
+                        if "roblox" in pname and any("robloxcrash" in c for c in crash_handlers):
+                            continue
+                        if any("crash" in c for c in crash_handlers) and pname.startswith(("palworld", "r5apex", "overwatch")):
+                            continue
+                        # Verify the process is genuinely running with real game asset memory (> 150MB)
+                        mem_info = proc.info.get("memory_info")
+                        if mem_info and getattr(mem_info, "rss", 0) < 150 * 1024 * 1024:
+                            continue
                         found.append(pname)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue

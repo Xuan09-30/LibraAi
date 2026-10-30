@@ -368,6 +368,16 @@ class VaultFactRequest(BaseModel):
 
     pinned: Optional[bool] = Field(False, description="Pin status")
 
+class TTSRequest(BaseModel):
+    text: str = Field(..., description="Text content to speak via Kokoro-82M")
+
+class GameToggleRequest(BaseModel):
+    mode: str = Field("auto", description="Gaming Shield mode: 'auto', 'on', or 'off'")
+
+class GameKillRequest(BaseModel):
+    process_name: Optional[str] = Field(None, description="Name of process to terminate")
+    pid: Optional[int] = Field(None, description="Process ID to terminate")
+
 class UpdateVaultFactRequest(BaseModel):
 
     value: str = Field(..., description="Updated fact text content")
@@ -1053,6 +1063,31 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         res = briefing.generate_tactical_briefing(force=force, deliver_audio=False)
 
         return res._data if hasattr(res, "_data") else {"status": "success", "summary": str(res)}
+
+    @app.post("/api/tts")
+    async def api_synthesize_tts(
+        req: TTSRequest,
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        """
+        Synthesizes high-fidelity neural audio using Kokoro-82M (af_heart - Libra's female voice).
+        Returns base64 encoded 24kHz WAV audio.
+        """
+        clean_text = req.text.strip()
+        if not clean_text:
+            raise HTTPException(status_code=400, detail="Empty text provided for TTS")
+
+        b64 = await asyncio.to_thread(synthesize_sentence_wav_b64, supervisor, clean_text)
+        if not b64:
+            raise HTTPException(status_code=500, detail="Failed to synthesize neural audio")
+
+        return {
+            "status": "success",
+            "audio_base64": b64,
+            "voice": "af_heart",
+            "model": "Kokoro-82M"
+        }
+
 
     # -----------------------------------------------------------------------
 
@@ -4096,6 +4131,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             "gaming_shield_active": shield_active,
 
             "gaming_lite_mode": lite_mode,
+            "override_mode": getattr(vram_gov, "override_mode", "auto") if vram_gov else "auto",
 
             "anti_cheat_safe_mode": True,
 
