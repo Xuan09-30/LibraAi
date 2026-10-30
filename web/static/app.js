@@ -6417,6 +6417,8 @@
   const COMMAND_ACTIONS = [
 
     { icon: '🎯', title: 'Autonomous Goal Execution', desc: 'Execute a multi-step autonomous goal (/goal)', shortcut: '/goal', run: () => { const inp = document.getElementById('prompt-input'); if (inp) { inp.value = '/goal '; inp.focus(); } } },
+    { icon: '🖥️', title: 'Show PC GUI Window', desc: 'Bring the full futuristic Libra voice assistant onto your PC monitor', shortcut: '/show', run: async () => { await fetch('/api/gui/show', { method: 'POST', headers: getAuthHeaders() }); } },
+    { icon: '🫥', title: 'Hide PC GUI Window', desc: 'Hide the interface and let Libra run silently in the background', shortcut: '/hide', run: async () => { await fetch('/api/gui/hide', { method: 'POST', headers: getAuthHeaders() }); } },
     { icon: '🎮', title: 'Gaming & Audio Shield Control', desc: 'Inspect active game & toggle audio/VRAM shield', shortcut: '/game', run: () => openGameShieldModal() },
     { icon: '📊', title: 'GPU & Hardware Telemetry HUD', desc: 'Live RTX 5060 Ti VRAM gauge, temperature & load', shortcut: '/vitals', run: () => toggleTokenModal(true) },
     { icon: '🧠', title: 'Core Memory & Knowledge Base', desc: 'View learned facts, habits & personal preferences', shortcut: '/memory', run: () => { if (vaultNavBtn) vaultNavBtn.click(); } },

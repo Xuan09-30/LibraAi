@@ -1503,26 +1503,44 @@ class LocalLLM:
         # -------------------------------------------------------------
         # 7.8 UI VISIBILITY CONTROLS (STEALTH BACKGROUND ASSISTANT)
         # -------------------------------------------------------------
+        show_ui_patterns = (
+            r"\b(?:"
+            r"show\s+yourself|come\s+out|reveal\s+yourself|appear|pop\s+up|"
+            r"show\s+(?:me\s+)?(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface|gui)|"
+            r"open\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface|gui)|"
+            r"bring\s+up\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface|gui)|"
+            r"display\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface|gui)"
+            r")\b"
+        )
         show_ui_match = (
-            re.search(r"\b(?:show\s+(?:me\s+)?(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|open\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|bring\s+up\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|display\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface))\b", q_lower)
-            or re.search(r"\b(?:show\s+(?:me\s+)?(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|open\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|bring\s+up\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|display\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface))\b", cmd_query)
+            re.search(show_ui_patterns, q_lower)
+            or re.search(show_ui_patterns, cmd_query)
         )
         if show_ui_match:
             plan_res = {"action": "show_ui", "args": {}}
-            msg = "Displaying neural interface."
+            msg = "I'm right here. Displaying neural interface."
             plan_res["voice_response"] = msg
             if not dry_run:
                 self.session_state["last_action"] = "show_ui"
                 self._record_turn(prompt, msg)
             return self._process_response(plan_res, prompt, dry_run=dry_run)
 
+        hide_ui_patterns = (
+            r"\b(?:"
+            r"hide\s+yourself|go\s+away|disappear|send\s+to\s+background|go\s+to\s+background|"
+            r"hide\s+(?:me\s+)?(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface|gui)|"
+            r"close\s+(?:your\s+)(?:neural\s+)?(?:ui|window|interface|gui)|"
+            r"minimize\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface|gui)|"
+            r"hide\s+window|minimize\s+window|minimize\s+ui"
+            r")\b"
+        )
         hide_ui_match = (
-            re.search(r"\b(?:hide\s+(?:me\s+)?(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|close\s+(?:your\s+)(?:neural\s+)?(?:ui|window|interface)|minimize\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|go\s+to\s+background|send\s+to\s+background|hide\s+window|minimize\s+window|minimize\s+ui)\b", q_lower)
-            or re.search(r"\b(?:hide\s+(?:me\s+)?(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|close\s+(?:your\s+)(?:neural\s+)?(?:ui|window|interface)|minimize\s+(?:your\s+|the\s+)?(?:neural\s+)?(?:ui|window|interface)|go\s+to\s+background|send\s+to\s+background|hide\s+window|minimize\s+window|minimize\s+ui)\b", cmd_query)
+            re.search(hide_ui_patterns, q_lower)
+            or re.search(hide_ui_patterns, cmd_query)
         )
         if hide_ui_match:
             plan_res = {"action": "hide_ui", "args": {}}
-            msg = "Hiding interface. I'll remain active in the background."
+            msg = "Hiding interface. I will remain active in the background."
             plan_res["voice_response"] = msg
             if not dry_run:
                 self.session_state["last_action"] = "hide_ui"
