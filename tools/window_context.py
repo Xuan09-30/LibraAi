@@ -584,15 +584,30 @@ class ActiveWindowEngine:
 
         candidates = []
         try:
-            # Anti-Cheat Safe Mode: Query ONLY ["pid", "name"] via CreateToolhelp32Snapshot.
-            # NEVER request "memory_info" here because psutil calls OpenProcess(PROCESS_VM_READ)
-            # on every process, which EasyAntiCheat / Vanguard flags as a process probe!
-            for proc in psutil.process_iter(["pid", "name"]):
+            crash_handlers = set()
+            for proc in psutil.process_iter(["name"]):
+                try:
+                    cname = (proc.info.get("name") or "").lower()
+                    if "crashhandler" in cname or "werfault" in cname:
+                        crash_handlers.add(cname)
+                except Exception:
+                    pass
+
+            for proc in psutil.process_iter(["pid", "name", "memory_info"]):
                 try:
                     pname = proc.info.get("name") or ""
                     p_low = pname.lower()
                     if not p_low or p_low in self.LAUNCHER_PROCESSES or p_low in ANTI_CHEAT_PROCESSES:
                         continue
+                    # Discard crashed zombies
+                    if "roblox" in p_low and any("robloxcrash" in c for c in crash_handlers):
+                        continue
+                    # Ignore processes with negligible memory (< 150MB) unless running in foreground
+                    mem_info = proc.info.get("memory_info")
+                    mem_mb = (getattr(mem_info, "rss", 0) / (1024 * 1024)) if mem_info else 0.0
+                    if mem_mb < 150.0 and p_low != proc_low:
+                        continue
+
                     label = None
                     priority = 1
                     if p_low in APP_FRIENDLY_NAMES:
@@ -614,7 +629,7 @@ class ActiveWindowEngine:
                             "app_label": label,
                             "app_category": "game",
                             "window_title": label,
-                            "memory_mb": 0.0,
+                            "memory_mb": round(mem_mb, 1),
                             "_priority": priority,
                         })
                 except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
