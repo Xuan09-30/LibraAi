@@ -1,5 +1,5 @@
 ---
-name: Hardware Vitals & Memory Hog Inspector
+name: hardware-vitals
 description: Inspects CPU, RAM, and top memory-consuming processes on Windows 11.
 triggers:
   - what is eating my ram
@@ -7,7 +7,7 @@ triggers:
   - top processes
   - what is slowing down my pc
 version: 1.0.0
-success_count: 18
+success_count: 20
 ---
 # Hardware Vitals & Memory Hog Inspector
 Identifies the top memory-consuming processes and system RAM/CPU load in real time.

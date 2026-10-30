@@ -1,5 +1,5 @@
 ---
-name: Active Window Context Copilot
+name: active-window
 description: Identifies the focused foreground window, IDE file, or browser tab for contextual assistance.
 triggers:
   - active window skill

@@ -37,17 +37,17 @@ def run_tests():
 
         create_ok = (
             create_res.get("status") == "success"
-            and create_res.get("slug") == "system_uptime_check"
+            and create_res.get("slug") in ("system_uptime_check", "system-uptime-check")
             and create_res.get("name") == "System Uptime Check"
-            and os.path.isfile(os.path.join(temp_skills_dir, "system_uptime_check", "SKILL.md"))
-            and os.path.isfile(os.path.join(temp_skills_dir, "system_uptime_check", "skill.py"))
+            and (os.path.isfile(os.path.join(temp_skills_dir, "system_uptime_check", "SKILL.md")) or os.path.isfile(os.path.join(temp_skills_dir, "system-uptime-check", "SKILL.md")))
+            and (os.path.isfile(os.path.join(temp_skills_dir, "system_uptime_check", "skill.py")) or os.path.isfile(os.path.join(temp_skills_dir, "system-uptime-check", "skill.py")))
         )
 
         # 1.2 Verify list_skills Level 0 metadata index
         skills_list = forge.list_skills()
         list_ok = (
             len(skills_list) == 1
-            and skills_list[0]["slug"] == "system_uptime_check"
+            and skills_list[0]["slug"] in ("system_uptime_check", "system-uptime-check")
             and "uptime" in " ".join(skills_list[0].get("triggers", []))
         )
 
@@ -283,7 +283,7 @@ def run_tests():
         dry_run=True
     )
     print(f"  [Route create_skill]: action='{p_create.get('action')}', slug='{p_create.get('slug')}'")
-    route_create_ok = p_create.get("action") == "create_skill" and p_create.get("slug") == "system_uptime_check"
+    route_create_ok = p_create.get("action") == "create_skill" and p_create.get("slug") in ("system_uptime_check", "system-uptime-check")
 
     # 5.2 Plan list_skills
     p_list = llm.plan("What skills do you have?", dry_run=True)

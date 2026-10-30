@@ -137,7 +137,7 @@ class TestV10ContextRemindersSkills(unittest.TestCase):
         """Test 4: Pre-Built Modular Hermes Skills Library discovery and execution."""
         forge = SkillForge()
         skills = forge.list_skills()
-        slugs = {s["slug"] for s in skills}
+        slugs = {s["slug"].replace("-", "_") for s in skills}
         expected = {
             "hardware_vitals",
             "desktop_janitor",
@@ -150,13 +150,13 @@ class TestV10ContextRemindersSkills(unittest.TestCase):
         # Trigger hardware_vitals via natural prompt
         r_ram = self.supervisor.plan_or_execute("What is eating my RAM?", dry_run=False)
         self.assertEqual(r_ram.get("action"), "run_learned_skill")
-        self.assertEqual(r_ram.get("slug"), "hardware_vitals")
+        self.assertIn(r_ram.get("slug"), ["hardware_vitals", "hardware-vitals"])
         self.assertIn("CPU", r_ram.get("voice_response", ""))
 
         # Trigger desktop_janitor via natural prompt
         r_dl = self.supervisor.plan_or_execute("Analyze my downloads", dry_run=False)
         self.assertEqual(r_dl.get("action"), "run_learned_skill")
-        self.assertEqual(r_dl.get("slug"), "desktop_janitor")
+        self.assertIn(r_dl.get("slug"), ["desktop_janitor", "desktop-janitor"])
         self.assertIn("Downloads", r_dl.get("voice_response", ""))
 
     def test_5_humanlike_anti_robotic_persona(self):

@@ -1,5 +1,5 @@
 ---
-name: Smart Windows Reminders & Action Center Alarms
+name: smart-reminders
 description: Schedules timezone-aware timers, alarms, and Windows 11 Action Center toast reminders.
 triggers:
   - reminder skill

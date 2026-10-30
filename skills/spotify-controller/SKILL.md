@@ -1,5 +1,5 @@
 ---
-name: Spotify Desktop & Now-Playing Controller
+name: spotify-controller
 description: Controls Spotify playback and reads the currently playing track from Spotify Desktop.
 triggers:
   - spotify now playing skill
