@@ -473,32 +473,22 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         """
 
-        # 1. Header-based email identity
-
-        email = (
-
-            request.headers.get("cf-access-authenticated-user-email")
-
-            or request.headers.get("x-user-email")
-
-        )
-
-        if email:
-
-            clean_email = email.lower().strip()
-
+        # 1. Header-based email identity (Strictly verified Cloudflare Access JWT)
+        cf_jwt = request.headers.get("cf-access-jwt-assertion")
+        cf_email = request.headers.get("cf-access-authenticated-user-email")
+        if cf_jwt and cf_email:
+            clean_email = cf_email.lower().strip()
             if clean_email == admin_email or clean_email.startswith(admin_email.split("@")[0]):
-
                 return {"authenticated": True, "role": "host", "method": "cloudflare_identity", "email": clean_email}
-
             else:
-
+                memory = getattr(supervisor.llm, "memory", None)
+                if memory and hasattr(memory, "get_user_by_email"):
+                    u = memory.get_user_by_email(clean_email)
+                    if u:
+                        return {"authenticated": True, "role": u.get("role", "tester"), "method": "cloudflare_identity", "email": clean_email, "label": u.get("display_name", "User")}
                 raise HTTPException(
-
                     status_code=403,
-
                     detail=f"Forbidden: Identity '{clean_email}' is not authorized to access Project Libra."
-
                 )
 
         # 2. Token-based authentication
@@ -707,10 +697,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         saved_path = os.path.join(upload_dir, saved_name)
 
+        if file_ext in {".exe", ".bat", ".cmd", ".vbs", ".ps1", ".sh", ".msi", ".scr", ".com", ".pif"}:
+            raise HTTPException(status_code=400, detail="Executable files are forbidden for upload.")
         content = await file.read()
-
+        if len(content) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Uploaded file exceeds 50MB limit.")
         with open(saved_path, "wb") as f:
-
             f.write(content)
 
         image_exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".svg"}
@@ -782,16 +774,13 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     # -----------------------------------------------------------------------
 
     @app.get("/api/vault")
-
     async def get_vault_facts_api(
-
         q: Optional[str] = Query(None),
-
         category: Optional[str] = Query(None),
-
         auth: Dict[str, Any] = Depends(authenticate_request)
-
     ):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Memory Vault is restricted to Host.")
 
         memory = getattr(supervisor.llm, "memory", None)
 
@@ -804,14 +793,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         return {"status": "error", "message": "Memory offline", "facts": []}
 
     @app.post("/api/vault")
-
     async def create_vault_fact_api(
-
         req: VaultFactRequest = Body(...),
-
         auth: Dict[str, Any] = Depends(authenticate_request)
-
     ):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Memory Vault is restricted to Host.")
 
         memory = getattr(supervisor.llm, "memory", None)
 
@@ -836,16 +823,13 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         return {"status": "error", "message": "Memory offline"}
 
     @app.put("/api/vault/{fact_id}")
-
     async def update_vault_fact_api(
-
         fact_id: int = Path(...),
-
         req: UpdateVaultFactRequest = Body(...),
-
         auth: Dict[str, Any] = Depends(authenticate_request)
-
     ):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Memory Vault is restricted to Host.")
 
         memory = getattr(supervisor.llm, "memory", None)
 
@@ -868,14 +852,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         return {"status": "error", "message": "Memory offline"}
 
     @app.delete("/api/vault/{fact_id}")
-
     async def delete_vault_fact_api(
-
         fact_id: int = Path(...),
-
         auth: Dict[str, Any] = Depends(authenticate_request)
-
     ):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Memory Vault is restricted to Host.")
 
         memory = getattr(supervisor.llm, "memory", None)
 
@@ -894,30 +876,25 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     # -----------------------------------------------------------------------
 
     @app.post("/api/bridge/drop")
-
     async def bridge_drop_file(
-
         file: UploadFile = File(...),
-
         open_on_pc: bool = Form(False),
-
         auth: Dict[str, Any] = Depends(authenticate_request)
-
     ):
-
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Bridge Drop is restricted to Host.")
         user_home = os.path.expanduser("~")
-
         drop_dir = os.path.join(user_home, "Downloads", "LibraDrop")
-
         os.makedirs(drop_dir, exist_ok=True)
-
         raw_filename = file.filename or "dropped_file"
-
         clean_filename = os.path.basename(raw_filename)
-
+        ext = os.path.splitext(clean_filename)[1].lower()
+        if ext in {".exe", ".bat", ".cmd", ".vbs", ".ps1", ".scr", ".com", ".msi", ".pif", ".wsf"}:
+            raise HTTPException(status_code=400, detail="Executable files cannot be transferred via Bridge.")
         dest_path = os.path.join(drop_dir, clean_filename)
-
         content = await file.read()
+        if len(content) > 100 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="File too large (max 100MB)")
 
         with open(dest_path, "wb") as f:
 
@@ -976,21 +953,26 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         }
 
     @app.get("/api/bridge/download")
-
     async def bridge_download_file(
-
         path: str = Query(...),
-
         auth: Dict[str, Any] = Depends(authenticate_request)
-
     ):
-
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: File download is restricted to Host.")
         norm_path = os.path.normpath(path)
-
         if not os.path.isfile(norm_path):
-
             raise HTTPException(status_code=404, detail="File not found on PC.")
-
+        user_home = os.path.expanduser("~")
+        allowed_dirs = [
+            os.path.normpath(os.path.join(user_home, "Downloads")),
+            os.path.normpath(os.path.join(PROJECT_ROOT, "uploads")),
+            os.path.normpath(os.path.join(PROJECT_ROOT, "assets")),
+        ]
+        is_safe = any(norm_path.lower().startswith(d.lower() + os.sep) or norm_path.lower() == d.lower() for d in allowed_dirs)
+        lower_p = norm_path.lower()
+        blocked_keywords = ["config.json", "config.local.json", ".env", ".git", "id_rsa", "credentials", "token.json", "system32"]
+        if any(b in lower_p for b in blocked_keywords) or not is_safe:
+            raise HTTPException(status_code=403, detail="Forbidden: Access to this file path is restricted.")
         filename = os.path.basename(norm_path)
 
         import mimetypes
@@ -1022,29 +1004,23 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         return {"status": "success", "pending": tg.get_pending_approvals()}
 
     @app.post("/api/trust/confirm")
-
     async def confirm_trust_action(
-
         req: TrustConfirmRequest = Body(...),
-
         auth: Dict[str, Any] = Depends(authenticate_request)
-
     ):
-
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Only host can resolve trust actions.")
         tg = get_trust_guard()
 
         return tg.resolve_approval(req.token, req.approve)
 
     @app.post("/api/trust/undo")
-
     async def undo_trust_action(
-
         req: TrustUndoRequest = Body(...),
-
         auth: Dict[str, Any] = Depends(authenticate_request)
-
     ):
-
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Only host can undo trust actions.")
         tg = get_trust_guard()
 
         return tg.undo_last(req.file_path)
@@ -1056,14 +1032,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     # -----------------------------------------------------------------------
 
     @app.get("/api/briefing")
-
     async def get_daily_briefing(
-
         force: bool = Query(False),
-
         auth: Dict[str, Any] = Depends(authenticate_request)
-
     ):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Daily briefing is restricted to Host.")
 
         briefing = getattr(supervisor.llm, "briefing_engine", None)
 
@@ -1581,8 +1555,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         return {"client_id": cid.strip(), "client_secret": csec.strip()}
 
     @app.post("/api/auth/google-config")
-
-    async def post_save_google_oauth_config(req: GoogleOAuthSaveConfigRequest):
+    async def post_save_google_oauth_config(
+        req: GoogleOAuthSaveConfigRequest,
+        auth: Dict[str, Any] = Depends(authenticate_request)
+    ):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Only host can configure Google OAuth.")
 
         """Saves Google OAuth Client ID and Secret to config.json."""
 
@@ -2122,8 +2100,10 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
             raise HTTPException(status_code=500, detail="Memory subsystem offline")
 
+        role = auth.get("role", "guest")
+        if role != "host" and session_id == "default":
+            raise HTTPException(status_code=403, detail="Forbidden: Host default session is protected.")
         user_email = auth.get("email", "")
-
         sess_meta = memory.get_session(session_id, user_email=user_email)
 
         if not sess_meta:
@@ -2192,8 +2172,9 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         user_email = auth.get("email", "")
 
+        if session_id == "default":
+            raise HTTPException(status_code=400, detail="Cannot delete default primary session.")
         if memory and hasattr(memory, "delete_session"):
-
             ok = memory.delete_session(session_id, user_email=user_email)
 
             return {"status": "success" if ok else "not_found", "session_id": session_id}
@@ -2240,7 +2221,11 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         """
 
-        user_email = (auth.get("email") or admin_email).strip().lower()
+        raw_email = auth.get("email") or ""
+        if auth.get("role") == "host":
+            user_email = (raw_email or admin_email).strip().lower()
+        else:
+            user_email = (raw_email or "guest@libra.local").strip().lower()
 
         memory = getattr(supervisor.llm, "memory", None)
 
@@ -2298,7 +2283,11 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         """
 
-        user_email = (auth.get("email") or admin_email).strip().lower()
+        raw_email = auth.get("email") or ""
+        if auth.get("role") == "host":
+            user_email = (raw_email or admin_email).strip().lower()
+        else:
+            user_email = (raw_email or "guest@libra.local").strip().lower()
 
         memory = getattr(supervisor.llm, "memory", None)
 
@@ -2319,16 +2308,22 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
     @app.post("/api/gui/show")
     async def post_gui_show(auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: PC GUI control is restricted to Host.")
         send_local_ipc_command("show")
         return {"status": "success", "message": "Showing PC GUI"}
 
     @app.post("/api/gui/hide")
     async def post_gui_hide(auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: PC GUI control is restricted to Host.")
         send_local_ipc_command("hide")
         return {"status": "success", "message": "Hiding PC GUI"}
 
     @app.post("/api/gui/toggle")
     async def post_gui_toggle(auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: PC GUI control is restricted to Host.")
         send_local_ipc_command("toggle")
         return {"status": "success", "message": "Toggled PC GUI visibility"}
 
@@ -2632,7 +2627,11 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                 # 2. Context Window Protection & System Knowledge Injection
 
-                user_email = (auth.get("email") or admin_email).strip().lower()
+                raw_email = auth.get("email") or ""
+                if auth.get("role") == "host":
+                    user_email = (raw_email or admin_email).strip().lower()
+                else:
+                    user_email = (raw_email or "guest@libra.local").strip().lower()
 
                 user_prof = {}
 
@@ -3311,7 +3310,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         t0 = time.perf_counter()
 
-        scope = "remote_host" if role == "host" else (req.client_scope or "remote_web")
+        scope = "remote_host" if role == "host" else "remote_web"
 
         memory = getattr(supervisor.llm, "memory", None)
 
@@ -3479,7 +3478,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                 }
 
-        effective_scope = req.client_scope if (req.client_scope == "remote_web" and not explicit_pc_target) else scope
+        effective_scope = "remote_host" if (role == "host" and (explicit_pc_target or req.client_scope == "remote_host")) else "remote_web"
 
         # 1. Ensure or auto-create session thread
 
@@ -4467,12 +4466,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                     await websocket.send_json({"type": "vitals", "data": sys_metrics})
 
                 elif msg_type == "chat":
-
                     prompt = data.get("prompt", "")
-
-                    scope = data.get("client_scope", "remote_web")
-
-                    sid = data.get("session_id", "default")
+                    is_ws_host = bool(token and token == access_token)
+                    scope = "remote_host" if is_ws_host else "remote_web"
+                    sid = data.get("session_id") or ("default" if is_ws_host else "guest_session")
+                    if not is_ws_host and sid == "default":
+                        sid = "guest_session" 
 
                     res = supervisor.process_command(prompt, client_scope=scope, dry_run=False, session_id=sid)
 

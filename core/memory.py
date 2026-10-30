@@ -3533,7 +3533,7 @@ class SemanticMemory:
 
                     FROM chat_sessions
 
-                    WHERE session_id = ? AND (user_email = '' OR LOWER(user_email) = ?)
+                    WHERE session_id = ? AND LOWER(user_email) = ?
 
                 """, (session_id, clean_email))
 
@@ -3615,7 +3615,7 @@ class SemanticMemory:
 
                     SET title = ?, updated_at = CURRENT_TIMESTAMP
 
-                    WHERE session_id = ? AND (user_email = '' OR LOWER(user_email) = ?)
+                    WHERE session_id = ? AND LOWER(user_email) = ?
 
                 """, (new_title.strip(), session_id, clean_email))
 
