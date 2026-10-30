@@ -896,12 +896,6 @@
 
   });
 
-      }
-
-    }
-
-  });
-
   // --------------------------------------------------------------------------
 
   // 6. CHAT RENDERING & LIGHTBOX
@@ -3665,7 +3659,17 @@
 
   if (signOutBtn) {
 
-    signOutBtn.addEventListener('click', async () => {
+    signOutBtn.addEventListener('click', async (e) => {
+
+      if (e) e.stopPropagation();
+
+      if (currentUserRole === 'guest') {
+
+        showAuthModal();
+
+        return;
+
+      }
 
       // 1. Instantly silence and abort all audio
 
@@ -4450,6 +4454,24 @@
       if (hostBugInbox) hostBugInbox.style.display = 'none';
 
       if (drawerHostTools) drawerHostTools.style.display = 'none';
+
+    }
+
+    if (signOutBtn) {
+
+      if (info.role === 'host' || info.role === 'tester') {
+
+        signOutBtn.title = 'Sign Out (' + displayEmail + ')';
+
+        signOutBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>';
+
+      } else {
+
+        signOutBtn.title = 'Sign In / Enter Token';
+
+        signOutBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"></path><polyline points="10 17 15 12 10 7"></polyline><line x1="15" y1="12" x2="3" y2="12"></line></svg>';
+
+      }
 
     }
 
@@ -7366,5 +7388,22 @@
       fetchSessions();
       fetchVitals();
       fetchTokenSummary();
+    });
+  }
+
+  const userProfileBadgeEl = document.getElementById('user-profile-badge');
+  if (userProfileBadgeEl) {
+    userProfileBadgeEl.style.cursor = 'pointer';
+    userProfileBadgeEl.addEventListener('click', (e) => {
+      if (e.target.closest('#sign-out-btn') || e.target.closest('#manage-users-drawer-btn')) return;
+      showAuthModal();
+    });
+  }
+
+  const headerRoleBadgeEl = document.getElementById('role-badge');
+  if (headerRoleBadgeEl) {
+    headerRoleBadgeEl.style.cursor = 'pointer';
+    headerRoleBadgeEl.addEventListener('click', () => {
+      showAuthModal();
     });
   }
