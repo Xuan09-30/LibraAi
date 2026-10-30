@@ -104,11 +104,17 @@ class SkillForge:
                 meta["md_path"] = md_path
                 meta["py_path"] = py_path
                 self.registry[item] = meta
+                # Register alternate slug for hyphen/underscore compatibility
+                alt_slug = item.replace("-", "_") if "-" in item else item.replace("_", "-")
+                if alt_slug != item:
+                    self.registry[alt_slug] = meta
 
     def _parse_skill_md(self, md_path: str) -> Dict[str, Any]:
         """Extracts YAML frontmatter from a SKILL.md document."""
+        folder_slug = os.path.basename(os.path.dirname(md_path))
         default_meta = {
-            "name": os.path.basename(os.path.dirname(md_path)),
+            "name": folder_slug,
+            "display_name": folder_slug.replace("-", " ").replace("_", " ").title(),
             "description": "Custom learned skill.",
             "triggers": [],
             "version": "1.0.0",
@@ -125,6 +131,13 @@ class SkillForge:
                 for k, v in parsed.items():
                     default_meta[k] = v
                 default_meta["body"] = body.strip()
+
+                # Extract human-readable title from markdown H1 if present
+                h1_match = re.search(r"^#\s+(.+)$", body, re.MULTILINE)
+                if h1_match:
+                    default_meta["display_name"] = h1_match.group(1).strip()
+                elif "name" in default_meta and default_meta["name"] != folder_slug:
+                    default_meta["display_name"] = default_meta["name"]
         except Exception as e:
             print(f"[SkillForge Metadata Parse Error on {md_path}]: {e}")
 
@@ -134,10 +147,16 @@ class SkillForge:
         """Returns the Level 0 metadata index of all registered skills."""
         self.refresh_registry()
         skills = []
+        seen_folders = set()
         for slug, meta in self.registry.items():
+            folder = meta.get("folder")
+            if folder in seen_folders:
+                continue
+            seen_folders.add(folder)
             skills.append({
-                "slug": slug,
+                "slug": meta.get("slug", slug),
                 "name": meta.get("name", slug),
+                "display_name": meta.get("display_name", meta.get("name", slug)),
                 "description": meta.get("description", ""),
                 "triggers": meta.get("triggers", []),
                 "version": meta.get("version", "1.0.0"),
@@ -209,14 +228,14 @@ class SkillForge:
             raw_name = "custom_skill"
 
         clean_name = re.sub(r"[^\w\s\-]", "", raw_name).strip().title()
-        skill_slug = re.sub(r"[^\w]+", "_", clean_name.lower()).strip("_")
+        skill_slug = re.sub(r"[^a-z0-9]+", "-", clean_name.lower()).strip("-")
         if not skill_slug:
-            skill_slug = "custom_skill"
+            skill_slug = "custom-skill"
 
         # 2. Generate code and triggers
         generated_code = None
         triggers = [
-            skill_slug.replace("_", " "),
+            skill_slug.replace("-", " "),
             clean_name.lower()
         ]
 
@@ -299,7 +318,7 @@ class SkillForge:
         py_file = os.path.join(skill_dir, "skill.py")
 
         frontmatter = {
-            "name": clean_name,
+            "name": skill_slug,
             "description": clean_desc,
             "triggers": list(set(triggers)),
             "version": "1.0.0",
@@ -448,6 +467,13 @@ def test_execute_contract_and_speed():
         self.refresh_registry()
         meta = self.registry.get(skill_slug)
         if not meta:
+            # Try alternate slug (hyphens vs underscores)
+            alt_slug = skill_slug.replace("-", "_") if "-" in skill_slug else skill_slug.replace("_", "-")
+            meta = self.registry.get(alt_slug)
+            if meta:
+                skill_slug = alt_slug
+
+        if not meta:
             # Try fuzzy match
             for s, m in self.registry.items():
                 if skill_slug.lower() in s.lower() or s.lower() in skill_slug.lower():
@@ -476,7 +502,8 @@ def test_execute_contract_and_speed():
             import types
             with open(path, "r", encoding="utf-8") as f:
                 code_str = f.read()
-            mod_name = f"skills.{skill_slug}.skill"
+            safe_slug = skill_slug.replace("-", "_")
+            mod_name = f"skills.{safe_slug}.skill"
             mod = types.ModuleType(mod_name)
             mod.__file__ = path
             sys.modules[mod_name] = mod

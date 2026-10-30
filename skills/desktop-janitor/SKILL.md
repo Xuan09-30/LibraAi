@@ -1,5 +1,5 @@
 ---
-name: Safe Downloads & Desktop Janitor
+name: desktop-janitor
 description: Analyzes Downloads folder clutter by file category and size without deleting user files.
 triggers:
   - analyze my downloads
@@ -7,7 +7,7 @@ triggers:
   - downloads summary
   - check my downloads clutter
 version: 1.0.0
-success_count: 16
+success_count: 18
 ---
 # Safe Downloads & Desktop Janitor
 Scans the Windows Downloads folder and breaks down installers, archives, images, and documents by count and megabytes.

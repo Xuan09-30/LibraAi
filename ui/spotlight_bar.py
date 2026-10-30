@@ -18,7 +18,23 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from skills.clipboard_manager import skill as clipboard_skill
+import importlib.util
+
+def _get_clipboard_skill():
+    for folder in ["clipboard-manager", "clipboard_manager"]:
+        py_path = os.path.join(PROJECT_ROOT, "skills", folder, "skill.py")
+        if os.path.isfile(py_path):
+            try:
+                spec = importlib.util.spec_from_file_location(f"skills.{folder.replace('-', '_')}.skill", py_path)
+                if spec and spec.loader:
+                    mod = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(mod)
+                    return mod
+            except Exception:
+                pass
+    return None
+
+clipboard_skill = _get_clipboard_skill()
 
 try:
     import keyboard
@@ -404,7 +420,7 @@ class SpotlightBar(QWidget):
         prev_clipboard = clipboard.text()
 
         # Preserve in clipboard manager ring-buffer
-        if prev_clipboard:
+        if prev_clipboard and clipboard_skill:
             try:
                 clipboard_skill.execute({"action": "save", "text": prev_clipboard}, {})
             except Exception:
