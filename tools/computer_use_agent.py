@@ -81,18 +81,18 @@ class AutonomousComputerUseAgent:
         if not q:
             return False
 
-        # Domain + multi-step navigation pattern
-        has_domain = bool(re.search(r"\b[a-z0-9\-]+\.(?:com|org|net|pk|io|tv|to|gg|co|me|ai|edu)\b", q))
+        # Domain + multi-step navigation pattern (e.g. "open cinejoy.pk and search for hannibal")
+        has_domain = bool(re.search(r"\b[a-z0-9\-]+\.(?:com|org|net|pk|io|tv|to|gg|co|me|ai|edu|gov|xyz)\b", q))
         has_nav_sequence = (
-            ("and then" in q or "then" in q or "find and search" in q or "and click" in q)
-            and any(w in q for w in ["chrome", "browser", "search", "click", "resume", "play", "watch", "type"])
+            ("and then" in q or "then" in q or "and search" in q or "search for" in q or "find and search" in q or "and click" in q or "and play" in q or "and watch" in q or "and find" in q)
+            and any(w in q for w in ["chrome", "browser", "search", "click", "resume", "play", "watch", "type", "find"])
         )
-        if has_domain and has_nav_sequence:
+        if has_domain and (has_nav_sequence or bool(re.search(r"\b(?:open|go\s+to|visit|browse|navigate\s+to)\s+[a-z0-9\-]+\.[a-z]{2,}\b.*?\b(?:search|find|click|type|play|watch|resume)\b", q))):
             return True
 
         # Explicit multi-step GUI chain ("open chrome ... search ... click ...")
         has_open_browser = any(w in q for w in ["open my chrome", "open chrome", "open google chrome", "in chrome"])
-        has_search_and_click = ("search" in q and "click" in q)
+        has_search_and_click = ("search" in q and ("click" in q or "watch" in q or "play" in q or "resume" in q))
         if has_open_browser and (has_domain or has_search_and_click):
             return True
 
@@ -370,8 +370,13 @@ class AutonomousComputerUseAgent:
         thought_steps: List[Dict[str, str]] = []
         step_num = 1
 
-        def _record_step(thought: str, action: str, status: str = "completed", **kwargs):
+        def _record_step(thought: str, action: str, status: str = "completed", pace: Optional[float] = None, **kwargs):
             nonlocal step_num
+            # Natural agent execution cadence so steps execute and stream one by one
+            if step_callback:
+                pause = pace if pace is not None else (0.45 if not dry_run else 0.35)
+                time.sleep(pause)
+
             entry: Dict[str, Any] = {
                 "step": step_num,
                 "thought": thought,
@@ -404,6 +409,10 @@ class AutonomousComputerUseAgent:
             step_num += 1
 
         def _record_retry(error_msg: str, attempt: int = 1, max_attempts: int = 3, reflection: str = ""):
+            # Reflexion pause so retry step appears with realistic timing
+            if step_callback:
+                time.sleep(0.60)
+
             entry: Dict[str, Any] = {
                 "step": f"error_{attempt}",
                 "attempt": attempt,
