@@ -9,6 +9,7 @@ import sys
 import json
 
 import time
+from datetime import datetime
 
 import wave
 
@@ -173,6 +174,33 @@ def load_web_config(config_path: str = "config.json") -> Dict[str, Any]:
             pass
 
     return cfg
+
+def load_github_config(config_path: str = "config.json") -> Dict[str, Any]:
+    full_path = os.path.join(PROJECT_ROOT, config_path)
+    local_path = os.path.join(PROJECT_ROOT, "config.local.json")
+    gh = {}
+    if os.path.exists(full_path):
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                val = data.get("github", {})
+                if isinstance(val, dict):
+                    gh.update(val)
+        except Exception:
+            pass
+    if os.path.exists(local_path):
+        try:
+            with open(local_path, "r", encoding="utf-8") as f:
+                local_data = json.load(f)
+                val = local_data.get("github", {})
+                if isinstance(val, dict) and val.get("token"):
+                    gh.update(val)
+        except Exception:
+            pass
+    if "GITHUB_TOKEN" in os.environ:
+        gh["token"] = os.environ["GITHUB_TOKEN"]
+        gh["enabled"] = True
+    return gh or {"enabled": False, "repo": "Xuan09-30/LibraAi", "token": ""}
 
 # ---------------------------------------------------------------------------
 
@@ -2880,6 +2908,9 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                     r"\b(?:what\s+window|what\s+application|what\s+am\s+i\s+playing|currently\s+looking\s+at)\b",
 
+                    # 9. Factual queries requiring verified ground truth & anti-hallucination
+                    r"\b(?:what\s+is\s+the\s+difference|how\s+many|what\s+year|when\s+was|who\s+wrote|who\s+invented|who\s+discovered|who\s+directed|who\s+starred|capital\s+of|population\s+of|specs\s+of|release\s+date|how\s+to\s+fix|what\s+caused)\b"
+
                 ]
 
                 is_tool_or_search_query = any(re.search(pat, req.prompt.strip(), re.IGNORECASE) for pat in realtime_search_patterns) or AutonomousComputerUseAgent.is_computer_use_prompt(req.prompt.strip())
@@ -3035,18 +3066,17 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                                     return
 
-                                # Emit initial thought steps for standard streaming chat
-
+                                # Contextual Grounding step
                                 q_clean = req.prompt.strip()[:65]
-                                thought_steps = [
-                                    {"step": 1, "title": "Semantic Intent Analysis", "detail": f"Analyzing conversational context and user objectives for '{q_clean}'.", "action": "intent_analysis", "status": "done"},
-                                    {"step": 2, "title": "Episodic & Procedural Memory Recall", "detail": "Cross-referenced user preferences, historical sessions, and active memory vault.", "action": "memory_recall", "status": "done"},
-                                    {"step": 3, "title": "Hardware & VRAM Governor Allocation", "detail": f"Allocated {target_model} on NVIDIA GeForce RTX 5060 Ti with active VRAM Governor (Keep-Alive: 15m).", "action": "vram_allocation", "status": "done"},
-                                    {"step": 4, "title": "Neural Streaming & Real-Time Verification", "detail": "Streaming contextual tokens with refusal interception and safety guards.", "action": "neural_stream", "status": "streaming"}
-                                ]
-                                for s_item in thought_steps:
-                                    await event_queue.put({"type": "thought_step", "step": s_item})
-                                    await asyncio.sleep(0.18)
+                                initial_step = {
+                                    "step": 1,
+                                    "title": "Contextual Grounding",
+                                    "thought": f"Cross-referenced session memory vault and persona context for '{q_clean}'.",
+                                    "action": "grounding",
+                                    "status": "done"
+                                }
+                                thought_steps = [initial_step]
+                                await event_queue.put({"type": "thought_step", "step": initial_step})
 
                                 async for line in resp.aiter_lines():
 
@@ -3058,7 +3088,15 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                                         chunk = json.loads(line)
 
-                                        token = chunk.get("message", {}).get("content", "")
+                                        msg = chunk.get("message", {})
+
+                                        thinking_tok = msg.get("thinking", "")
+
+                                        token = msg.get("content", "")
+
+                                        if thinking_tok:
+
+                                            await event_queue.put({"type": "thought_step", "step": {"thought": thinking_tok}})
 
                                         if token:
 
@@ -3080,7 +3118,9 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                                                 "i cannot browse", "i can't browse", "for real-time updates", "check the official",
 
-                                                "check online yourself"
+                                                "check online yourself", "i'm sorry, but i don't have", "i do not have information about",
+
+                                                "my knowledge is limited", "i cannot access the internet"
 
                                             ]):
 
@@ -4507,6 +4547,328 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         except Exception as e:
 
             logger.warning(f"WebSocket session closed: {e}")
+
+    # -----------------------------------------------------------------------
+    # GITHUB ISSUE INTEGRATION & TESTER BUG TRACKER (PHASE 12.6)
+    # -----------------------------------------------------------------------
+    @app.get("/api/github/config")
+    async def get_github_config(auth: Dict[str, Any] = Depends(authenticate_request)):
+        gh_cfg = load_github_config(config_path)
+        token = gh_cfg.get("token", "")
+        has_token = bool(token and token not in ["YOUR_GITHUB_TOKEN", "", None])
+        return {
+            "status": "success",
+            "repo": gh_cfg.get("repo", "Xuan09-30/LibraAi"),
+            "has_token": has_token,
+            "enabled": gh_cfg.get("enabled", True) if has_token else False
+        }
+
+    @app.post("/api/github/config")
+    async def post_github_config(req: Request, auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Only host can configure GitHub integration.")
+        data = await req.json()
+        token = str(data.get("token", "")).strip()
+        repo = str(data.get("repo", "Xuan09-30/LibraAi")).strip()
+        if not token:
+            raise HTTPException(status_code=400, detail="Personal Access Token is required.")
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                res = await client.get(
+                    f"https://api.github.com/repos/{repo}",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "User-Agent": "LibraAi-BugTracker",
+                        "Accept": "application/vnd.github+json"
+                    }
+                )
+                if res.status_code != 200:
+                    raise HTTPException(status_code=400, detail=f"GitHub API Error {res.status_code}: Token or repository invalid.")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to verify GitHub token: {e}")
+
+        try:
+            local_cfg_path = os.path.join(PROJECT_ROOT, "config.local.json")
+            local_cfg = {}
+            if os.path.exists(local_cfg_path):
+                try:
+                    with open(local_cfg_path, "r", encoding="utf-8") as rf:
+                        local_cfg = json.load(rf)
+                except Exception:
+                    pass
+            local_cfg["github"] = {
+                "enabled": True,
+                "repo": repo,
+                "token": token
+            }
+            with open(local_cfg_path, "w", encoding="utf-8") as wf:
+                json.dump(local_cfg, wf, indent=2)
+
+            full_cfg_path = os.path.join(PROJECT_ROOT, config_path)
+            if os.path.exists(full_cfg_path):
+                try:
+                    with open(full_cfg_path, "r", encoding="utf-8") as rf:
+                        full_cfg = json.load(rf)
+                    full_cfg["github"] = {
+                        "enabled": True,
+                        "repo": repo,
+                        "token": "YOUR_GITHUB_TOKEN"
+                    }
+                    with open(full_cfg_path, "w", encoding="utf-8") as wf:
+                        json.dump(full_cfg, wf, indent=2)
+                except Exception:
+                    pass
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to persist config: {e}")
+
+        return {"status": "success", "repo": repo, "has_token": True}
+
+    @app.get("/api/bugs")
+    async def get_bugs(auth: Dict[str, Any] = Depends(authenticate_request)):
+        reports_file = os.path.join(PROJECT_ROOT, "logs", "bug_reports.json")
+        history_file = os.path.join(PROJECT_ROOT, "logs", "bug_history.json")
+        active = []
+        resolved = []
+        if os.path.exists(reports_file):
+            try:
+                with open(reports_file, "r", encoding="utf-8") as f:
+                    active = json.load(f)
+            except Exception:
+                active = []
+        if os.path.exists(history_file):
+            try:
+                with open(history_file, "r", encoding="utf-8") as f:
+                    resolved = json.load(f)
+            except Exception:
+                resolved = []
+        total = len(active) + len(resolved)
+        since = "2026-10-28"
+        if active or resolved:
+            all_reports = active + resolved
+            dates = [r.get("created_at", "") for r in all_reports if r.get("created_at")]
+            if dates:
+                since = min(dates)
+        stats = {
+            "total_submitted": total,
+            "active_count": len(active),
+            "resolved_count": len(resolved),
+            "tracking_since": since
+        }
+        return {"status": "success", "reports": active, "resolved": resolved, "stats": stats}
+
+    @app.post("/api/bugs")
+    async def post_bug(req: Request, auth: Dict[str, Any] = Depends(authenticate_request)):
+        data = await req.json()
+        desc = str(data.get("description", "")).strip()
+        if not desc:
+            raise HTTPException(status_code=400, detail="Bug description is required.")
+        reporter = str(data.get("reporter_name", "")).strip() or auth.get("email", "Tester")
+        category = str(data.get("category", "General")).strip()
+        device_info = str(data.get("device_info", "")).strip()
+        session_id = str(data.get("session_id", "")).strip()
+        screenshot_b64 = data.get("screenshot", "")
+        role = auth.get("role", "tester")
+
+        bug_id = f"bug_{int(time.time() * 1000)}"
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        has_screenshot = False
+        if screenshot_b64 and isinstance(screenshot_b64, str) and screenshot_b64.startswith("data:image/"):
+            try:
+                header, b64_data = screenshot_b64.split(",", 1)
+                img_bytes = base64.b64decode(b64_data)
+                assets_dir = os.path.join(PROJECT_ROOT, "assets", "bug_screenshots")
+                os.makedirs(assets_dir, exist_ok=True)
+                shot_path = os.path.join(assets_dir, f"{bug_id}.png")
+                with open(shot_path, "wb") as bf:
+                    bf.write(img_bytes)
+                has_screenshot = True
+            except Exception as e:
+                logger.warning(f"Failed to save bug screenshot: {e}")
+
+        # Post to GitHub Issues if token available
+        gh_cfg = load_github_config(config_path)
+        token = gh_cfg.get("token", "")
+        repo = gh_cfg.get("repo", "Xuan09-30/LibraAi")
+        gh_issue_url = None
+        gh_issue_num = None
+
+        if token and token not in ["YOUR_GITHUB_TOKEN", "", None] and gh_cfg.get("enabled", True):
+            try:
+                issue_title = f"[Bug] [{category}] {desc[:60]}"
+                issue_body = (
+                    f"### 🐞 Bug Report from Project Libra\n"
+                    f"- **Reporter**: {reporter} (`{role}`)\n"
+                    f"- **Category**: {category}\n"
+                    f"- **Timestamp**: {now_str}\n"
+                    f"- **Session ID**: `{session_id}`\n"
+                    f"- **Device**: `{device_info}`\n\n"
+                    f"### Description\n"
+                    f"{desc}\n\n"
+                )
+                if has_screenshot:
+                    raw_gh_url = f"https://raw.githubusercontent.com/{repo}/master/assets/bug_screenshots/{bug_id}.png"
+                    issue_body += f"### Screenshot\n![Bug Screenshot]({raw_gh_url})\n\n*(Saved locally: `assets/bug_screenshots/{bug_id}.png`)*\n"
+
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    gh_res = await client.post(
+                        f"https://api.github.com/repos/{repo}/issues",
+                        headers={
+                            "Authorization": f"Bearer {token}",
+                            "User-Agent": "LibraAi-BugTracker",
+                            "Accept": "application/vnd.github+json"
+                        },
+                        json={
+                            "title": issue_title,
+                            "body": issue_body,
+                            "labels": ["bug", category.lower().replace(" ", "-")]
+                        }
+                    )
+                    if gh_res.status_code in [200, 201]:
+                        gh_data = gh_res.json()
+                        gh_issue_url = gh_data.get("html_url")
+                        gh_issue_num = gh_data.get("number")
+                    else:
+                        logger.warning(f"GitHub Issue creation returned {gh_res.status_code}: {gh_res.text}")
+            except Exception as e:
+                logger.warning(f"Error creating GitHub issue: {e}")
+
+        new_bug = {
+            "id": bug_id,
+            "reporter": reporter,
+            "role": role,
+            "category": category,
+            "description": desc,
+            "device_info": device_info,
+            "session_id": session_id,
+            "has_screenshot": has_screenshot,
+            "screenshot_url": f"/api/bugs/screenshot/{bug_id}" if has_screenshot else None,
+            "github_screenshot_url": f"https://raw.githubusercontent.com/{repo}/master/assets/bug_screenshots/{bug_id}.png" if has_screenshot else None,
+            "created_at": now_str,
+            "status": "open",
+            "resolved_at": None,
+            "github_issue_url": gh_issue_url,
+            "github_issue_number": gh_issue_num
+        }
+
+        logs_dir = os.path.join(PROJECT_ROOT, "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        reports_file = os.path.join(logs_dir, "bug_reports.json")
+        reports = []
+        if os.path.exists(reports_file):
+            try:
+                with open(reports_file, "r", encoding="utf-8") as f:
+                    reports = json.load(f)
+            except Exception:
+                reports = []
+        reports.insert(0, new_bug)
+        with open(reports_file, "w", encoding="utf-8") as f:
+            json.dump(reports, f, indent=2)
+
+        return {
+            "status": "success",
+            "id": bug_id,
+            "github_issue_url": gh_issue_url,
+            "github_issue_number": gh_issue_num
+        }
+
+    @app.get("/api/bugs/screenshot/{bug_id}")
+    async def get_bug_screenshot(bug_id: str):
+        safe_id = re.sub(r"[^a-zA-Z0-9_]", "", bug_id)
+        path = os.path.join(PROJECT_ROOT, "assets", "bug_screenshots", f"{safe_id}.png")
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail="Screenshot not found.")
+        return FileResponse(path, media_type="image/png")
+
+    @app.post("/api/bugs/{bug_id}/sync-github")
+    async def post_sync_bug_github(bug_id: str, auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Host only.")
+        reports_file = os.path.join(PROJECT_ROOT, "logs", "bug_reports.json")
+        if not os.path.exists(reports_file):
+            raise HTTPException(status_code=404, detail="No bug reports found.")
+        with open(reports_file, "r", encoding="utf-8") as f:
+            reports = json.load(f)
+        target = next((r for r in reports if r.get("id") == bug_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail="Bug report not found.")
+
+        gh_cfg = load_github_config(config_path)
+        token = gh_cfg.get("token", "")
+        repo = gh_cfg.get("repo", "Xuan09-30/LibraAi")
+        if not token or token == "YOUR_GITHUB_TOKEN":
+            raise HTTPException(status_code=400, detail="GitHub Token not configured.")
+
+        issue_title = f"[Bug] [{target.get('category', 'Bug')}] {target.get('description', '')[:60]}"
+        issue_body = (
+            f"### 🐞 Bug Report from Project Libra\n"
+            f"- **Reporter**: {target.get('reporter')} (`{target.get('role')}`)\n"
+            f"- **Category**: {target.get('category')}\n"
+            f"- **Timestamp**: {target.get('created_at')}\n"
+            f"- **Session ID**: `{target.get('session_id')}`\n\n"
+            f"### Description\n"
+            f"{target.get('description')}\n"
+        )
+        if target.get("has_screenshot"):
+            raw_gh_url = f"https://raw.githubusercontent.com/{repo}/master/assets/bug_screenshots/{bug_id}.png"
+            issue_body += f"\n### Screenshot\n![Bug Screenshot]({raw_gh_url})\n"
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            gh_res = await client.post(
+                f"https://api.github.com/repos/{repo}/issues",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "User-Agent": "LibraAi-BugTracker",
+                    "Accept": "application/vnd.github+json"
+                },
+                json={"title": issue_title, "body": issue_body, "labels": ["bug"]}
+            )
+            if gh_res.status_code not in [200, 201]:
+                raise HTTPException(status_code=400, detail=f"GitHub API Error: {gh_res.text}")
+            gh_data = gh_res.json()
+            target["github_issue_url"] = gh_data.get("html_url")
+            target["github_issue_number"] = gh_data.get("number")
+
+        with open(reports_file, "w", encoding="utf-8") as f:
+            json.dump(reports, f, indent=2)
+
+        return {"status": "success", "github_issue_url": target["github_issue_url"], "github_issue_number": target["github_issue_number"]}
+
+    @app.delete("/api/bugs/{bug_id}")
+    async def delete_bug(bug_id: str, auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Host only.")
+        reports_file = os.path.join(PROJECT_ROOT, "logs", "bug_reports.json")
+        history_file = os.path.join(PROJECT_ROOT, "logs", "bug_history.json")
+        if not os.path.exists(reports_file):
+            raise HTTPException(status_code=404, detail="No bug reports found.")
+        with open(reports_file, "r", encoding="utf-8") as f:
+            reports = json.load(f)
+        idx = next((i for i, r in enumerate(reports) if r.get("id") == bug_id), None)
+        if idx is None:
+            raise HTTPException(status_code=404, detail="Bug report not found.")
+        resolved_item = reports.pop(idx)
+        resolved_item["status"] = "resolved"
+        resolved_item["resolved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with open(reports_file, "w", encoding="utf-8") as f:
+            json.dump(reports, f, indent=2)
+
+        history = []
+        if os.path.exists(history_file):
+            try:
+                with open(history_file, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            except Exception:
+                history = []
+        history.insert(0, resolved_item)
+        with open(history_file, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+
+        return {"status": "success", "message": "Bug resolved and archived."}
 
     return app
 

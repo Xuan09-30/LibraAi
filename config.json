@@ -26,7 +26,7 @@
     "domain": ""
   },
   "github": {
-    "enabled": false,
+    "enabled": true,
     "repo": "Xuan09-30/LibraAi",
     "token": "YOUR_GITHUB_TOKEN"
   }

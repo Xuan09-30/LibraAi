@@ -4139,6 +4139,11 @@ header {
   cursor: not-allowed;
 }
 
+.user-role-select option {
+  background-color: #0b1329 !important;
+  color: #e2e8f0 !important;
+}
+
 .user-delete-btn {
   background: rgba(239, 68, 68, 0.1);
   border: 1px solid rgba(239, 68, 68, 0.25);
