@@ -962,6 +962,12 @@
     return defaultText || 'Analyzed memory context, queried neural model, synthesized response';
   }
 
+  function formatThoughtReasoning(text) {
+    if (!text) return '';
+    const escaped = escapeHtml(text);
+    return escaped.replace(/`([^`]+)`/g, '<span class="thought-code-pill">$1</span>');
+  }
+
   function renderThoughtStepItemHtml(s, idx) {
     const stepNum = s.step || (idx + 1);
     const isRetry = s.status === 'retry' || s.action === 'retry' || (s.title && s.title.toLowerCase().includes('error')) || (s.thought && s.thought.includes('attempt'));
@@ -980,12 +986,12 @@
       headerText = `Ran type ('${s.text || ''}')`;
     } else if (action === 'done') {
       headerText = `Completed task`;
-    } else if (s.title && s.title.startsWith('Ran ')) {
-      headerText = s.title;
+    } else if (s.title && (s.title.startsWith('Ran ') || s.title.startsWith('Check '))) {
+      headerText = s.title.startsWith('Ran ') ? s.title : `Ran ${s.title.toLowerCase()}`;
     } else if (s.title) {
-      headerText = s.title;
+      headerText = `Ran ${s.title.toLowerCase()}`;
     } else {
-      headerText = `Step ${stepNum}`;
+      headerText = `Ran step ${stepNum}`;
     }
 
     const paramObj = {};
@@ -997,12 +1003,12 @@
 
     return `
       <div class="thought-action-row ${isRetry ? 'thought-retry-row' : ''} ${isCorrected ? 'thought-corrected-row' : ''}">
-        <button class="thought-action-btn" type="button" aria-expanded="false" title="Click to inspect action payload">
+        <button class="thought-action-btn" type="button" aria-expanded="false" title="Click to inspect action details">
           <span class="thought-action-label">${escapeHtml(headerText)}</span>
           <span class="thought-action-chevron">&gt;</span>
         </button>
         <div class="thought-action-pane" style="display: none;">
-          ${rationale ? `<div class="thought-action-rationale">${escapeHtml(rationale)}</div>` : ''}
+          ${rationale ? `<div class="thought-action-rationale">${formatThoughtReasoning(rationale)}</div>` : ''}
           <pre class="thought-action-code"><code>${escapeHtml(paramJson)}</code></pre>
         </div>
       </div>
@@ -1049,7 +1055,7 @@
     const acc = document.createElement('div');
     acc.className = 'thought-accordion' + (isStreaming ? ' streaming' : '');
 
-    const durationText = isStreaming ? 'Working... ▾' : `Worked for ${formatDuration(elapsedSec)} ▾`;
+    const durationText = initialLabel || (isStreaming ? 'Thinking... 0s ▾' : `Worked for ${formatDuration(elapsedSec)} ▾`);
     const summaryText = getThoughtSummary(steps);
     const stepsHtml = (steps && steps.length > 0) ? steps.map(renderThoughtStepItemHtml).join('') : '';
 
@@ -1077,7 +1083,7 @@
             <span class="thought-sub-chevron">▾</span>
           </button>
           <div class="thought-sub-content">
-            <div class="thought-cot-text">${escapeHtml(reasoning || '')}</div>
+            <div class="thought-cot-text">${formatThoughtReasoning(reasoning || '')}</div>
           </div>
         </div>
         <div class="thought-actions-list">${stepsHtml}</div>
@@ -1093,13 +1099,22 @@
     const list = acc.querySelector('.thought-actions-list');
     if (!list) return;
 
-    const rowWrapper = document.createElement('div');
-    rowWrapper.innerHTML = renderThoughtStepItemHtml(stepData, list.children.length);
-    const newRow = rowWrapper.firstElementChild;
-    if (newRow) {
-      list.appendChild(newRow);
-      const btn = newRow.querySelector('.thought-action-btn');
-      if (btn) _wireActionBtn(btn);
+    if (stepData.thought && !stepData.action && !stepData.title) {
+      updateThoughtAccordionReasoning(acc, stepData.thought);
+    } else {
+      const rowWrapper = document.createElement('div');
+      rowWrapper.innerHTML = renderThoughtStepItemHtml(stepData, list.children.length);
+      const newRow = rowWrapper.firstElementChild;
+      if (newRow) {
+        list.appendChild(newRow);
+        const btn = newRow.querySelector('.thought-action-btn');
+        if (btn) _wireActionBtn(btn);
+      }
+    }
+
+    if (stepData.thought && !acc._hasReasoning) {
+      updateThoughtAccordionReasoning(acc, stepData.thought);
+      acc._hasReasoning = true;
     }
 
     const summaryLine = acc.querySelector('.thought-summary-line');
@@ -1115,18 +1130,19 @@
     if (subSec && cotText) {
       subSec.style.display = 'block';
       subSec.classList.remove('collapsed');
-      cotText.textContent = reasoningText;
+      cotText.innerHTML = formatThoughtReasoning(reasoningText);
     }
   }
 
   function finalizeThoughtAccordion(acc, steps, t0_stream) {
-    if (!acc) return;
+    if (!acc || acc._isFinalized) return;
+    acc._isFinalized = true;
     acc.classList.remove('streaming');
     if (acc._timerInterval) {
       clearInterval(acc._timerInterval);
       acc._timerInterval = null;
     }
-    const elapsedSec = t0_stream ? ((performance.now() - t0_stream) / 1000) : 8;
+    const elapsedSec = t0_stream ? Math.max(1, ((performance.now() - t0_stream) / 1000)) : 8;
     const durLabel = acc.querySelector('.thought-duration-label');
     const pulseDot = acc.querySelector('.thought-pulse-dot');
     if (pulseDot) pulseDot.remove();
@@ -1135,7 +1151,7 @@
     }
 
     const summaryLine = acc.querySelector('.thought-summary-line');
-    if (summaryLine) {
+    if (summaryLine && steps && steps.length > 0) {
       summaryLine.textContent = getThoughtSummary(steps) + ' ▾';
     }
 
@@ -2721,15 +2737,16 @@
       let activeThoughtSteps = [];
       const thoughtAccordion = createThoughtAccordion(
         activeThoughtSteps,
-        'Working... 0s ▾',
+        'Thinking... 0s ▾',
         true
       );
       let streamElapsedSec = 0;
       thoughtAccordion._timerInterval = setInterval(() => {
+        if (!thoughtAccordion || thoughtAccordion._isFinalized) return;
         streamElapsedSec += 1;
         const durLabel = thoughtAccordion.querySelector('.thought-duration-label');
         if (durLabel && thoughtAccordion.classList.contains('streaming')) {
-          durLabel.textContent = `Working... ${formatDuration(streamElapsedSec)} ▾`;
+          durLabel.textContent = `Thinking... ${formatDuration(streamElapsedSec)} ▾`;
         }
       }, 1000);
       contentDiv.appendChild(thoughtAccordion);
@@ -2897,13 +2914,16 @@
                   activeThreadTitleEl.textContent = data.session_title;
                 }
               } else if (data.type === 'thought') {
-                if (thoughtAccordion) {
+                if (thoughtAccordion && !thoughtAccordion._isFinalized) {
                   if (data.steps && Array.isArray(data.steps)) {
-                    data.steps.forEach(s => appendLiveStepToAccordion(thoughtAccordion, s));
+                    data.steps.forEach(s => {
+                      activeThoughtSteps.push(s);
+                      appendLiveStepToAccordion(thoughtAccordion, s);
+                    });
                   }
                 }
               } else if (data.type === 'thought_step') {
-                if (thoughtAccordion && data.step) {
+                if (thoughtAccordion && data.step && !thoughtAccordion._isFinalized) {
                   activeThoughtSteps.push(data.step);
                   appendLiveStepToAccordion(thoughtAccordion, data.step);
                 }
@@ -2911,6 +2931,10 @@
                 accumulatedText = '';
                 renderProgressive(true);
               } else if (data.type === 'token') {
+                // First answer token: thinking is finished! Immediately freeze thought timer & accordion
+                if (thoughtAccordion && !thoughtAccordion._isFinalized) {
+                  finalizeThoughtAccordion(thoughtAccordion, activeThoughtSteps, t0_stream);
+                }
                 accumulatedText += data.content;
                 renderProgressive(false);
               } else if (data.type === 'audio') {
@@ -2921,7 +2945,7 @@
               } else if (data.type === 'done') {
                 finalTokenMetrics = data.token_metrics;
                 renderProgressive(true);
-                if (thoughtAccordion) {
+                if (thoughtAccordion && !thoughtAccordion._isFinalized) {
                   finalizeThoughtAccordion(thoughtAccordion, data.thought_steps || activeThoughtSteps, t0_stream);
                 }
               }
@@ -3089,6 +3113,16 @@
 
       setOrbState('error', 'OFFLINE');
 
+    } finally {
+      if (typeof thoughtAccordion !== 'undefined' && thoughtAccordion) {
+        if (!thoughtAccordion._isFinalized) {
+          finalizeThoughtAccordion(thoughtAccordion, activeThoughtSteps, t0_stream);
+        }
+        if (thoughtAccordion._timerInterval) {
+          clearInterval(thoughtAccordion._timerInterval);
+          thoughtAccordion._timerInterval = null;
+        }
+      }
     }
 
   }

@@ -4318,96 +4318,98 @@ header {
 
 /* ==========================================================================
    AI THOUGHT PROCESS & MODEL REASONING ACCORDION (PHASE 12.6)
-   Sleek Antigravity / Cursor Cybernetic Thought Hierarchy
+   Clean, Unboxed, GitHub/Antigravity Neutral Minimalist Hierarchy
+   Matching media_1793419035062_970bd910.png reference
    ========================================================================== */
 .thought-accordion {
-  margin-bottom: 14px;
-  border-radius: 8px;
-  background: rgba(15, 18, 24, 0.7);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  overflow: hidden;
-  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  margin: 6px 0 14px 0;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  border-radius: 0 !important;
+  padding: 0 !important;
   max-width: 100%;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
 }
 
 .thought-accordion:hover {
-  border-color: rgba(255, 255, 255, 0.16);
-  background: rgba(18, 22, 30, 0.85);
+  background: transparent !important;
+  border: none !important;
 }
 
 .thought-accordion.streaming {
-  border-color: rgba(0, 242, 254, 0.4);
-  box-shadow: 0 0 16px rgba(0, 242, 254, 0.08);
+  border: none !important;
+  box-shadow: none !important;
 }
 
 .thought-top-header {
-  padding: 8px 12px 6px 12px;
+  padding: 2px 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
   cursor: pointer;
   user-select: none;
 }
 
 .thought-duration-btn {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 6px;
   background: transparent;
   border: none;
   padding: 0;
   margin: 0;
-  color: #cbd5e1;
+  color: #8b949e;
   font-size: 13px;
-  font-weight: 500;
-  font-family: inherit;
+  font-weight: 400;
   cursor: pointer;
   text-align: left;
   transition: color 0.15s ease;
 }
 
 .thought-duration-btn:hover {
-  color: #ffffff;
+  color: #c9d1d9;
 }
 
 .thought-duration-label {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: 4px;
+  color: #8b949e;
 }
 
 .thought-pulse-dot {
   display: inline-block;
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
   border-radius: 50%;
-  background: var(--neon-cyan);
+  background: #58a6ff;
   margin-right: 4px;
+  opacity: 0.85;
   animation: pulse-thought 1.2s infinite ease-in-out;
 }
 
 @keyframes pulse-thought {
-  0% { transform: scale(0.9); opacity: 0.6; }
-  50% { transform: scale(1.3); opacity: 1; filter: drop-shadow(0 0 4px #00f2fe); }
-  100% { transform: scale(0.9); opacity: 0.6; }
+  0% { transform: scale(0.9); opacity: 0.5; }
+  50% { transform: scale(1.15); opacity: 1; }
+  100% { transform: scale(0.9); opacity: 0.5; }
 }
 
 .thought-summary-line {
-  font-size: 11.5px;
-  color: #64748b;
-  margin-left: 2px;
+  font-size: 12.5px;
+  color: #8b949e;
   cursor: pointer;
   transition: color 0.15s ease;
 }
 
 .thought-summary-line:hover {
-  color: #94a3b8;
+  color: #c9d1d9;
 }
 
 .thought-body {
-  padding: 6px 12px 12px 12px;
-  border-top: 1px solid rgba(255, 255, 255, 0.05);
-  background: rgba(10, 12, 16, 0.45);
+  padding: 6px 0 6px 16px;
+  background: transparent !important;
+  border: none !important;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -4417,39 +4419,37 @@ header {
   display: none !important;
 }
 
-/* Collapsible CoT Reasoning Section */
+/* Collapsible Thought & Reasoning Section */
 .thought-sub-section {
-  border-radius: 6px;
-  background: rgba(0, 0, 0, 0.3);
-  border-left: 2px solid var(--neon-cyan);
-  padding: 6px 10px;
-  margin-bottom: 4px;
+  background: transparent !important;
+  border: none !important;
+  border-left: none !important;
+  padding: 2px 0;
+  margin-bottom: 2px;
 }
 
 .thought-sub-header {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  justify-content: space-between;
-  width: 100%;
+  gap: 5px;
   background: transparent;
   border: none;
   padding: 0;
-  color: #94a3b8;
+  color: #8b949e;
   font-size: 12px;
-  font-weight: 500;
-  font-family: inherit;
+  font-weight: 400;
   cursor: pointer;
   transition: color 0.15s ease;
 }
 
 .thought-sub-header:hover {
-  color: #e2e8f0;
+  color: #c9d1d9;
 }
 
 .thought-sub-chevron {
-  font-size: 10px;
-  color: #64748b;
-  transition: transform 0.2s ease;
+  font-size: 11px;
+  color: #8b949e;
+  transition: transform 0.15s ease;
 }
 
 .thought-sub-section.collapsed .thought-sub-chevron {
@@ -4461,45 +4461,55 @@ header {
 }
 
 .thought-cot-text {
-  margin-top: 6px;
-  font-size: 11.5px;
-  color: #cbd5e1;
-  line-height: 1.5;
+  margin: 6px 0 8px 14px;
+  font-size: 12px;
+  color: #8b949e;
+  line-height: 1.55;
   white-space: pre-wrap;
   word-break: break-word;
 }
 
-/* Tool & Action Rows */
+/* Inline Code Pill for Reasoning Text (e.g. `gui.py`) */
+.thought-code-pill {
+  display: inline-block;
+  background: #161b22;
+  border: 1px solid rgba(240, 246, 252, 0.12);
+  border-radius: 4px;
+  padding: 1px 6px;
+  color: #f0f6fc;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  margin: 0 2px;
+}
+
+/* Action Rows (e.g. "Ran check running processes >") */
 .thought-actions-list {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
 }
 
 .thought-action-row {
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.02);
-  border: 1px solid rgba(255, 255, 255, 0.04);
-  overflow: hidden;
-  transition: border-color 0.15s ease, background 0.15s ease;
+  background: transparent !important;
+  border: none !important;
+  border-radius: 4px;
+  transition: background 0.12s ease;
 }
 
 .thought-action-row:hover {
-  border-color: rgba(255, 255, 255, 0.1);
-  background: rgba(255, 255, 255, 0.04);
+  background: rgba(255, 255, 255, 0.03) !important;
 }
 
 .thought-action-btn {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  justify-content: space-between;
-  width: 100%;
-  padding: 6px 10px;
+  gap: 5px;
+  padding: 3px 0;
   background: transparent;
   border: none;
-  color: #94a3b8;
+  color: #8b949e;
   font-size: 12px;
-  font-family: inherit;
   cursor: pointer;
   text-align: left;
   user-select: none;
@@ -4507,24 +4517,19 @@ header {
 }
 
 .thought-action-btn:hover {
-  color: #f1f5f9;
+  color: #c9d1d9;
 }
 
 .thought-action-label {
-  flex: 1;
-  font-weight: 500;
-  letter-spacing: 0.15px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  font-weight: 400;
+  color: inherit;
 }
 
 .thought-action-chevron {
-  font-size: 10px;
-  color: #64748b;
-  margin-left: 8px;
-  transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-  flex-shrink: 0;
+  font-size: 11px;
+  color: #8b949e;
+  margin-left: 2px;
+  transition: transform 0.15s ease;
 }
 
 .thought-action-row.open .thought-action-chevron {
@@ -4532,51 +4537,39 @@ header {
 }
 
 .thought-action-pane {
-  padding: 8px 10px 10px 10px;
-  border-top: 1px solid rgba(255, 255, 255, 0.05);
-  background: rgba(0, 0, 0, 0.4);
+  margin: 4px 0 6px 14px;
+  padding: 6px 10px;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  background: #0d1117;
   font-size: 11px;
 }
 
 .thought-action-rationale {
-  color: #e2e8f0;
-  margin-bottom: 6px;
+  color: #8b949e;
+  margin-bottom: 5px;
   line-height: 1.45;
 }
 
 .thought-action-code {
-  background: rgba(0, 0, 0, 0.5) !important;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: #161b22 !important;
+  border: 1px solid #30363d !important;
   border-radius: 4px;
   padding: 6px 8px;
   margin: 0;
-  font-family: 'Fira Code', 'Cascadia Code', Consolas, monospace !important;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace !important;
   font-size: 10.5px !important;
-  color: #38bdf8 !important;
+  color: #58a6ff !important;
   overflow-x: auto;
 }
 
 /* Retry & Error Row Styling */
-.thought-action-row.thought-retry-row {
-  border-left: 3px solid #f59e0b;
-  background: rgba(245, 158, 11, 0.04);
+.thought-action-row.thought-retry-row .thought-action-btn {
+  color: #f85149;
 }
-
-.thought-action-row.thought-retry-row .thought-action-label {
-  color: #f59e0b;
-  font-weight: 600;
+.thought-action-row.thought-retry-row .thought-action-chevron {
+  color: #f85149;
 }
-
-.thought-action-row.thought-retry-row .thought-action-pane {
-  border-top-color: rgba(245, 158, 11, 0.2);
-}
-
-/* Corrected Row Styling */
-.thought-action-row.thought-corrected-row {
-  border-left: 3px solid #10b981;
-  background: rgba(16, 185, 129, 0.04);
-}
-
-.thought-action-row.thought-corrected-row .thought-action-label {
-  color: #34d399;
+.thought-action-row.thought-corrected-row .thought-action-btn {
+  color: #e3b341;
 }

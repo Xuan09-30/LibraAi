@@ -2416,15 +2416,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                 is_desktop_cmd = False
 
-                for pat in getattr(supervisor, "REMOTE_SANDBOX_PATTERNS", []):
-
-                    if re.search(pat, req.prompt, re.IGNORECASE):
-
-                        if not re.search(r"open\s+(?:my\s+)?(?:google\s+)?calendar\b", req.prompt, re.IGNORECASE):
-
-                            is_desktop_cmd = True
-
-                            break
+                if not AutonomousComputerUseAgent.is_computer_use_prompt(req.prompt.strip()):
+                    for pat in getattr(supervisor, "REMOTE_SANDBOX_PATTERNS", []):
+                        if re.search(pat, req.prompt, re.IGNORECASE):
+                            if not re.search(r"open\s+(?:my\s+)?(?:google\s+)?calendar\b", req.prompt, re.IGNORECASE):
+                                is_desktop_cmd = True
+                                break
 
                 # 1.2.1 Natural Language Guest Token Generation (Host Only)
 
@@ -2961,9 +2958,10 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                             {"step": 5, "title": "Factual Synthesis & Delivery", "detail": "Synthesized verified response with citations and token analytics.", "action": "synthesize", "status": "done"}
                         ]
 
-                    if thought_steps:
-
-                        await event_queue.put({"type": "thought", "steps": thought_steps})
+                    if thought_steps and not AutonomousComputerUseAgent.is_computer_use_prompt(req.prompt.strip()):
+                        for s_item in thought_steps:
+                            await event_queue.put({"type": "thought_step", "step": s_item})
+                            await asyncio.sleep(0.35)
 
                     reply_c = res_proc.get("voice_response") or "Command processed."
 
@@ -3046,12 +3044,9 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                                     {"step": 3, "title": "Hardware & VRAM Governor Allocation", "detail": f"Allocated {target_model} on NVIDIA GeForce RTX 5060 Ti with active VRAM Governor (Keep-Alive: 15m).", "action": "vram_allocation", "status": "done"},
                                     {"step": 4, "title": "Neural Streaming & Real-Time Verification", "detail": "Streaming contextual tokens with refusal interception and safety guards.", "action": "neural_stream", "status": "streaming"}
                                 ]
-                                await event_queue.put({
-                                    "type": "thought",
-                                    "status": "thinking",
-                                    "text": "Libra is thinking about what the user needs...",
-                                    "steps": thought_steps
-                                })
+                                for s_item in thought_steps:
+                                    await event_queue.put({"type": "thought_step", "step": s_item})
+                                    await asyncio.sleep(0.18)
 
                                 async for line in resp.aiter_lines():
 
@@ -3433,15 +3428,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         is_desktop_cmd = False
 
-        for pat in getattr(supervisor, "REMOTE_SANDBOX_PATTERNS", []):
-
-            if re.search(pat, req.prompt, re.IGNORECASE):
-
-                if not re.search(r"open\s+(?:my\s+)?(?:google\s+)?calendar\b", req.prompt, re.IGNORECASE):
-
-                    is_desktop_cmd = True
-
-                    break
+        if not AutonomousComputerUseAgent.is_computer_use_prompt(req.prompt.strip()):
+            for pat in getattr(supervisor, "REMOTE_SANDBOX_PATTERNS", []):
+                if re.search(pat, req.prompt, re.IGNORECASE):
+                    if not re.search(r"open\s+(?:my\s+)?(?:google\s+)?calendar\b", req.prompt, re.IGNORECASE):
+                        is_desktop_cmd = True
+                        break
 
         if is_desktop_cmd or is_desktop_open or is_desktop_close:
 
