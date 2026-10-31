@@ -1,5 +1,5 @@
-// Project Libra PWA Service Worker (v10.6.0)
-const CACHE_NAME = 'libra-pwa-v10.6.0';
+// Project Libra PWA Service Worker (v10.6.5)
+const CACHE_NAME = 'libra-pwa-v10.6.5';
 
 const STATIC_ASSETS = [
   '/',

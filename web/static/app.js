@@ -7436,27 +7436,29 @@
         optionsUsersList.innerHTML = '';
 
         users.forEach(u => {
-
           const item = document.createElement('div');
-
-          item.style.cssText = 'background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; padding: 8px 10px; display: flex; justify-content: space-between; align-items: center; font-size: 12px;';
-
+          const isMainHost = u.is_primary_host;
+          const initial = (u.display_name || u.email || 'U')[0].toUpperCase();
+          const avatarClass = u.role === 'host' ? 'avatar-host' : 'avatar-tester';
+          const badgeClass = u.role === 'host' ? 'host' : 'guest';
+          item.className = `user-row-item ${isMainHost ? 'is-main-host' : (u.role === 'host' ? 'is-host' : 'is-tester')}`;
+          item.style.marginBottom = '6px';
           item.innerHTML = `
-
-            <div>
-
-              <strong>${escapeHtml(u.display_name || u.email)}</strong>
-
-              <div style="font-size: 10px; color: #64748b;">${escapeHtml(u.email)}</div>
-
+            <div class="user-row-left">
+              <div class="user-row-avatar ${avatarClass}">${initial}</div>
+              <div class="user-row-info">
+                <div class="user-row-name">
+                  <span>${escapeHtml(u.display_name || u.email.split('@')[0])}</span>
+                  ${isMainHost ? '<span class="primary-host-tag">MAIN HOST</span>' : ''}
+                </div>
+                <div class="user-row-email">${escapeHtml(u.email)}</div>
+              </div>
             </div>
-
-            <span class="role-badge ${u.role === 'host' ? 'host' : 'guest'}">${u.role.toUpperCase()}</span>
-
+            <div class="user-row-right">
+              <span class="role-badge ${badgeClass}">${u.role.toUpperCase()}</span>
+            </div>
           `;
-
           optionsUsersList.appendChild(item);
-
         });
 
       }
