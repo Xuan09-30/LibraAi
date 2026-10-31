@@ -346,6 +346,24 @@ class SupervisorHub:
                     self.llm.last_token_metrics = dict(fast_tm)
                 return res
 
+        # PHASE 12: AUTONOMOUS COMPUTER-USE REACT LOOP EXECUTION
+        if AutonomousComputerUseAgent.is_computer_use_prompt(prompt):
+            if client_scope == "remote_web":
+                return {
+                    "action": "sandboxed_blocked",
+                    "status": "blocked",
+                    "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                    "client_scope": client_scope
+                }
+            agent = AutonomousComputerUseAgent(
+                gui_control=getattr(self.llm, "gui_control", None),
+                spatial=getattr(self.llm, "spatial", None),
+                model_mgr=getattr(self.llm, "model_manager", None),
+                chrome_mgr=getattr(self.llm, "chrome_mgr", None),
+                memory=getattr(self.llm, "memory", None)
+            )
+            return agent.execute_task(prompt, dry_run=dry_run)
+
         norm_trigger = normalize_trigger(prompt)
         intent_signature = f"macro:{norm_trigger}"
         t_start = time.perf_counter()

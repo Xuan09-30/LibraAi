@@ -941,48 +941,211 @@
 
   // --------------------------------------------------------------------------
   // AI THOUGHT PROCESS & MODEL REASONING ACCORDION COMPONENT (PHASE 12.6)
+  // Antigravity / Cursor Sleek Cybernetic Thought Tree
   // --------------------------------------------------------------------------
-  function createThoughtAccordion(steps, initialLabel, isStreaming = false, reasoningText = '') {
+  function formatDuration(sec) {
+    if (!sec || sec < 1) return '1s';
+    if (sec < 60) return `${Math.max(1, Math.round(sec))}s`;
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec % 60);
+    return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  }
+
+  function getThoughtSummary(steps, defaultText) {
+    if (!steps || steps.length === 0) return defaultText || 'Analyzed context and synthesized response';
+    const hasComputerUse = steps.some(s => s.action === 'click' || s.action === 'press' || s.action === 'type' || (s.title && s.title.includes('COMPUTER_USE')));
+    if (hasComputerUse) return 'Automated browser, executed steps, completed workflow';
+    const hasWebSearch = steps.some(s => s.action === 'web_search' || (s.title && s.title.toLowerCase().includes('web')));
+    if (hasWebSearch) return 'Researched live web, verified sources, synthesized response';
+    const hasCode = steps.some(s => s.action === 'run_code' || s.action === 'git_ops' || (s.title && s.title.toLowerCase().includes('file')));
+    if (hasCode) return 'Explored files, ran commands, edited files';
+    return defaultText || 'Analyzed memory context, queried neural model, synthesized response';
+  }
+
+  function renderThoughtStepItemHtml(s, idx) {
+    const stepNum = s.step || (idx + 1);
+    const isRetry = s.status === 'retry' || s.action === 'retry' || (s.title && s.title.toLowerCase().includes('error')) || (s.thought && s.thought.includes('attempt'));
+    const isCorrected = s.status === 'corrected';
+    const action = (s.action || '').toLowerCase();
+
+    let headerText = '';
+    if (isRetry) {
+      headerText = s.title || s.thought || `Model error (attempt 1/3)`;
+    } else if (action === 'click') {
+      const coordStr = (s.x !== undefined && s.y !== undefined) ? ` (${s.x}, ${s.y})` : '';
+      headerText = `Ran click${coordStr}`;
+    } else if (action === 'press') {
+      headerText = `Ran press key (${s.key || 'hotkey'})`;
+    } else if (action === 'type') {
+      headerText = `Ran type ('${s.text || ''}')`;
+    } else if (action === 'done') {
+      headerText = `Completed task`;
+    } else if (s.title && s.title.startsWith('Ran ')) {
+      headerText = s.title;
+    } else if (s.title) {
+      headerText = s.title;
+    } else {
+      headerText = `Step ${stepNum}`;
+    }
+
+    const paramObj = {};
+    for (const k of ['step', 'thought', 'action', 'x', 'y', 'key', 'text', 'status', 'error', 'attempt', 'max_attempts']) {
+      if (s[k] !== undefined) paramObj[k] = s[k];
+    }
+    const paramJson = JSON.stringify(paramObj, null, 2);
+    const rationale = s.thought || s.detail || '';
+
+    return `
+      <div class="thought-action-row ${isRetry ? 'thought-retry-row' : ''} ${isCorrected ? 'thought-corrected-row' : ''}">
+        <button class="thought-action-btn" type="button" aria-expanded="false" title="Click to inspect action payload">
+          <span class="thought-action-label">${escapeHtml(headerText)}</span>
+          <span class="thought-action-chevron">&gt;</span>
+        </button>
+        <div class="thought-action-pane" style="display: none;">
+          ${rationale ? `<div class="thought-action-rationale">${escapeHtml(rationale)}</div>` : ''}
+          <pre class="thought-action-code"><code>${escapeHtml(paramJson)}</code></pre>
+        </div>
+      </div>
+    `;
+  }
+
+  function _wireActionBtn(btn) {
+    if (!btn || btn.hasAttribute('data-wired')) return;
+    btn.setAttribute('data-wired', 'true');
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const row = btn.closest('.thought-action-row');
+      if (!row) return;
+      const isOpen = row.classList.toggle('open');
+      btn.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+      const pane = row.querySelector('.thought-action-pane');
+      if (pane) pane.style.display = isOpen ? 'block' : 'none';
+    });
+  }
+
+  function _wireThoughtAccordionEvents(acc) {
+    const topHeader = acc.querySelector('.thought-top-header');
+    const body = acc.querySelector('.thought-body');
+    if (topHeader && body) {
+      topHeader.addEventListener('click', (e) => {
+        e.stopPropagation();
+        body.classList.toggle('collapsed');
+      });
+    }
+
+    const subHeader = acc.querySelector('.thought-sub-header');
+    const subSection = acc.querySelector('.thought-sub-section');
+    if (subHeader && subSection) {
+      subHeader.addEventListener('click', (e) => {
+        e.stopPropagation();
+        subSection.classList.toggle('collapsed');
+      });
+    }
+
+    acc.querySelectorAll('.thought-action-btn').forEach(_wireActionBtn);
+  }
+
+  function createThoughtAccordion(steps, initialLabel, isStreaming = false, reasoningText = '', elapsedSec = 8) {
     const acc = document.createElement('div');
     acc.className = 'thought-accordion' + (isStreaming ? ' streaming' : '');
-    const stepsHtml = renderThoughtStepsHtml(steps);
-    const reasoningHtml = reasoningText ? `<div class="thought-raw-reasoning">${escapeHtml(reasoningText)}</div>` : '';
+
+    const durationText = isStreaming ? 'Working... ▾' : `Worked for ${formatDuration(elapsedSec)} ▾`;
+    const summaryText = getThoughtSummary(steps);
+    const stepsHtml = (steps && steps.length > 0) ? steps.map(renderThoughtStepItemHtml).join('') : '';
+
+    let reasoning = reasoningText;
+    if (!reasoning && steps && steps.length > 0) {
+      const firstWithThought = steps.find(s => s.thought && !s.thought.startsWith('Model error'));
+      if (firstWithThought) {
+        reasoning = firstWithThought.thought;
+      }
+    }
+    const thoughtDurationSec = Math.max(1, Math.min(8, Math.round(elapsedSec * 0.7)));
 
     acc.innerHTML = `
-      <button class="thought-header" type="button" aria-expanded="false" title="Click to inspect Libra's reasoning & model steps">
-        <span class="thought-icon">${isStreaming ? '🧠' : '✦'}</span>
-        <span class="thought-label">${escapeHtml(initialLabel || 'Libra is analyzing what the user needs...')}</span>
-        <span class="thought-chevron">▾</span>
-      </button>
-      <div class="thought-body" style="display: none;">
-        <div class="thought-steps-list">${stepsHtml}</div>
-        ${reasoningHtml}
+      <div class="thought-top-header" title="Click to collapse / expand thought process">
+        <button class="thought-duration-btn" type="button" aria-expanded="true">
+          ${isStreaming ? '<span class="thought-pulse-dot"></span>' : ''}
+          <span class="thought-duration-label">${escapeHtml(durationText)}</span>
+        </button>
+        <div class="thought-summary-line">${escapeHtml(summaryText)} ▾</div>
+      </div>
+      <div class="thought-body">
+        <div class="thought-sub-section thought-cot-box ${reasoning ? '' : 'collapsed'}" style="${reasoning ? '' : 'display: none;'}">
+          <button class="thought-sub-header" type="button" aria-expanded="true">
+            <span class="thought-sub-title">Thought for ${thoughtDurationSec}s</span>
+            <span class="thought-sub-chevron">▾</span>
+          </button>
+          <div class="thought-sub-content">
+            <div class="thought-cot-text">${escapeHtml(reasoning || '')}</div>
+          </div>
+        </div>
+        <div class="thought-actions-list">${stepsHtml}</div>
       </div>
     `;
 
-    const btn = acc.querySelector('.thought-header');
-    const body = acc.querySelector('.thought-body');
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const isOpen = acc.classList.toggle('open');
-      btn.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
-      body.style.display = isOpen ? 'flex' : 'none';
-    });
-
+    _wireThoughtAccordionEvents(acc);
     return acc;
   }
 
-  function renderThoughtStepsHtml(steps) {
-    if (!steps || !Array.isArray(steps) || steps.length === 0) return '';
-    return steps.map((s, idx) => `
-      <div class="thought-step-item">
-        <div class="thought-step-num">${s.step || idx + 1}</div>
-        <div class="thought-step-content">
-          <div class="thought-step-title">${escapeHtml(s.title || 'Step ' + (idx + 1))}</div>
-          <div class="thought-step-detail">${escapeHtml(s.detail || '')}</div>
-        </div>
-      </div>
-    `).join('');
+  function appendLiveStepToAccordion(acc, stepData) {
+    if (!acc || !stepData) return;
+    const list = acc.querySelector('.thought-actions-list');
+    if (!list) return;
+
+    const rowWrapper = document.createElement('div');
+    rowWrapper.innerHTML = renderThoughtStepItemHtml(stepData, list.children.length);
+    const newRow = rowWrapper.firstElementChild;
+    if (newRow) {
+      list.appendChild(newRow);
+      const btn = newRow.querySelector('.thought-action-btn');
+      if (btn) _wireActionBtn(btn);
+    }
+
+    const summaryLine = acc.querySelector('.thought-summary-line');
+    if (summaryLine) {
+      summaryLine.textContent = getThoughtSummary([stepData]) + ' ▾';
+    }
+  }
+
+  function updateThoughtAccordionReasoning(acc, reasoningText) {
+    if (!acc || !reasoningText) return;
+    const subSec = acc.querySelector('.thought-sub-section');
+    const cotText = acc.querySelector('.thought-cot-text');
+    if (subSec && cotText) {
+      subSec.style.display = 'block';
+      subSec.classList.remove('collapsed');
+      cotText.textContent = reasoningText;
+    }
+  }
+
+  function finalizeThoughtAccordion(acc, steps, t0_stream) {
+    if (!acc) return;
+    acc.classList.remove('streaming');
+    if (acc._timerInterval) {
+      clearInterval(acc._timerInterval);
+      acc._timerInterval = null;
+    }
+    const elapsedSec = t0_stream ? ((performance.now() - t0_stream) / 1000) : 8;
+    const durLabel = acc.querySelector('.thought-duration-label');
+    const pulseDot = acc.querySelector('.thought-pulse-dot');
+    if (pulseDot) pulseDot.remove();
+    if (durLabel) {
+      durLabel.textContent = `Worked for ${formatDuration(elapsedSec)} ▾`;
+    }
+
+    const summaryLine = acc.querySelector('.thought-summary-line');
+    if (summaryLine) {
+      summaryLine.textContent = getThoughtSummary(steps) + ' ▾';
+    }
+
+    if (steps && Array.isArray(steps) && steps.length > 0) {
+      const list = acc.querySelector('.thought-actions-list');
+      if (list && list.children.length === 0) {
+        list.innerHTML = steps.map(renderThoughtStepItemHtml).join('');
+        list.querySelectorAll('.thought-action-btn').forEach(_wireActionBtn);
+      }
+    }
   }
 
   function appendMessage(text, isUser, meta = {}) {
@@ -1073,12 +1236,13 @@
         { step: 3, title: 'Neural Synthesis', detail: 'Synthesized response in ' + (meta.latency_ms ? meta.latency_ms + 'ms' : '0.8s') + '.' }
       ];
 
-      const elapsedStr = meta.latency_ms ? ' • ' + (meta.latency_ms / 1000).toFixed(1) + 's' : '';
+      const elapsedSec = meta.latency_ms ? (meta.latency_ms / 1000) : 8;
       const thoughtAcc = createThoughtAccordion(
         steps,
-        `✦ Thought Process (${steps.length} steps${elapsedStr})`,
+        `Worked for ${formatDuration(elapsedSec)} ▾`,
         false,
-        reasoningText
+        reasoningText,
+        elapsedSec
       );
       contentDiv.appendChild(thoughtAcc);
     }
@@ -2554,15 +2718,20 @@
       contentDiv.className = 'msg-content';
 
       // Live Thought Accordion (Phase 12.6)
-      let activeThoughtSteps = [
-        { step: 1, title: 'Intent & Scope Analysis', detail: 'Libra is analyzing what the user needs...' },
-        { step: 2, title: 'Model Selection & Routing', detail: 'Allocating Qwen 3 (8B) on NVIDIA RTX 5060 Ti...' }
-      ];
+      let activeThoughtSteps = [];
       const thoughtAccordion = createThoughtAccordion(
         activeThoughtSteps,
-        '🧠 Libra is analyzing what the user needs...',
+        'Working... 0s ▾',
         true
       );
+      let streamElapsedSec = 0;
+      thoughtAccordion._timerInterval = setInterval(() => {
+        streamElapsedSec += 1;
+        const durLabel = thoughtAccordion.querySelector('.thought-duration-label');
+        if (durLabel && thoughtAccordion.classList.contains('streaming')) {
+          durLabel.textContent = `Working... ${formatDuration(streamElapsedSec)} ▾`;
+        }
+      }, 1000);
       contentDiv.appendChild(thoughtAccordion);
 
       const textNode = document.createElement('div');
@@ -2637,13 +2806,7 @@
           const reasoning = thinkMatch[1].trim();
           curVisible = accumulatedText.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim();
           if (thoughtAccordion && reasoning) {
-            let rBox = thoughtAccordion.querySelector('.thought-raw-reasoning');
-            if (!rBox) {
-              rBox = document.createElement('div');
-              rBox.className = 'thought-raw-reasoning';
-              thoughtAccordion.querySelector('.thought-body').appendChild(rBox);
-            }
-            rBox.textContent = reasoning;
+            updateThoughtAccordionReasoning(thoughtAccordion, reasoning);
           }
         }
 
@@ -2735,24 +2898,19 @@
                 }
               } else if (data.type === 'thought') {
                 if (thoughtAccordion) {
-                  const labelEl = thoughtAccordion.querySelector('.thought-label');
-                  if (labelEl && data.text) labelEl.textContent = data.text;
                   if (data.steps && Array.isArray(data.steps)) {
-                    activeThoughtSteps = data.steps;
-                    const listEl = thoughtAccordion.querySelector('.thought-steps-list');
-                    if (listEl) listEl.innerHTML = renderThoughtStepsHtml(data.steps);
+                    data.steps.forEach(s => appendLiveStepToAccordion(thoughtAccordion, s));
                   }
+                }
+              } else if (data.type === 'thought_step') {
+                if (thoughtAccordion && data.step) {
+                  activeThoughtSteps.push(data.step);
+                  appendLiveStepToAccordion(thoughtAccordion, data.step);
                 }
               } else if (data.type === 'clear') {
                 accumulatedText = '';
                 renderProgressive(true);
               } else if (data.type === 'token') {
-                if (!accumulatedText && thoughtAccordion) {
-                  const labelEl = thoughtAccordion.querySelector('.thought-label');
-                  if (labelEl && labelEl.textContent.includes('analyzing')) {
-                    labelEl.textContent = '⚡ Synthesizing response (qwen3:8b)...';
-                  }
-                }
                 accumulatedText += data.content;
                 renderProgressive(false);
               } else if (data.type === 'audio') {
@@ -2764,18 +2922,7 @@
                 finalTokenMetrics = data.token_metrics;
                 renderProgressive(true);
                 if (thoughtAccordion) {
-                  thoughtAccordion.classList.remove('streaming');
-                  const iconEl = thoughtAccordion.querySelector('.thought-icon');
-                  if (iconEl) iconEl.textContent = '✦';
-                  const labelEl = thoughtAccordion.querySelector('.thought-label');
-                  const totalSteps = (data.thought_steps && data.thought_steps.length) || activeThoughtSteps.length || 3;
-                  const elapsedSec = ((performance.now() - t0_stream) / 1000).toFixed(1);
-                  if (labelEl) labelEl.textContent = `✦ Thought Process (${totalSteps} steps • ${elapsedSec}s)`;
-                  if (data.thought_steps && Array.isArray(data.thought_steps)) {
-                    activeThoughtSteps = data.thought_steps;
-                    const listEl = thoughtAccordion.querySelector('.thought-steps-list');
-                    if (listEl) listEl.innerHTML = renderThoughtStepsHtml(data.thought_steps);
-                  }
+                  finalizeThoughtAccordion(thoughtAccordion, data.thought_steps || activeThoughtSteps, t0_stream);
                 }
               }
 
