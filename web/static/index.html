@@ -9,7 +9,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="icon" type="image/png" href="/static/icon.png">
-  <link rel="stylesheet" href="/static/style.css?v=10.6.0">
+  <link rel="stylesheet" href="/static/style.css?v=10.6.5">
   <link rel="stylesheet" href="/static/prism.css?v=10.5.2">
   <script src="/static/three.min.js"></script>
 </head>
@@ -73,7 +73,7 @@
             <span>👥 User Permissions</span>
           </button>
           <button id="desktop-gui-drawer-btn" class="drawer-tool-btn host-only-btn" title="Bring up Project Libra Desktop GUI on Monitor" style="display: none;">
-            <span>??? Show Desktop GUI</span>
+            <span>🖥️ Show Desktop GUI</span>
           </button>
           <button id="drawer-token-telemetry-btn" class="drawer-tool-btn" title="GPU Token Telemetry & Context Stats">
             <span>📊 GPU Telemetry</span>
@@ -416,18 +416,6 @@
             <input type="text" id="prof-interests-input" class="auth-input" placeholder="e.g. Artificial Intelligence, Python, Gaming, Robotics, GPU Hardware" style="margin: 0; width: 100%;">
           </div>
 
-                    <!-- VOICE OUTPUT (KOKORO-82M TTS) TOGGLE -->
-          <div class="options-voice-toggle-row">
-            <div class="options-voice-toggle-meta">
-              <span class="options-voice-toggle-title">🔊 Neural Voice Responses (Kokoro-82M TTS)</span>
-              <span class="options-voice-toggle-sub">Speak responses aloud using local CUDA neural voice synthesis</span>
-            </div>
-            <label class="libra-switch">
-              <input type="checkbox" id="options-voice-toggle" checked>
-              <span class="libra-slider"></span>
-            </label>
-          </div>
-
           <div id="prof-status-msg" style="display: none; font-size: 12px; margin-bottom: 8px;"></div>
           <button id="save-profile-btn" class="modal-btn primary" style="width: 100%;">💾 SAVE PREFERENCES &amp; INSTRUCTIONS</button>
           <button id="options-token-telemetry-btn" type="button" class="modal-btn secondary" style="margin-top: 10px; width: 100%;">📊 View Real-Time GPU Token Telemetry</button>
@@ -573,46 +561,59 @@
   </div>
 
   <!-- ========================================================================
-       MODAL: AUTHENTICATION (CLEAN SIGN IN WITH GOOGLE / TOKEN)
+       MODAL: AUTHENTICATION (CYBERNETIC GATEWAY & ACCESS PORTAL)
        ======================================================================== -->
   <div id="auth-modal" class="modal-overlay">
-    <div class="modal-content auth-modal-clean">
-      <button id="close-auth-modal-btn" class="modal-close-btn" title="Close" style="position: absolute; top: 14px; right: 16px;">&times;</button>
-      <div class="auth-clean-header">
-        <div class="auth-clean-brand">
-          <span class="auth-brand-sparkle">✦</span>
-          <span class="auth-brand-text">Project Libra</span>
+    <div class="modal-content auth-modal-clean" style="max-width: 440px; width: 92%;">
+      <div class="modal-header">
+        <div class="modal-header-title">
+          <span style="color: #00f2fe;">✦ PROJECT LIBRA GATEWAY</span>
+          <span style="font-size: 11px; color: #64748b; margin-left: 8px;">ACCESS PORTAL</span>
         </div>
-        <h2 class="auth-clean-title" id="g-main-heading">Sign in</h2>
-        <p class="auth-clean-subtitle" id="g-sub-heading">to continue to Project Libra</p>
+        <button id="close-auth-modal-btn" class="modal-close-btn" title="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
       </div>
 
-      <div id="auth-status-msg" class="auth-status-msg" style="display: none;"></div>
-
-      <!-- VIEW A: GOOGLE SIGN-IN (CLEAN WHITE BUTTON) -->
-      <div id="auth-view-google" class="auth-view-google">
-        <a href="/auth/google/login" class="google-sign-in-clean-btn" id="real-google-oauth-btn" title="Sign in with your Google Account">
-          <svg class="google-svg-clean" viewBox="0 0 24 24" width="20" height="20">
-            <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.8-2.4 3.66v3.04h3.88c2.28-2.09 3.66-5.17 3.66-9.14z"/>
-            <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.04c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.13C3.26 21.36 7.33 24 12 24z"/>
-            <path fill="#FBBC05" d="M5.28 14.28c-.24-.72-.38-1.49-.38-2.28s.14-1.56.38-2.28V6.59H1.25C.45 8.18 0 9.99 0 12s.45 3.82 1.25 5.41l4.03-3.13z"/>
-            <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.33 0 3.26 2.64 1.25 6.59l4.03 3.13c.95-2.83 3.6-4.97 6.72-4.97z"/>
-          </svg>
-          <span>Continue with Google</span>
-        </a>
-
-        <!-- ALTERNATIVE AUTH METHODS -->
-        <div style="display: flex; align-items: center; margin: 18px 0 12px 0; width: 100%;">
-          <div style="flex: 1; height: 1px; background: rgba(255,255,255,0.1);"></div>
-          <span style="padding: 0 10px; font-size: 11px; color: #64748b; text-transform: uppercase;">or</span>
-          <div style="flex: 1; height: 1px; background: rgba(255,255,255,0.1);"></div>
+      <div class="modal-body auth-modal-body" style="padding-top: 6px;">
+        <div class="auth-clean-header" style="text-align: center; margin-bottom: 20px;">
+          <div class="auth-brand-badge">
+            <span class="auth-brand-sparkle">✦</span>
+            <span>NEURAL COGNITIVE ASSISTANT</span>
+          </div>
+          <h2 class="auth-clean-title" id="g-main-heading">Sign In to Continue</h2>
+          <p class="auth-clean-subtitle" id="g-sub-heading">Authenticate to access your private neural workspace, local LLMs, and real-time GPU telemetry.</p>
         </div>
 
-        <div style="width: 100%; display: flex; flex-direction: column; gap: 8px;">
-          <input type="password" id="auth-modal-token-input" class="auth-input" placeholder="Paste Master / Guest Token" style="margin: 0; width: 100%;">
-          <div style="display: flex; gap: 8px;">
-            <button id="auth-modal-token-btn" type="button" class="modal-btn primary" style="flex: 1; padding: 10px; font-size: 12px;">🔑 Sign in with Token</button>
-            <button id="auth-modal-guest-btn" type="button" class="modal-btn secondary" style="flex: 1; padding: 10px; font-size: 12px;">⚡ Enter as Guest</button>
+        <div id="auth-status-msg" class="auth-status-msg" style="display: none;"></div>
+
+        <!-- VIEW A: GOOGLE SIGN-IN -->
+        <div id="auth-view-google" class="auth-view-google">
+          <a href="/auth/google/login" class="google-sign-in-clean-btn" id="real-google-oauth-btn" title="Sign in with your Google Account">
+            <svg class="google-svg-clean" viewBox="0 0 24 24" width="20" height="20">
+              <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.8-2.4 3.66v3.04h3.88c2.28-2.09 3.66-5.17 3.66-9.14z"/>
+              <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.04c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.13C3.26 21.36 7.33 24 12 24z"/>
+              <path fill="#FBBC05" d="M5.28 14.28c-.24-.72-.38-1.49-.38-2.28s.14-1.56.38-2.28V6.59H1.25C.45 8.18 0 9.99 0 12s.45 3.82 1.25 5.41l4.03-3.13z"/>
+              <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.33 0 3.26 2.64 1.25 6.59l4.03 3.13c.95-2.83 3.6-4.97 6.72-4.97z"/>
+            </svg>
+            <span>Continue with Google</span>
+          </a>
+
+          <div class="auth-divider">
+            <div class="auth-divider-line"></div>
+            <span class="auth-divider-text">OR ACCESS VIA TOKEN</span>
+            <div class="auth-divider-line"></div>
+          </div>
+
+          <div class="auth-token-box" style="display: flex; flex-direction: column; gap: 10px; width: 100%;">
+            <input type="password" id="auth-modal-token-input" class="user-input auth-input" placeholder="Paste Master Key or Guest Access Token..." style="margin: 0; width: 100%;">
+            <div style="display: flex; gap: 8px;">
+              <button id="auth-modal-token-btn" type="button" class="user-btn-primary" style="flex: 1; height: 42px; justify-content: center; font-size: 12px;">🔑 Sign in with Key</button>
+              <button id="auth-modal-guest-btn" type="button" class="modal-btn secondary" style="flex: 1; height: 42px; justify-content: center; font-size: 12px;">⚡ Enter as Guest</button>
+            </div>
           </div>
         </div>
       </div>
@@ -983,6 +984,6 @@
   <script src="/static/html2canvas.min.js"></script>
   <!-- MAIN SCRIPT -->
   <script src="/static/prism.min.js?v=10.4.0"></script>
-  <script src="/static/app.js?v=10.6.0"></script>
+  <script src="/static/app.js?v=10.6.5"></script>
 </body>
 </html>

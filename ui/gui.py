@@ -2150,13 +2150,18 @@ if __name__ == "__main__":
     if not is_reload_restart:
         socket = QLocalSocket()
         socket.connectToServer("libra_instance_ipc")
-        if socket.waitForConnected(500):
-            # Another instance is actively running. Ask existing instance to show its window immediately.
+        if socket.waitForConnected(800):
             socket.write(b"show\n")
             socket.waitForBytesWritten(1000)
-            socket.waitForReadyRead(500)
+            has_reply = socket.waitForReadyRead(1000)
+            if has_reply:
+                reply = bytes(socket.readAll()).decode("utf-8", errors="ignore")
+                if "ok" in reply.lower():
+                    print("[GUI] Existing Libra instance found and activated. Showing window.")
+                    socket.disconnectFromServer()
+                    sys.exit(0)
+            print("[GUI Warning] Existing socket unresponsive or zombie. Taking over as primary instance.")
             socket.disconnectFromServer()
-            sys.exit(0)
 
     # 2. Setup IPC Server to receive 'show' commands from subsequent launches
     ipc_server = QLocalServer()
