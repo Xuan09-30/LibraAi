@@ -4603,54 +4603,35 @@ def ensure_ngrok_tunnel(port: int = 8765) -> Dict[str, Any]:
                 asyncio.set_event_loop(loop)
 
                 async def _run():
-
                     global _NGROK_SESSION
-
-                    for attempt in range(5):
-
+                    while True:
                         try:
-
                             _NGROK_SESSION = await ngrok.SessionBuilder().authtoken(authtoken).connect()
-
                             listener = await _NGROK_SESSION.http_endpoint().domain(domain).listen()
-
                             listener.forward(f"127.0.0.1:{port}")
-
                             url = listener.url()
-
                             _CLOUDFLARE_INFO.update({
-
                                 "public_url": url,
-
                                 "pid": os.getpid(),
-
                                 "status": "online",
-
                                 "provider": "ngrok"
-
                             })
-
                             logger.info(f"[Ngrok] Permanent tunnel active: {url}")
 
-                            break
-
+                            # Keep connection active and monitor health
+                            while True:
+                                await asyncio.sleep(10)
                         except Exception as err:
-
-                            if ("already online" in str(err) or "ERR_NGROK_334" in str(err)) and attempt < 4:
-
-                                logger.info(f"[Ngrok] Domain {domain} busy, waiting 2.5s for previous session to close (attempt {attempt+1}/5)...")
-
-                                await asyncio.sleep(2.5)
-
-                            else:
-
-                                logger.warning(f"[Ngrok Session Error]: {err}")
-
-                                return
-
-                    while True:
-
-                        await asyncio.sleep(3600)
+                            _CLOUDFLARE_INFO["status"] = "reconnecting"
+                            err_str = str(err).lower()
+                            wait_s = 2.5 if ("already online" in err_str or "err_ngrok_334" in err_str) else 5.0
+                            logger.info(f"[Ngrok] Session note: {err}. Auto-reconnecting in {wait_s}s...")
+                            try:
+                                if _NGROK_SESSION:
+                                    await _NGROK_SESSION.close()
+                            except Exception:
+                                pass
+                            await asyncio.sleep(wait_s)
 
                 try:
 
