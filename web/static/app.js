@@ -969,7 +969,6 @@
   }
 
   function renderThoughtStepItemHtml(s, idx) {
-    const stepNum = s.step || (idx + 1);
     const isRetry = s.status === 'retry' || s.action === 'retry' || (s.title && s.title.toLowerCase().includes('error')) || (s.thought && s.thought.includes('attempt'));
     const isCorrected = s.status === 'corrected';
     const action = (s.action || '').toLowerCase();
@@ -986,20 +985,25 @@
       headerText = `Ran type ('${s.text || ''}')`;
     } else if (action === 'done') {
       headerText = `Completed task`;
-    } else if (s.title && (s.title.startsWith('Ran ') || s.title.startsWith('Check '))) {
-      headerText = s.title.startsWith('Ran ') ? s.title : `Ran ${s.title.toLowerCase()}`;
     } else if (s.title) {
-      headerText = `Ran ${s.title.toLowerCase()}`;
+      headerText = s.title.startsWith('Ran ') ? s.title : `Ran ${s.title.toLowerCase()}`;
     } else {
-      headerText = `Ran step ${stepNum}`;
+      headerText = `Step ${s.step || (idx + 1)}`;
     }
 
-    const paramObj = {};
-    for (const k of ['step', 'thought', 'action', 'x', 'y', 'key', 'text', 'status', 'error', 'attempt', 'max_attempts']) {
-      if (s[k] !== undefined) paramObj[k] = s[k];
+    const detailText = s.detail || s.thought || '';
+
+    // Claude / Minimalist clean formatting: avoid raw JSON debugging dumps
+    let paramHtml = '';
+    if (action === 'click' || action === 'press' || action === 'type' || action === 'run_code') {
+      const paramList = [];
+      if (s.x !== undefined && s.y !== undefined) paramList.push(`coords: [${s.x}, ${s.y}]`);
+      if (s.key) paramList.push(`key: "${s.key}"`);
+      if (s.text) paramList.push(`text: "${s.text}"`);
+      if (paramList.length > 0) {
+        paramHtml = `<div class="thought-action-params">${escapeHtml(paramList.join(' • '))}</div>`;
+      }
     }
-    const paramJson = JSON.stringify(paramObj, null, 2);
-    const rationale = s.thought || s.detail || '';
 
     return `
       <div class="thought-action-row ${isRetry ? 'thought-retry-row' : ''} ${isCorrected ? 'thought-corrected-row' : ''}">
@@ -1008,8 +1012,8 @@
           <span class="thought-action-chevron">&gt;</span>
         </button>
         <div class="thought-action-pane" style="display: none;">
-          ${rationale ? `<div class="thought-action-rationale">${formatThoughtReasoning(rationale)}</div>` : ''}
-          <pre class="thought-action-code"><code>${escapeHtml(paramJson)}</code></pre>
+          ${detailText ? `<div class="thought-action-rationale">${formatThoughtReasoning(detailText)}</div>` : ''}
+          ${paramHtml}
         </div>
       </div>
     `;
@@ -1055,36 +1059,27 @@
     const acc = document.createElement('div');
     acc.className = 'thought-accordion' + (isStreaming ? ' streaming' : '');
 
-    const durationText = initialLabel || (isStreaming ? 'Thinking... 0s ▾' : `Worked for ${formatDuration(elapsedSec)} ▾`);
-    const summaryText = getThoughtSummary(steps);
+    const durationText = initialLabel || (isStreaming ? 'Thinking... 0s ▾' : `Thought for ${formatDuration(elapsedSec)} ▾`);
     const stepsHtml = (steps && steps.length > 0) ? steps.map(renderThoughtStepItemHtml).join('') : '';
 
     let reasoning = reasoningText;
     if (!reasoning && steps && steps.length > 0) {
-      const firstWithThought = steps.find(s => s.thought && !s.thought.startsWith('Model error'));
+      const firstWithThought = steps.find(s => s.thought && !s.thought.startsWith('Model error') && !s.thought.startsWith('Chrome is visible'));
       if (firstWithThought) {
         reasoning = firstWithThought.thought;
       }
     }
-    const thoughtDurationSec = Math.max(1, Math.min(8, Math.round(elapsedSec * 0.7)));
 
     acc.innerHTML = `
       <div class="thought-top-header" title="Click to collapse / expand thought process">
-        <button class="thought-duration-btn" type="button" aria-expanded="true">
+        <button class="thought-duration-btn" type="button" aria-expanded="${isStreaming ? 'true' : 'false'}">
           ${isStreaming ? '<span class="thought-pulse-dot"></span>' : ''}
           <span class="thought-duration-label">${escapeHtml(durationText)}</span>
         </button>
-        <div class="thought-summary-line">${escapeHtml(summaryText)} ▾</div>
       </div>
-      <div class="thought-body">
-        <div class="thought-sub-section thought-cot-box ${reasoning ? '' : 'collapsed'}" style="${reasoning ? '' : 'display: none;'}">
-          <button class="thought-sub-header" type="button" aria-expanded="true">
-            <span class="thought-sub-title">Thought for ${thoughtDurationSec}s</span>
-            <span class="thought-sub-chevron">▾</span>
-          </button>
-          <div class="thought-sub-content">
-            <div class="thought-cot-text">${formatThoughtReasoning(reasoning || '')}</div>
-          </div>
+      <div class="thought-body ${isStreaming ? '' : 'collapsed'}">
+        <div class="thought-sub-section thought-cot-box" style="${reasoning ? '' : 'display: none;'}">
+          <div class="thought-cot-text">${formatThoughtReasoning(reasoning || '')}</div>
         </div>
         <div class="thought-actions-list">${stepsHtml}</div>
       </div>
@@ -1116,11 +1111,6 @@
       updateThoughtAccordionReasoning(acc, stepData.thought);
       acc._hasReasoning = true;
     }
-
-    const summaryLine = acc.querySelector('.thought-summary-line');
-    if (summaryLine) {
-      summaryLine.textContent = getThoughtSummary([stepData]) + ' ▾';
-    }
   }
 
   function updateThoughtAccordionReasoning(acc, reasoningText) {
@@ -1142,17 +1132,20 @@
       clearInterval(acc._timerInterval);
       acc._timerInterval = null;
     }
-    const elapsedSec = t0_stream ? Math.max(1, ((performance.now() - t0_stream) / 1000)) : 8;
+    const elapsedSec = (t0_stream && typeof t0_stream === 'number')
+      ? Math.max(1, ((performance.now() - t0_stream) / 1000))
+      : 8;
     const durLabel = acc.querySelector('.thought-duration-label');
     const pulseDot = acc.querySelector('.thought-pulse-dot');
     if (pulseDot) pulseDot.remove();
     if (durLabel) {
-      durLabel.textContent = `Worked for ${formatDuration(elapsedSec)} ▾`;
+      durLabel.textContent = `Thought for ${formatDuration(elapsedSec)} ▾`;
     }
 
-    const summaryLine = acc.querySelector('.thought-summary-line');
-    if (summaryLine && steps && steps.length > 0) {
-      summaryLine.textContent = getThoughtSummary(steps) + ' ▾';
+    // Automatically collapse thought body when answer starts (Claude style)
+    const body = acc.querySelector('.thought-body');
+    if (body) {
+      body.classList.add('collapsed');
     }
 
     if (steps && Array.isArray(steps) && steps.length > 0) {
@@ -2539,11 +2532,56 @@
 
   });
 
+  let isGenerating = false;
+  let activeAbortController = null;
+
+  function stopGeneration() {
+    if (activeAbortController) {
+      try {
+        activeAbortController.abort();
+      } catch (e) {}
+      activeAbortController = null;
+    }
+  }
+
+  function setGeneratingState(generating) {
+    isGenerating = generating;
+    if (!sendBtn) return;
+    if (generating) {
+      sendBtn.classList.add('stop-mode');
+      sendBtn.title = 'Stop generating';
+      sendBtn.innerHTML = `
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+          <rect x="5" y="5" width="14" height="14" rx="2" ry="2"/>
+        </svg>
+      `;
+    } else {
+      sendBtn.classList.remove('stop-mode');
+      sendBtn.title = 'Send Message';
+      sendBtn.innerHTML = `
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <line x1="12" y1="19" x2="12" y2="5"/>
+          <polyline points="5 12 12 5 19 12"/>
+        </svg>
+      `;
+    }
+  }
+
   async function sendPrompt(text) {
 
     if ((!text || !text.trim()) && !pendingAttachment) return;
 
+    // If currently generating, clicking the button or submitting triggers Stop
+    if (isGenerating) {
+      stopGeneration();
+      return;
+    }
+
     unlockAudio();
+
+    const t0_stream = performance.now();
+    activeAbortController = new AbortController();
+    setGeneratingState(true);
 
     const cleanPrompt = (text || '').trim();
 
@@ -2782,7 +2820,9 @@
 
         headers: getAuthHeaders({ 'Content-Type': 'application/json' }),
 
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+
+        signal: activeAbortController ? activeAbortController.signal : undefined
 
       });
 
@@ -2944,6 +2984,9 @@
                 }
               } else if (data.type === 'done') {
                 finalTokenMetrics = data.token_metrics;
+                if (data.reply_text && (!accumulatedText || accumulatedText.length < data.reply_text.length)) {
+                  accumulatedText = data.reply_text;
+                }
                 renderProgressive(true);
                 if (thoughtAccordion && !thoughtAccordion._isFinalized) {
                   finalizeThoughtAccordion(thoughtAccordion, data.thought_steps || activeThoughtSteps, t0_stream);
@@ -3107,13 +3150,22 @@
 
     } catch (err) {
 
-      console.error('[Chat Error]:', err);
-
-      appendMessage('Connection Error: Unable to reach Home PC server.', false, { action: 'error' });
-
-      setOrbState('error', 'OFFLINE');
+      if (err.name === 'AbortError') {
+        console.log('[Chat] Generation stopped by user.');
+        if (accumulatedText) {
+          accumulatedText += '\n\n*(Generation stopped by user)*';
+          renderProgressive(true);
+        }
+        setOrbState('idle', 'STANDBY // READY');
+      } else {
+        console.error('[Chat Error]:', err);
+        appendMessage('Connection Error: Unable to reach Home PC server.', false, { action: 'error' });
+        setOrbState('error', 'OFFLINE');
+      }
 
     } finally {
+      setGeneratingState(false);
+      activeAbortController = null;
       if (typeof thoughtAccordion !== 'undefined' && thoughtAccordion) {
         if (!thoughtAccordion._isFinalized) {
           finalizeThoughtAccordion(thoughtAccordion, activeThoughtSteps, t0_stream);
@@ -3144,6 +3196,11 @@
     promptInput.addEventListener('keydown', (e) => {
 
       if (e.key === 'Enter') {
+
+        if (isGenerating) {
+          e.preventDefault();
+          return; // Prevents sending a new prompt while the previous one is running
+        }
 
         unlockAudio();
 
