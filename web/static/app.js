@@ -986,7 +986,7 @@
     } else if (action === 'done') {
       headerText = `Completed task`;
     } else if (s.title) {
-      headerText = s.title.startsWith('Ran ') ? s.title : `Ran ${s.title.toLowerCase()}`;
+      headerText = s.title;
     } else {
       headerText = `Step ${s.step || (idx + 1)}`;
     }
@@ -1028,6 +1028,8 @@
       if (!row) return;
       const isOpen = row.classList.toggle('open');
       btn.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+      const ch = btn.querySelector('.thought-action-chevron');
+      if (ch) ch.textContent = isOpen ? '▾' : '>';
       const pane = row.querySelector('.thought-action-pane');
       if (pane) pane.style.display = isOpen ? 'block' : 'none';
     });
@@ -1095,7 +1097,7 @@
     if (!list) return;
 
     if (stepData.thought && !stepData.action && !stepData.title) {
-      updateThoughtAccordionReasoning(acc, stepData.thought);
+      updateThoughtAccordionReasoning(acc, stepData.thought, true);
     } else {
       const rowWrapper = document.createElement('div');
       rowWrapper.innerHTML = renderThoughtStepItemHtml(stepData, list.children.length);
@@ -1107,20 +1109,25 @@
       }
     }
 
-    if (stepData.thought && !acc._hasReasoning) {
-      updateThoughtAccordionReasoning(acc, stepData.thought);
+    if (stepData.thought && !acc._hasReasoning && (stepData.action || stepData.title)) {
+      updateThoughtAccordionReasoning(acc, stepData.thought, false);
       acc._hasReasoning = true;
     }
   }
 
-  function updateThoughtAccordionReasoning(acc, reasoningText) {
+  function updateThoughtAccordionReasoning(acc, reasoningText, append = false) {
     if (!acc || !reasoningText) return;
     const subSec = acc.querySelector('.thought-sub-section');
     const cotText = acc.querySelector('.thought-cot-text');
     if (subSec && cotText) {
       subSec.style.display = 'block';
       subSec.classList.remove('collapsed');
-      cotText.innerHTML = formatThoughtReasoning(reasoningText);
+      if (append) {
+        acc._cotReasoning = (acc._cotReasoning || '') + reasoningText;
+      } else {
+        acc._cotReasoning = reasoningText;
+      }
+      cotText.innerHTML = formatThoughtReasoning(acc._cotReasoning);
     }
   }
 
@@ -1134,7 +1141,7 @@
     }
     const elapsedSec = (t0_stream && typeof t0_stream === 'number')
       ? Math.max(1, ((performance.now() - t0_stream) / 1000))
-      : 8;
+      : (acc._streamElapsedSec || 6);
     const durLabel = acc.querySelector('.thought-duration-label');
     const pulseDot = acc.querySelector('.thought-pulse-dot');
     if (pulseDot) pulseDot.remove();
@@ -2779,9 +2786,17 @@
         true
       );
       let streamElapsedSec = 0;
+      thoughtAccordion._streamElapsedSec = 0;
       thoughtAccordion._timerInterval = setInterval(() => {
-        if (!thoughtAccordion || thoughtAccordion._isFinalized) return;
+        if (!thoughtAccordion || thoughtAccordion._isFinalized) {
+          if (thoughtAccordion && thoughtAccordion._timerInterval) {
+            clearInterval(thoughtAccordion._timerInterval);
+            thoughtAccordion._timerInterval = null;
+          }
+          return;
+        }
         streamElapsedSec += 1;
+        thoughtAccordion._streamElapsedSec = streamElapsedSec;
         const durLabel = thoughtAccordion.querySelector('.thought-duration-label');
         if (durLabel && thoughtAccordion.classList.contains('streaming')) {
           durLabel.textContent = `Thinking... ${formatDuration(streamElapsedSec)} ▾`;
@@ -2861,11 +2876,17 @@
         const thinkMatch = accumulatedText.match(/<think>([\s\S]*?)(?:<\/think>|$)/i);
         if (thinkMatch) {
           const reasoning = thinkMatch[1].trim();
-          curVisible = accumulatedText.replace(/<think>[\s\S]*?(?:<\/think>|$)/gi, '').trim();
+          if (accumulatedText.includes('</think>')) {
+            curVisible = accumulatedText.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+          } else {
+            curVisible = immediate ? accumulatedText.replace(/<\/?think>/gi, '').trim() : '';
+          }
           if (thoughtAccordion && reasoning) {
-            updateThoughtAccordionReasoning(thoughtAccordion, reasoning);
+            updateThoughtAccordionReasoning(thoughtAccordion, reasoning, false);
           }
         }
+
+        const textToDisplay = curVisible || (immediate ? accumulatedText.replace(/<\/?think>/gi, '').trim() : '');
 
         if (immediate) {
           if (renderRafId) {
@@ -2874,7 +2895,7 @@
             renderRafId = null;
           }
           isRenderScheduled = false;
-          textNode.innerHTML = formatMarkdown(curVisible);
+          textNode.innerHTML = formatMarkdown(textToDisplay);
           if (!userIsScrolledUp) {
             chatContainer.scrollTop = chatContainer.scrollHeight;
           }
@@ -2892,7 +2913,7 @@
           renderRafId = requestAnimationFrame(() => {
             renderRafId = null;
             isRenderScheduled = false;
-            textNode.innerHTML = formatMarkdown(curVisible);
+            textNode.innerHTML = formatMarkdown(textToDisplay);
             if (!userIsScrolledUp) {
               chatContainer.scrollTop = chatContainer.scrollHeight;
             }
@@ -2904,7 +2925,7 @@
             renderRafId = requestAnimationFrame(() => {
               renderRafId = null;
               isRenderScheduled = false;
-              textNode.innerHTML = formatMarkdown(curVisible);
+              textNode.innerHTML = formatMarkdown(textToDisplay);
               if (!userIsScrolledUp) {
                 chatContainer.scrollTop = chatContainer.scrollHeight;
               }
@@ -5282,6 +5303,14 @@
 
   const usersModalStatus = document.getElementById('users-modal-status');
 
+  let _lastModalCloseTimestamp = 0;
+  function registerModalClosed() {
+    _lastModalCloseTimestamp = Date.now();
+  }
+  function isGhostClickFromModalClose() {
+    return (Date.now() - _lastModalCloseTimestamp) < 450;
+  }
+
   function showUsersModal() {
     if (typeof optionsModal !== 'undefined' && optionsModal) {
       optionsModal.style.display = 'none';
@@ -5295,6 +5324,7 @@
   }
 
   function hideUsersModal() {
+    registerModalClosed();
     if (usersModal) {
       usersModal.style.display = 'none';
       usersModal.classList.remove('active');
@@ -5302,14 +5332,24 @@
   }
 
   if (usersNavBtn) {
-    usersNavBtn.addEventListener('click', () => {
+    usersNavBtn.addEventListener('click', (e) => {
+      if (isGhostClickFromModalClose()) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
       toggleDrawer(false);
       showUsersModal();
     });
   }
 
   if (manageUsersDrawerBtn) {
-    manageUsersDrawerBtn.addEventListener('click', () => {
+    manageUsersDrawerBtn.addEventListener('click', (e) => {
+      if (isGhostClickFromModalClose()) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
       toggleDrawer(false);
       showUsersModal();
     });
@@ -5332,7 +5372,7 @@
           method: 'POST',
           headers: getAuthHeaders()
         });
-        showGlobalToast('??? Bringing Project Libra to your desktop monitor...');
+        showGlobalToast('✨ Bringing Project Libra to your desktop monitor...');
       } catch (e) {
         console.error('Failed to show GUI:', e);
       }
@@ -5341,6 +5381,7 @@
 
   if (closeUsersModalBtn) {
     closeUsersModalBtn.addEventListener('click', (e) => {
+      e.preventDefault();
       e.stopPropagation();
       hideUsersModal();
     });
@@ -5889,14 +5930,28 @@
   }
 
   function closeBugModal() {
-
+    registerModalClosed();
     if (bugReportModal) bugReportModal.style.display = 'none';
-
   }
 
-  if (bugNavBtn) bugNavBtn.addEventListener('click', openBugModal);
+  if (bugNavBtn) {
+    bugNavBtn.addEventListener('click', (e) => {
+      if (isGhostClickFromModalClose()) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      openBugModal();
+    });
+  }
 
-  if (closeBugModalBtn) closeBugModalBtn.addEventListener('click', closeBugModal);
+  if (closeBugModalBtn) {
+    closeBugModalBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      closeBugModal();
+    });
+  }
 
   if (refreshBugsBtn) refreshBugsBtn.addEventListener('click', fetchBugReports);
 
@@ -7200,35 +7255,28 @@
   }
 
   async function loadGitHubConfig() {
-
     try {
-
       const res = await fetch('/api/github/config', { headers: getAuthHeaders() });
-
       if (res.ok) {
-
         const data = await res.json();
-
         if (optionsGhRepoInput && data.repo) optionsGhRepoInput.value = data.repo;
-
         if (optionsGhStatusIndicator) {
-
           if (data.has_token) {
-
             optionsGhStatusIndicator.innerHTML = '<span style="color: #34d399; font-weight: 600;">● Connected (GitHub PAT Active — Automatic Issue Creation Online)</span>';
-
           } else {
-
             optionsGhStatusIndicator.innerHTML = '<span style="color: #fb7185; font-weight: 600;">● No Token Configured (Paste your GitHub PAT below to auto-post issues)</span>';
-
           }
-
         }
-
+      } else {
+        if (optionsGhStatusIndicator) {
+          optionsGhStatusIndicator.innerHTML = '<span style="color: #fb7185; font-weight: 600;">● Unable to connect to GitHub service</span>';
+        }
       }
-
-    } catch (e) {}
-
+    } catch (e) {
+      if (optionsGhStatusIndicator) {
+        optionsGhStatusIndicator.innerHTML = '<span style="color: #fb7185; font-weight: 600;">● Connection Error</span>';
+      }
+    }
   }
 
   async function saveGitHubConfig() {
@@ -7450,14 +7498,28 @@
   }
 
   function closeOptionsModal() {
-
+    registerModalClosed();
     if (optionsModal) optionsModal.style.display = 'none';
-
   }
 
-  if (optionsNavBtn) optionsNavBtn.addEventListener('click', () => openOptionsModal('tab-profile'));
+  if (optionsNavBtn) {
+    optionsNavBtn.addEventListener('click', (e) => {
+      if (isGhostClickFromModalClose()) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      openOptionsModal('tab-profile');
+    });
+  }
 
-  if (closeOptionsModalBtn) closeOptionsModalBtn.addEventListener('click', closeOptionsModal);
+  if (closeOptionsModalBtn) {
+    closeOptionsModalBtn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      closeOptionsModal();
+    });
+  }
 
   // Voice Speech Listeners
 
@@ -7646,7 +7708,7 @@
   document.addEventListener('keydown', (e) => {
 
     if (e.key === 'Escape') {
-
+      registerModalClosed();
       const overlays = document.querySelectorAll('.modal-overlay');
 
       overlays.forEach(m => {
@@ -7674,7 +7736,7 @@
     modal.addEventListener('click', (e) => {
 
       if (e.target === modal) {
-
+        registerModalClosed();
         modal.style.display = 'none';
 
         modal.classList.remove('active');

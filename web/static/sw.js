@@ -1,5 +1,5 @@
-// Project Libra PWA Service Worker (v10.2.5)
-const CACHE_NAME = 'libra-pwa-v10.5.5';
+// Project Libra PWA Service Worker (v10.6.0)
+const CACHE_NAME = 'libra-pwa-v10.6.0';
 
 const STATIC_ASSETS = [
   '/',
@@ -77,23 +77,18 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // 3. Static assets: Stale-While-Revalidate
+  // 3. Static assets: Network-First with cache fallback (ensures instant updates)
   event.respondWith(
-    caches.match(event.request).then((cachedResponse) => {
-      const fetchPromise = fetch(event.request)
-        .then((networkResponse) => {
-          if (networkResponse && networkResponse.status === 200) {
-            const responseToCache = networkResponse.clone();
-            caches.open(CACHE_NAME).then((cache) => {
-              cache.put(event.request, responseToCache);
-            });
-          }
-          return networkResponse;
-        })
-        .catch(() => cachedResponse);
-
-      // Return cached version immediately if available, otherwise wait for network
-      return cachedResponse || fetchPromise;
-    })
+    fetch(event.request)
+      .then((networkResponse) => {
+        if (networkResponse && networkResponse.status === 200) {
+          const responseToCache = networkResponse.clone();
+          caches.open(CACHE_NAME).then((cache) => {
+            cache.put(event.request, responseToCache);
+          });
+        }
+        return networkResponse;
+      })
+      .catch(() => caches.match(event.request))
   );
 });
