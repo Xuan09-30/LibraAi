@@ -405,6 +405,7 @@ def send_local_ipc_command(cmd: str):
         if sock.waitForConnected(250):
             sock.write(f"{cmd}\n".encode("utf-8"))
             sock.waitForBytesWritten(500)
+            sock.waitForReadyRead(500)
             sock.disconnectFromServer()
     except Exception:
         pass

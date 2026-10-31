@@ -5045,30 +5045,68 @@
   const usersModalStatus = document.getElementById('users-modal-status');
 
   function showUsersModal() {
-
-    if (typeof optionsModal !== 'undefined' && optionsModal) optionsModal.style.display = 'none';
-
-    if (usersModal) {
-
-      usersModal.style.display = 'flex';
-
-      fetchUsersList();
-
+    if (typeof optionsModal !== 'undefined' && optionsModal) {
+      optionsModal.style.display = 'none';
+      optionsModal.classList.remove('active');
     }
-
+    if (usersModal) {
+      usersModal.style.display = 'flex';
+      usersModal.classList.add('active');
+      fetchUsersList();
+    }
   }
 
   function hideUsersModal() {
-
-    if (usersModal) usersModal.style.display = 'none';
-
+    if (usersModal) {
+      usersModal.style.display = 'none';
+      usersModal.classList.remove('active');
+    }
   }
 
-  if (usersNavBtn) usersNavBtn.addEventListener('click', showUsersModal);
+  if (usersNavBtn) {
+    usersNavBtn.addEventListener('click', () => {
+      toggleDrawer(false);
+      showUsersModal();
+    });
+  }
 
-  if (manageUsersDrawerBtn) manageUsersDrawerBtn.addEventListener('click', showUsersModal);
+  if (manageUsersDrawerBtn) {
+    manageUsersDrawerBtn.addEventListener('click', () => {
+      toggleDrawer(false);
+      showUsersModal();
+    });
+  }
 
-  if (closeUsersModalBtn) closeUsersModalBtn.addEventListener('click', hideUsersModal);
+  const optionsOpenUsersBtn = document.getElementById('options-open-users-btn');
+  if (optionsOpenUsersBtn) {
+    optionsOpenUsersBtn.addEventListener('click', () => {
+      closeOptionsModal();
+      showUsersModal();
+    });
+  }
+
+  const desktopGuiDrawerBtn = document.getElementById('desktop-gui-drawer-btn');
+  if (desktopGuiDrawerBtn) {
+    desktopGuiDrawerBtn.addEventListener('click', async () => {
+      toggleDrawer(false);
+      try {
+        await fetch('/api/gui/show', {
+          method: 'POST',
+          headers: getAuthHeaders()
+        });
+        showGlobalToast('??? Bringing Project Libra to your desktop monitor...');
+      } catch (e) {
+        console.error('Failed to show GUI:', e);
+      }
+    });
+  }
+
+  if (closeUsersModalBtn) {
+    closeUsersModalBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      hideUsersModal();
+    });
+  }
 
   if (refreshUsersBtn) refreshUsersBtn.addEventListener('click', fetchUsersList);
 

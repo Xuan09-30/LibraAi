@@ -134,6 +134,12 @@ class GlobalHotkeyThread(QThread):
         if sys.platform != "win32":
             return
         user32 = ctypes.windll.user32
+        try:
+            h_desk = user32.OpenDesktopW("Default", 0, False, 0x01FF)
+            if h_desk:
+                user32.SetThreadDesktop(h_desk)
+        except Exception:
+            pass
 
         # 1. Register Win32 RegisterHotKey
         success1 = user32.RegisterHotKey(

@@ -9,8 +9,8 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="icon" type="image/png" href="/static/icon.png">
-  <link rel="stylesheet" href="/static/style.css?v=10.4.0">
-  <link rel="stylesheet" href="/static/prism.css?v=10.4.0">
+  <link rel="stylesheet" href="/static/style.css?v=10.5.2">
+  <link rel="stylesheet" href="/static/prism.css?v=10.5.2">
   <script src="/static/three.min.js"></script>
 </head>
 <body>
@@ -71,6 +71,9 @@
           </button>
           <button id="users-nav-btn" class="drawer-tool-btn" title="User Management & Role Permissions">
             <span>👥 User Permissions</span>
+          </button>
+          <button id="desktop-gui-drawer-btn" class="drawer-tool-btn host-only-btn" title="Bring up Project Libra Desktop GUI on Monitor" style="display: none;">
+            <span>??? Show Desktop GUI</span>
           </button>
           <button id="drawer-token-telemetry-btn" class="drawer-tool-btn" title="GPU Token Telemetry & Context Stats">
             <span>📊 GPU Telemetry</span>
@@ -356,7 +359,7 @@
         <button class="options-tab-btn active" data-tab="tab-profile">👤 Profile &amp; Instructions</button>
         <button class="options-tab-btn host-only-btn" data-tab="tab-invites" style="display: none;">🔑 Invites &amp; Tunnel</button>
         <button class="options-tab-btn host-only-btn" data-tab="tab-github" style="display: none;">🐙 GitHub Sync</button>
-        <button class="options-tab-btn host-only-btn" data-tab="tab-users" style="display: none;">👥 Users</button>
+        <button class="options-tab-btn host-only-btn" id="options-open-users-btn" style="display: none;">👥 Users</button>
       </div>
 
       <div class="modal-body" style="max-height: 440px; overflow-y: auto;">
@@ -489,13 +492,6 @@
         </div>
 
         <!-- TAB 4: USERS & ROLES -->
-        <div id="tab-users" class="options-tab-content" style="display: none;">
-          <p style="font-size: 12px; color: #94a3b8; margin-bottom: 10px;">
-            Manage authorized users, promote/demote roles between Tester and Host:
-          </p>
-          <div id="options-users-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 250px; overflow-y: auto;">
-            <div style="color: #64748b; font-size: 12px;">Loading registered users...</div>
-          </div>
         </div>
       </div>
     </div>
@@ -987,6 +983,6 @@
   <script src="/static/html2canvas.min.js"></script>
   <!-- MAIN SCRIPT -->
   <script src="/static/prism.min.js?v=10.4.0"></script>
-  <script src="/static/app.js?v=10.4.0"></script>
+  <script src="/static/app.js?v=10.5.2"></script>
 </body>
 </html>
