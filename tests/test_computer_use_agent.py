@@ -75,3 +75,47 @@ def test_anticheat_guard_prevents_automation(monkeypatch):
     assert res["status"] == "paused_for_anticheat"
     assert res["agent_trace"][0]["action"] == "aborted_for_anticheat"
     assert "Anti-Cheat Safe Mode" in res["voice_response"]
+
+
+def test_loop_execution_and_memory_persistence():
+    class DummyMemory:
+        def __init__(self):
+            self.corrections = []
+            self.macros = []
+        def record_correction(self, trigger, mistake, correction):
+            self.corrections.append((trigger, mistake, correction))
+            return 1
+        def record_action_macro(self, prompt, sig, tool_chain):
+            self.macros.append((prompt, sig, tool_chain))
+            return 1
+
+    mem = DummyMemory()
+    agent = AutonomousComputerUseAgent(gui_control=None, spatial=None, memory=mem)
+    streamed_steps = []
+    def callback(s):
+        streamed_steps.append(s)
+
+    prompt = "Open my chrome and then cinejoy.pk, find and search hannibal and click resume"
+    res = agent.execute_task(prompt, dry_run=True, step_callback=callback)
+
+    assert res["status"] == "success"
+    assert res["learned_workflow_saved"] is True
+    # Verify retry entry was recorded
+    retries = [s for s in res["agent_trace"] if s.get("action") == "retry"]
+    assert len(retries) >= 1
+    assert "Gemini 503" in retries[0]["error"]
+    assert retries[0]["attempt"] == 1
+    # Verify callback streamed steps
+    assert len(streamed_steps) == len(res["agent_trace"])
+    # Verify memory was persisted
+    assert len(mem.corrections) == 1
+    assert "navigate cinejoy.pk" in mem.corrections[0][0]
+    assert len(mem.macros) == 1
+    # Verify vault markdown was created
+    vault_file = os.path.join(PROJECT_ROOT, "assets", "vault", "learned_workflow_cinejoy_pk.md")
+    assert os.path.exists(vault_file)
+    with open(vault_file, "r", encoding="utf-8") as f:
+        content = f.read()
+        assert "Learned Workflow: cinejoy.pk" in content
+        assert "Gemini 503" in content
+
