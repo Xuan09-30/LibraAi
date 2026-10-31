@@ -1,6 +1,7 @@
 import os
 import sys
 
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 os.chdir(PROJECT_ROOT)
 if PROJECT_ROOT not in sys.path:
@@ -70,7 +71,7 @@ os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = (
 import ctypes
 from ctypes import wintypes
 
-_is_reload = any(arg.startswith("--reload-") or arg.startswith("--reloaded-") for arg in sys.argv)
+_is_reload = any(arg.startswith("--reload-") or arg.startswith("--reloaded-") for arg in sys.argv) or "pytest" in sys.modules or os.environ.get("LIBRA_TEST_MODE") == "1"
 _libra_mutex_handle = None
 
 if not _is_reload:
@@ -94,9 +95,10 @@ if not _is_reload:
             _sock = QLocalSocket()
             for _ in range(15):
                 _sock.connectToServer("libra_instance_ipc")
-                if _sock.waitForConnected(200):
+                if _sock.waitForConnected(500):
                     _sock.write(b"show\n")
                     _sock.waitForBytesWritten(1000)
+                    _sock.waitForReadyRead(500)
                     _sock.disconnectFromServer()
                     break
                 time.sleep(0.2)
@@ -212,6 +214,7 @@ class VoiceAssistantWorker(QThread):
     core_response_signal = pyqtSignal(dict)
     notification_signal = pyqtSignal(str, str)
     game_state_changed = pyqtSignal(bool)
+    ui_visibility_signal = pyqtSignal(str)  # 'show', 'hide', 'toggle'
 
     def __init__(self, raw_chime_pcm: bytes = b""):
         super().__init__()
@@ -929,6 +932,50 @@ class VoiceAssistantWorker(QThread):
                 followup_turn_count = 0
                 continue
 
+            # Direct Voice Window Commands (e.g. "show yourself", "come out", "hide yourself")
+            clean_cmd = re.sub(r"[^a-zA-Z\s]", " ", user_text).strip().lower()
+            clean_cmd_stripped = re.sub(r"^(?:hey\s+libra|libra|please)\s+", "", clean_cmd).strip().lower()
+
+            SHOW_PHRASES = {
+                "show yourself", "show interface", "open interface", "come out",
+                "open window", "show window", "open the window", "show the window",
+                "open up", "show ui", "open ui", "bring up the window",
+                "open libra", "show libra", "show desktop", "come back", "maximize"
+            }
+            HIDE_PHRASES = {
+                "hide yourself", "hide interface", "close interface", "hide window",
+                "hide ui", "close window", "close ui", "minimize", "go away",
+                "go to background", "hide in background", "disappear", "hide libra"
+            }
+
+            if clean_cmd_stripped in SHOW_PHRASES or clean_cmd in SHOW_PHRASES:
+                print(f"[Worker] Voice UI Command triggered: SHOW ({user_text})")
+                self.ui_visibility_signal.emit("show")
+                voice_msg = "Right here, Chen Xuan. Bringing up my interface now."
+                self.log_received.emit("LIBRA", voice_msg)
+                if not self.mute_tts:
+                    self.orb_state_signal.emit("speaking")
+                    speak_interruptible(voice_msg)
+                self.orb_state_signal.emit("idle")
+                ww_booster.clear_followup_window()
+                in_followup_mode = False
+                self.status_changed.emit("STANDBY // READY")
+                continue
+
+            if clean_cmd_stripped in HIDE_PHRASES or clean_cmd in HIDE_PHRASES:
+                print(f"[Worker] Voice UI Command triggered: HIDE ({user_text})")
+                self.ui_visibility_signal.emit("hide")
+                voice_msg = "Minimizing to background. I'll still be listening whenever you call."
+                self.log_received.emit("LIBRA", voice_msg)
+                if not self.mute_tts:
+                    self.orb_state_signal.emit("speaking")
+                    speak_interruptible(voice_msg)
+                self.orb_state_signal.emit("idle")
+                ww_booster.clear_followup_window()
+                in_followup_mode = False
+                self.status_changed.emit("STANDBY // READY")
+                continue
+
             # STATE 4: REASON & EXECUTE VIA LLM CORE
             self.status_changed.emit("PROCESSING REASONING...")
             self.orb_state_signal.emit("reasoning")
@@ -1252,13 +1299,14 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.init_ui()
         _ = self.winId()
         self.init_tray_icon()
-        try:
-            self.main_hotkey_thread = MainWindowHotkeyThread(self)
-            self.main_hotkey_thread.hotkey_triggered.connect(self.toggle_interface)
-            self.main_hotkey_thread.start()
-        except Exception as hk_err:
-            print(f"[Main Hotkey Init Warning]: {hk_err}")
+        self.main_hotkey_thread = None
         if start_worker:
+            try:
+                self.main_hotkey_thread = MainWindowHotkeyThread(self)
+                self.main_hotkey_thread.hotkey_triggered.connect(self.toggle_interface)
+                self.main_hotkey_thread.start()
+            except Exception as hk_err:
+                print(f"[Main Hotkey Init Warning]: {hk_err}")
             self.init_code_reloader()
             self.init_worker()
 
@@ -1742,7 +1790,16 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.worker.core_response_signal.connect(self.handle_core_response)
         self.worker.notification_signal.connect(self.show_notification)
         self.worker.game_state_changed.connect(self._on_game_state_changed)
+        self.worker.ui_visibility_signal.connect(self._handle_ui_visibility)
         self.worker.start()
+
+    def _handle_ui_visibility(self, action: str):
+        if action == "show":
+            self.show_interface()
+        elif action == "hide":
+            self.hide_interface()
+        elif action == "toggle":
+            self.toggle_interface()
 
     def _create_default_tray_icon(self) -> QIcon:
         icon_path = os.path.join(PROJECT_ROOT, "assets", "icon.png")
@@ -1838,7 +1895,9 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             pass
 
     def show_interface(self):
-        # 1. Qt level restore & activate
+        # 1. Center on screen if not positioned or offscreen
+        self.center_on_screen()
+        # 2. Qt level restore & activate
         if self.isMinimized():
             self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
         self.show()
@@ -1992,8 +2051,10 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             if arg != "--hidden" and not arg.startswith("--reload-") and not arg.startswith("--reloaded-"):
                 cmd.append(arg)
 
+        if not was_visible:
+            cmd.append("--hidden")
+
         cmd.extend([
-            "--hidden",
             f"--reload-count={new_count}",
             f"--reloaded-from={filename}",
             f"--reloaded-at={t_str}"
@@ -2011,6 +2072,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         )
 
         QApplication.quit()
+        os._exit(0)
 
     def _quit_application(self):
         if self.code_reloader is not None:
@@ -2077,6 +2139,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
 
 if __name__ == "__main__":
+
     from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
     app = QApplication(sys.argv)
@@ -2087,10 +2150,12 @@ if __name__ == "__main__":
     if not is_reload_restart:
         socket = QLocalSocket()
         socket.connectToServer("libra_instance_ipc")
-        if socket.waitForConnected(400):
+        if socket.waitForConnected(500):
             # Another instance is actively running. Ask existing instance to show its window immediately.
             socket.write(b"show\n")
             socket.waitForBytesWritten(1000)
+            socket.waitForReadyRead(500)
+            socket.disconnectFromServer()
             sys.exit(0)
 
     # 2. Setup IPC Server to receive 'show' commands from subsequent launches
@@ -2104,19 +2169,27 @@ if __name__ == "__main__":
     def handle_incoming_ipc():
         conn = ipc_server.nextPendingConnection()
         if conn:
-            conn.waitForReadyRead(500)
-            msg = bytes(conn.readAll()).decode("utf-8", errors="ignore")
-            if "show" in msg:
-                window.show_interface()
-            elif "hide" in msg:
+            raw = bytes(conn.readAll())
+            if not raw:
+                conn.waitForReadyRead(250)
+                raw = bytes(conn.readAll())
+            msg = raw.decode("utf-8", errors="ignore").strip().lower()
+            if "hide" in msg:
                 window.hide_interface()
             elif "toggle" in msg:
                 window.toggle_interface()
+            else:
+                window.show_interface()
+            try:
+                conn.write(b"ok\n")
+                conn.flush()
+            except Exception:
+                pass
 
     ipc_server.newConnection.connect(handle_incoming_ipc)
 
     is_reload_restart = any(arg.startswith("--reload-count") for arg in sys.argv)
-    is_hidden_requested = "--hidden" in sys.argv or is_reload_restart
+    is_hidden_requested = "--hidden" in sys.argv
 
     if not is_hidden_requested:
         window.center_on_screen()
