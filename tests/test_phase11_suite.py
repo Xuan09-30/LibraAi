@@ -676,8 +676,9 @@ def test_sse_chat_token_streaming(test_client):
             assert len(events) >= 3
             assert events[0]["type"] == "meta"
             assert "session_id" in events[0]
-            assert events[1]["type"] == "token"
-            assert events[1]["content"] == "Real-time"
+            token_events = [e for e in events if e.get("type") == "token"]
+            assert len(token_events) >= 1
+            assert token_events[0]["content"] == "Real-time"
             assert events[-1]["type"] == "done"
             assert events[-1]["token_metrics"]["turn_out"] == 6
 

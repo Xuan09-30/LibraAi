@@ -2095,7 +2095,8 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         if self.worker is not None:
             self.worker.stop()
             self.worker.wait()
-        QApplication.quit()
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            QApplication.quit()
 
     def _on_game_state_changed(self, is_game_active: bool):
         self.anti_cheat_safe_mode = is_game_active

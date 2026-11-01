@@ -7,7 +7,7 @@ triggers:
   - downloads summary
   - check my downloads clutter
 version: 1.0.0
-success_count: 18
+success_count: 20
 ---
 # Safe Downloads & Desktop Janitor
 Scans the Windows Downloads folder and breaks down installers, archives, images, and documents by count and megabytes.

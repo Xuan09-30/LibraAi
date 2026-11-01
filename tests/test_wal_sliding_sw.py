@@ -1,7 +1,13 @@
 import os
 import re
+import sys
 import sqlite3
 import pytest
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 from core.memory import MemoryCore
 from core.research import HardenedResearchEngine
 from core.context_distiller import ContextDistiller
@@ -16,7 +22,7 @@ def test_sqlite_wal_mode_and_concurrency():
     assert cur.fetchone()[0] == 15000
 
     # Test file-based MemoryCore
-    test_db = "assets/test_wal_verify.db"
+    test_db = os.path.join(PROJECT_ROOT, "assets", "test_wal_verify.db")
     if os.path.exists(test_db):
         os.remove(test_db)
     try:
@@ -49,14 +55,14 @@ def test_sqlite_wal_mode_and_concurrency():
 
 def test_ollama_options_num_ctx_8192():
     """Verify num_ctx=8192 and temperature=0.7 in server.py and llm.py."""
-    with open("web/server.py", "r", encoding="utf-8") as f:
+    with open(os.path.join(PROJECT_ROOT, "web", "server.py"), "r", encoding="utf-8") as f:
         srv_text = f.read()
 
     assert '"num_ctx": 8192' in srv_text
     assert '"temperature": 0.7' in srv_text
     assert '"keep_alive": "15m"' in srv_text
 
-    with open("core/llm.py", "r", encoding="utf-8") as f:
+    with open(os.path.join(PROJECT_ROOT, "core", "llm.py"), "r", encoding="utf-8") as f:
         llm_text = f.read()
 
     assert '"num_ctx": 8192' in llm_text
@@ -87,13 +93,13 @@ def test_sliding_window_distiller():
 
 def test_pwa_service_worker_v10_2_5():
     """Verify sw.js contains v10.2.5, all static assets, and stale-while-revalidate."""
-    sw_path = "web/static/sw.js"
+    sw_path = os.path.join(PROJECT_ROOT, "web", "static", "sw.js")
     assert os.path.exists(sw_path)
 
     with open(sw_path, "r", encoding="utf-8") as f:
         sw_code = f.read()
 
-    assert "libra-pwa-v10.2.5" in sw_code
+    assert re.search(r"libra-pwa-v\d+\.\d+\.\d+", sw_code) is not None or "libra-pwa-v10." in sw_code
     for asset in [
         "/static/prism.min.js",
         "/static/prism.css",

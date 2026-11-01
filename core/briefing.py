@@ -413,7 +413,7 @@ class BriefingAndWorkspaces:
         temp = w.get("temp_c", 31)
         cpu = h.get("cpu_percent", 12.0)
         nvme = h.get("nvme_free_gb", 100.0)
-        greeting = f"Good morning {name}! In Kuala Lumpur it is {temp} degrees Celsius. System CPU is at {cpu}% with {nvme} GB free on NVMe storage. "
+        greeting = f"Good morning {name}! In Kuala Lumpur it is {temp} degrees Celsius. System CPU is at {cpu}% with {nvme} GB free on NVMe storage. Checking your schedule and reminders: "
         combined = greeting + str(res)
         data = dict(res._data) if hasattr(res, "_data") else {"status": "success"}
         data["voice_response"] = combined

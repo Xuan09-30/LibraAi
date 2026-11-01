@@ -489,157 +489,89 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     # -----------------------------------------------------------------------
 
     def authenticate_request(request: Request) -> Dict[str, Any]:
-
         """
-
         Enforces Cloudflare / Token / Localhost Identity Lock:
-
         1. Cloudflare Access Google OAuth: 'Cf-Access-Authenticated-User-Email'.
-
         2. Custom identity header: 'X-User-Email'.
-
-        3. Bearer token / 'x-libra-token' / '?token=...' / cookie 'libra_token'.
-
-        4. Direct localhost access on the host PC (when no external proxy header is present).
-
+        3. Tailscale identity header: 'Tailscale-User-Login'.
+        4. Bearer token / 'x-libra-token' / '?token=...' / cookie 'libra_token'.
+        5. Direct localhost access on the host PC (when no external proxy header is present).
         """
-
-        # 1. Header-based email identity (Strictly verified Cloudflare Access JWT)
-        cf_jwt = request.headers.get("cf-access-jwt-assertion")
-        cf_email = request.headers.get("cf-access-authenticated-user-email")
-        if cf_jwt and cf_email:
-            clean_email = cf_email.lower().strip()
+        # 1. Header-based email identity (Cloudflare Access / Tailscale / X-User-Email)
+        email = (
+            request.headers.get("cf-access-authenticated-user-email")
+            or request.headers.get("x-user-email")
+            or request.headers.get("tailscale-user-login")
+        )
+        if email:
+            clean_email = email.lower().strip()
             if clean_email == admin_email or clean_email.startswith(admin_email.split("@")[0]):
-                return {"authenticated": True, "role": "host", "method": "cloudflare_identity", "email": clean_email}
+                return {"authenticated": True, "role": "host", "method": "identity_header", "email": clean_email}
             else:
                 memory = getattr(supervisor.llm, "memory", None)
                 if memory and hasattr(memory, "get_user_by_email"):
                     u = memory.get_user_by_email(clean_email)
                     if u:
-                        return {"authenticated": True, "role": u.get("role", "tester"), "method": "cloudflare_identity", "email": clean_email, "label": u.get("display_name", "User")}
+                        return {"authenticated": True, "role": u.get("role", "tester"), "method": "identity_header", "email": clean_email, "label": u.get("display_name", "User")}
                 raise HTTPException(
                     status_code=403,
                     detail=f"Forbidden: Identity '{clean_email}' is not authorized to access Project Libra."
                 )
 
         # 2. Token-based authentication
-
         auth_header = request.headers.get("authorization", "")
-
         token = ""
-
         if auth_header.startswith("Bearer "):
-
             token = auth_header[7:].strip()
-
         elif "x-libra-token" in request.headers:
-
             token = request.headers.get("x-libra-token", "").strip()
-
         elif "token" in request.query_params:
-
             token = request.query_params.get("token", "").strip()
-
         elif "libra_token" in request.cookies:
-
             token = request.cookies.get("libra_token", "").strip()
-
         elif "libra_auth" in request.cookies:
-
             token = request.cookies.get("libra_auth", "").strip()
 
         # Host Master Token
-
         if token and token == access_token:
-
             return {"authenticated": True, "role": "host", "method": "master_token", "token": token, "email": admin_email, "label": "Host Admin"}
 
         # Per-User Unique Token (Multi-User Registered Users or Guest Tokens)
-
         memory = getattr(supervisor.llm, "memory", None)
-
         if memory and hasattr(memory, "validate_user_token") and token:
-
             user_info = memory.validate_user_token(token)
-
             if user_info:
-
                 return {
-
                     "authenticated": True,
-
                     "role": user_info.get("role", "guest"),
-
                     "method": "user_token",
-
                     "token": token,
-
                     "email": user_info.get("email", ""),
-
                     "label": user_info.get("display_name", "User")
-
                 }
 
         # Legacy Guest Access Token fallback
-
         if memory and hasattr(memory, "validate_guest_token") and token:
-
             guest_info = memory.validate_guest_token(token)
-
             if guest_info:
-
                 return {
-
                     "authenticated": True,
-
                     "role": "guest",
-
                     "method": "guest_token",
-
                     "token": token,
-
                     "email": f"{guest_info.get('label', 'Guest').lower().replace(' ', '_')}@guest.local",
-
                     "label": guest_info.get("label", "Guest")
-
                 }
 
         # 3. Direct Localhost Host Access (when no invalid token was supplied and not proxied via Cloudflare)
-
         client_host = request.client.host if request.client else ""
-
         is_proxied = bool(request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for"))
-
         if not token and not is_proxied and client_host in ("127.0.0.1", "::1", "localhost"):
-
             return {"authenticated": True, "role": "host", "method": "localhost_direct", "email": admin_email}
 
-        # 4. Sandboxed Guest Access for Web/Ngrok visitors when no credentials are provided
-
-        if not token:
-
-            return {
-
-                "authenticated": True,
-
-                "role": "guest",
-
-                "method": "sandboxed_guest",
-
-                "token": "sandboxed_guest",
-
-                "email": "guest@libra.local",
-
-                "label": "Guest User"
-
-            }
-
         raise HTTPException(
-
             status_code=401,
-
-            detail="Unauthorized: Invalid Libra access token."
-
+            detail="Unauthorized: Valid authentication credentials required."
         )
 
     # -----------------------------------------------------------------------
@@ -994,10 +926,14 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         if not os.path.isfile(norm_path):
             raise HTTPException(status_code=404, detail="File not found on PC.")
         user_home = os.path.expanduser("~")
+        import tempfile
         allowed_dirs = [
             os.path.normpath(os.path.join(user_home, "Downloads")),
+            os.path.normpath(os.path.join(user_home, "Desktop")),
+            os.path.normpath(os.path.join(user_home, "Documents")),
             os.path.normpath(os.path.join(PROJECT_ROOT, "uploads")),
             os.path.normpath(os.path.join(PROJECT_ROOT, "assets")),
+            os.path.normpath(tempfile.gettempdir()),
         ]
         is_safe = any(norm_path.lower().startswith(d.lower() + os.sep) or norm_path.lower() == d.lower() for d in allowed_dirs)
         lower_p = norm_path.lower()

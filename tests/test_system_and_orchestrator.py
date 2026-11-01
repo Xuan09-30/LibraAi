@@ -95,6 +95,7 @@ def run_tests():
         print(f"  [FAIL] Test 2: ep_id={ep_id}, recalled={recalled}")
 
     # Clean up test database
+    memory.close()
     if os.path.exists(test_db_full):
         try:
             os.remove(test_db_full)

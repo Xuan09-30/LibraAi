@@ -2232,13 +2232,23 @@ class SemanticMemory:
             sql = f"UPDATE semantic_facts SET {', '.join(updates)} WHERE id = ?"
 
             try:
-
                 cursor.execute(sql, tuple(params))
-
-            except sqlite3.DatabaseError:
-
-                cursor.execute("INSERT INTO semantic_facts_fts(semantic_facts_fts) VALUES('rebuild')")
-
+            except sqlite3.DatabaseError as dbe:
+                if "no such table: semantic_facts_fts" in str(dbe).lower():
+                    try:
+                        cursor.execute("""
+                            CREATE VIRTUAL TABLE IF NOT EXISTS semantic_facts_fts USING fts5(
+                                value, entity, relation, category, content='semantic_facts', content_rowid='id'
+                            )
+                        """)
+                        cursor.execute("INSERT INTO semantic_facts_fts(semantic_facts_fts) VALUES('rebuild')")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        cursor.execute("INSERT INTO semantic_facts_fts(semantic_facts_fts) VALUES('rebuild')")
+                    except Exception:
+                        pass
                 cursor.execute(sql, tuple(params))
 
             conn.commit()
@@ -2246,7 +2256,18 @@ class SemanticMemory:
             success = cursor.rowcount > 0
 
         except Exception as e:
-
+            if "no such table: semantic_facts_fts" in str(e).lower():
+                try:
+                    cursor.execute("""
+                        CREATE VIRTUAL TABLE IF NOT EXISTS semantic_facts_fts USING fts5(
+                            value, entity, relation, category, content='semantic_facts', content_rowid='id'
+                        )
+                    """)
+                    cursor.execute(sql, tuple(params))
+                    conn.commit()
+                    return cursor.rowcount > 0
+                except Exception:
+                    pass
             print(f"[SemanticMemory update_vault_fact Error]: {e}")
 
             return False
@@ -2465,6 +2486,31 @@ class SemanticMemory:
 
             self.sync_fact_to_vault_markdown(f["id"])
 
+    def close(self):
+        """Cleanly stops background observers and closes database connections."""
+        if hasattr(self, "_vault_observer") and self._vault_observer:
+            try:
+                self._vault_observer.stop()
+                self._vault_observer.join(timeout=1.0)
+            except Exception:
+                pass
+            if getattr(SemanticMemory, "_ACTIVE_VAULT_OBSERVER", None) == self._vault_observer:
+                SemanticMemory._ACTIVE_VAULT_OBSERVER = None
+            self._vault_observer = None
+
+        if hasattr(self, "_shared_conn") and self._shared_conn:
+            try:
+                self._shared_conn.close()
+            except Exception:
+                pass
+            self._shared_conn = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def start_vault_watchdog(self):
 
         """Starts real-time watchdog file watcher on assets/vault/."""
@@ -2508,17 +2554,20 @@ class SemanticMemory:
                     parent._handle_vault_file_delete(int(m.group(1)))
 
         try:
+            if getattr(SemanticMemory, "_ACTIVE_VAULT_OBSERVER", None) is not None:
+                try:
+                    SemanticMemory._ACTIVE_VAULT_OBSERVER.stop()
+                    SemanticMemory._ACTIVE_VAULT_OBSERVER.join(timeout=1.0)
+                except Exception:
+                    pass
+                SemanticMemory._ACTIVE_VAULT_OBSERVER = None
 
             self._vault_observer = Observer()
-
+            SemanticMemory._ACTIVE_VAULT_OBSERVER = self._vault_observer
             self._vault_observer.schedule(VaultEventHandler(), self.vault_dir, recursive=False)
-
             self._vault_observer.daemon = True
-
             self._vault_observer.start()
-
             print(f"[Memory Vault] Obsidian sync watcher online on: {self.vault_dir}")
-
         except Exception as e:
 
             print(f"[Memory Vault Watchdog Error]: {e}")

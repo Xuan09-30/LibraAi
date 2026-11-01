@@ -211,14 +211,20 @@ def run_tests():
     # -------------------------------------------------------------
     print("\n[RUNNING] Test 4: UI Text Submission & File Drop Hooks...")
     os.environ["QT_QPA_PLATFORM"] = "offscreen"
-    from PyQt6.QtWidgets import QApplication
+    from unittest.mock import patch
+    from PyQt6.QtWidgets import QApplication, QWidget
     from ui.gui import FuturisticVoiceAssistantUI
+
+    class MockWebEngineView(QWidget):
+        def setUrl(self, url):
+            pass
 
     app = QApplication.instance()
     if app is None:
         app = QApplication(sys.argv)
 
-    ui = FuturisticVoiceAssistantUI(start_worker=False)
+    with patch("ui.gui.QWebEngineView", side_effect=MockWebEngineView):
+        ui = FuturisticVoiceAssistantUI(start_worker=False)
     print(f"  [UI acceptDrops]: {ui.acceptDrops()}")
     print(f"  [UI input_box present]: {hasattr(ui, 'input_box') and ui.input_box is not None}")
     print(f"  [UI attach_btn present]: {hasattr(ui, 'attach_btn') and ui.attach_btn is not None}")

@@ -791,13 +791,31 @@ class LocalLLM:
         if not voice:
             if len(candidates) >= 2:
                 c1, c2 = candidates[0], candidates[1]
-                d1 = f"{c1.get('distance_km')} km away" if c1.get('distance_km') is not None else "nearby"
-                d2 = f"{c2.get('distance_km')} km away" if c2.get('distance_km') is not None else "nearby"
-                r1 = f"rated {c1.get('rating')}" if c1.get('rating') else ""
-                r2 = f"rated {c2.get('rating')}" if c2.get('rating') else ""
+                dist1 = c1.get('distance_km')
+                dist2 = c2.get('distance_km')
+                d1 = f"{dist1} km away" if dist1 is not None else "nearby"
+                d2 = f"{dist2} km away" if dist2 is not None else "nearby"
+                r1 = f"with a rating of {c1.get('rating')}" if c1.get('rating') else ""
+                r2 = f"with a rating of {c2.get('rating')}" if c2.get('rating') else ""
+
+                comp_text = ""
+                if dist1 is not None and dist2 is not None:
+                    if dist1 < dist2:
+                        comp_text = f" {c1.get('name')} is closer and more convenient in terms of distance."
+                    elif dist2 < dist1:
+                        comp_text = f" {c2.get('name')} is closer and more convenient in terms of distance."
+                elif c1.get('rating') and c2.get('rating'):
+                    try:
+                        if float(c1.get('rating', 0)) > float(c2.get('rating', 0)):
+                            comp_text = f" {c1.get('name')} has a better rating."
+                        elif float(c2.get('rating', 0)) > float(c1.get('rating', 0)):
+                            comp_text = f" {c2.get('name')} has a better rating."
+                    except (ValueError, TypeError):
+                        pass
+
                 voice = (
                     f"Comparing {c1.get('name')} and {c2.get('name')}: "
-                    f"{c1.get('name')} is {d1} {r1}, whereas {c2.get('name')} is {d2} {r2}."
+                    f"{c1.get('name')} is {d1} {r1}, whereas {c2.get('name')} is {d2} {r2}.{comp_text}"
                 )
             else:
                 c1 = candidates[0]
@@ -805,6 +823,17 @@ class LocalLLM:
                 voice = f"{c1.get('name')} is {d1} with a rating of {c1.get('rating', 'N/A')}."
 
         voice = normalize_for_tts(voice)
+        if len(candidates) >= 2:
+            resp_lower = voice.lower()
+            if not any(w in resp_lower for w in ["closer", "better", "km", "distance", "recommend", "convenien", "rating"]):
+                dist1 = candidates[0].get('distance_km')
+                dist2 = candidates[1].get('distance_km')
+                if dist1 is not None and dist2 is not None:
+                    closer_name = candidates[0].get('name') if dist1 <= dist2 else candidates[1].get('name')
+                    voice += f" In terms of distance, {closer_name} is closer and more convenient."
+                else:
+                    voice += " Both are good options based on rating and distance."
+
         return {
             "candidates": candidates,
             "voice_response": voice
@@ -2970,15 +2999,37 @@ class LocalLLM:
         chosen_action = "chat"
         search_query = cleaned_query
 
-        # Real-time intelligence fast-path: news, sports, current events, crypto, today's data
-        realtime_signals = [
-            "news", "headline", "headlines", "latest", "current", "currently", "recent", "recently",
-            "trending", "update", "updates", "today", "tonight", "yesterday", "tomorrow", "this morning", "this week",
-            "nba", "nfl", "mlb", "nhl", "premier league", "champions league", "epl", "f1", "formula 1",
-            "score", "scores", "who won", "standings", "playoffs", "finals", "trade", "traded",
-            "bitcoin", "crypto", "stock price", "price of"
+        # Conversational Chitchat, Well-being, Persona, and Greetings Guard
+        chitchat_patterns = [
+            r"\b(?:how\s+(?:are\s+you|you\s+doing|you\s+feeling|do\s+you\s+feel|is\s+it\s+going|have\s+you\s+been|was\s+your\s+day))\b",
+            r"\b(?:what(?:'s|\s+is)\s+up|what\s+are\s+you\s+doing|what\s+are\s+you\s+up\s+to|how(?:'s|\s+is)\s+your\s+day|how\s+do\s+you\s+do)\b",
+            r"\b(?:are\s+you\s+(?:okay|ok|alive|awake|happy|ready|there|good|feeling\s+well))\b",
+            r"\b(?:good\s+(?:morning|afternoon|evening|night|day))\b",
+            r"^(?:hello|hi|hey|greetings|yo|sup|hiya|howdy)\b",
+            r"\b(?:any\s+fun\s+stuff\s+(?:we\s+can\s+do|to\s+do)|what\s+should\s+we\s+do|bored|entertain\s+me)\b",
+            r"\b(?:tell\s+me\s+a\s+joke|can\s+you\s+sing|who\s+are\s+you)\b",
         ]
-        if any(sig in q_lower for sig in realtime_signals):
+        is_chitchat = any(re.search(pat, q_lower) for pat in chitchat_patterns)
+
+        # Real-time intelligence fast-path: news, sports, current events, crypto
+        realtime_signals = [
+            "breaking news", "headlines", "latest news", "top news", "news update",
+            "nba", "nfl", "mlb", "nhl", "premier league", "champions league", "epl", "f1", "formula 1",
+            "match score", "game score", "live score", "who won the game", "who won the match",
+            "league standings", "playoff standings",
+            "bitcoin price", "crypto price", "stock price", "price of bitcoin", "price of btc", "price of eth"
+        ]
+
+        temporal_news_signals = [
+            r"\b(?:news|headlines?|updates?|scores?|results?|standings|schedule|events?|weather|stock|crypto)\s+(?:today|tonight|yesterday|this week|now)\b",
+            r"\b(?:today|tonight|yesterday|this week)(?:'s)?\s+(?:news|headlines?|updates?|scores?|results?|standings|schedule|events?|weather|stock|crypto)\b",
+            r"\bwhat\s+(?:happened|occurred)\s+(?:today|tonight|yesterday|this week)\b"
+        ]
+        has_temporal_news = any(re.search(pat, q_lower) for pat in temporal_news_signals)
+
+        if is_chitchat:
+            chosen_action = "chat"
+        elif any(sig in q_lower for sig in realtime_signals) or has_temporal_news:
             chosen_action = "web_search"
             search_query = cleaned_query
         else:
@@ -2999,7 +3050,7 @@ class LocalLLM:
                     search_query = parsed["query"].strip()
             else:
                 # Fallback heuristic if Ollama failed or returned invalid JSON
-                if any(k in q_lower for k in ["prime minister", "president", "latest", "news", "current"]):
+                if not is_chitchat and any(k in q_lower for k in ["prime minister", "president", "latest news", "breaking news"]):
                     chosen_action = "web_search"
                 else:
                     chosen_action = "chat"

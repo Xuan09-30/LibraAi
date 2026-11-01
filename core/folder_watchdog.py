@@ -208,6 +208,8 @@ class AutomatedFolderWatchdog:
             except Exception:
                 pass
 
+    _ACTIVE_OBSERVER = None
+
     def start(self):
         """Starts monitoring in non-blocking background threads."""
         if self._running:
@@ -218,7 +220,16 @@ class AutomatedFolderWatchdog:
 
         if WATCHDOG_AVAILABLE:
             try:
+                if AutomatedFolderWatchdog._ACTIVE_OBSERVER is not None:
+                    try:
+                        AutomatedFolderWatchdog._ACTIVE_OBSERVER.stop()
+                        AutomatedFolderWatchdog._ACTIVE_OBSERVER.join(timeout=1.0)
+                    except Exception:
+                        pass
+                    AutomatedFolderWatchdog._ACTIVE_OBSERVER = None
+
                 self._observer = Observer()
+                AutomatedFolderWatchdog._ACTIVE_OBSERVER = self._observer
                 prog_handler = DebouncedEventHandler(self._handle_program_event, delay=1.2)
                 for p_dir in self.program_dirs:
                     if os.path.isdir(p_dir):
@@ -275,10 +286,18 @@ class AutomatedFolderWatchdog:
         if self._observer:
             try:
                 self._observer.stop()
-                self._observer.join(timeout=2.0)
+                self._observer.join(timeout=1.0)
             except Exception:
                 pass
+            if AutomatedFolderWatchdog._ACTIVE_OBSERVER == self._observer:
+                AutomatedFolderWatchdog._ACTIVE_OBSERVER = None
             self._observer = None
+
+    def __del__(self):
+        try:
+            self.stop()
+        except Exception:
+            pass
 
     def get_status(self) -> Dict[str, Any]:
         """Returns the current runtime telemetry of the folder watchdog."""

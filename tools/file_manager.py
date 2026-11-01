@@ -318,6 +318,7 @@ class FileManager:
             "last folder", "the created folder", "that created folder", "the new folder"
         }
         clean_norm = query.lower().strip().rstrip(".?!")
+        clean_norm = re.sub(r"^(?:okay\s+now\s+|yeah,?\s*|yes,?\s*|sure,?\s*|alright,?\s*)", "", clean_norm).strip()
         clean_norm = re.sub(r"^(?:please\s+)?(?:open|reveal|show)\s+", "", clean_norm).strip()
         clean_norm = re.sub(r"\s+for\s+me$", "", clean_norm).strip()
 
@@ -325,6 +326,16 @@ class FileManager:
         if clean_norm in PRONOUN_REFERENCES or query.lower().strip() in PRONOUN_REFERENCES:
             if self.last_folder_path and (dry_run or os.path.exists(self.last_folder_path)):
                 resolved_path = self.last_folder_path
+
+        # Match against last_folder_name or last_folder_path directly
+        if not resolved_path and self.last_folder_path:
+            last_name = (self.last_folder_name or os.path.basename(self.last_folder_path)).lower()
+            if clean_norm == last_name or clean_norm == self.last_folder_path.lower():
+                resolved_path = self.last_folder_path
+
+        # Direct absolute path resolution
+        if not resolved_path and os.path.isabs(query) and (dry_run or os.path.exists(query)):
+            resolved_path = os.path.abspath(query)
 
         if not resolved_path:
             resolved_path = self.search_path(query, folders_only=True)

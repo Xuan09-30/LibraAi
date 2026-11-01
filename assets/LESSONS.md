@@ -57,3 +57,5 @@ Whenever a similar ambiguous query or command arises, Libra consults these lesso
 - **Trigger**: `open my project folder` | **Avoid**: `OldDrafts` | **Corrected Action**: `LibraAi` (2026-10-26 01:01)
 - **Trigger**: `navigate cinejoy.pk` | **Avoid**: `Foreign ad overlays and DOM layout delays on cinejoy.pk` | **Corrected Action**: `Executed loop recovery: dismissed ad pop-ups with Ctrl+W, grounded DOM elements via CDP/OCR, and verified resume state.` (2026-10-31 12:26)
 - **Trigger**: `navigate cinejoy.pk` | **Avoid**: `Foreign ad overlays and DOM layout delays on cinejoy.pk` | **Corrected Action**: `Executed loop recovery: dismissed ad pop-ups with Ctrl+W, grounded DOM elements via CDP/OCR, and verified hannibal on my pc state.` (2026-10-31 13:58)
+- **Trigger**: `open my project folder` | **Avoid**: `OldDrafts` | **Corrected Action**: `LibraAi` (2026-11-01 00:47)
+- **Trigger**: `open my project folder` | **Avoid**: `OldDrafts` | **Corrected Action**: `LibraAi` (2026-11-01 01:31)

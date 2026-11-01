@@ -89,20 +89,26 @@ class TestCyberneticChime:
     def test_ui_gui_chime_loading(self):
         """Verifies that FuturisticVoiceAssistantUI loads chime_pcm into memory at startup."""
         os.environ["QT_QPA_PLATFORM"] = "offscreen"
-        from PyQt6.QtWidgets import QApplication
+        from unittest.mock import patch
+        from PyQt6.QtWidgets import QApplication, QWidget
         from ui.gui import FuturisticVoiceAssistantUI, VoiceAssistantWorker
 
+        class MockWebEngineView(QWidget):
+            def setUrl(self, url):
+                pass
+
         app = QApplication.instance() or QApplication(sys.argv)
-        ui = FuturisticVoiceAssistantUI(start_worker=False)
+        with patch("ui.gui.QWebEngineView", side_effect=MockWebEngineView):
+            ui = FuturisticVoiceAssistantUI(start_worker=False)
 
-        assert hasattr(ui, "raw_chime_pcm")
-        assert hasattr(ui, "chime_pcm")
-        assert len(ui.raw_chime_pcm) > 0, "Chime PCM was not loaded into UI memory"
-        assert len(ui.chime_pcm) == len(ui.raw_chime_pcm)
+            assert hasattr(ui, "raw_chime_pcm")
+            assert hasattr(ui, "chime_pcm")
+            assert len(ui.raw_chime_pcm) > 0, "Chime PCM was not loaded into UI memory"
+            assert len(ui.chime_pcm) == len(ui.raw_chime_pcm)
 
-        # Verify worker accepts raw_chime_pcm
-        worker = VoiceAssistantWorker(raw_chime_pcm=ui.raw_chime_pcm)
-        assert worker.raw_chime_pcm == ui.raw_chime_pcm
-        assert worker.chime_pcm == ui.chime_pcm
+            # Verify worker accepts raw_chime_pcm
+            worker = VoiceAssistantWorker(raw_chime_pcm=ui.raw_chime_pcm)
+            assert worker.raw_chime_pcm == ui.raw_chime_pcm
+            assert worker.chime_pcm == ui.chime_pcm
 
-        ui._quit_application()
+            ui._quit_application()
