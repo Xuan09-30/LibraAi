@@ -14,7 +14,7 @@ Project Libra is a local-first multimodal AI assistant and desktop automation ag
 | :--- | :--- | :--- |
 | **Primary Resident VRAM (`qwen3:8b` Q4\_K\_M + `nomic-embed-text` F16)** | **5,472 MB** (`qwen3:8b`) + **320 MB** (`nomic-embed-text`) = **5.79 GB** (leaves ~10.2 GB free VRAM on 16GB RTX 5060 Ti) | Live `/api/ps` & `SystemMonitor` telemetry |
 | **On-Demand Vision Cold-Load Latency (`qwen2.5vl:7b`, `keep_alive=0`)** | **Median = `2,783.16 ms`** wall-clock (`2,593.39 ms` Ollama `load_duration`, 5 runs: `[5069.24, 2781.04, 2787.51, 2783.16, 2769.26] ms`) | 5-run cold-load benchmark (`keep_alive=0`) |
-| **Generation Throughput (`qwen3:8b` on RTX 5060 Ti)** | **Median = `72.07 tok/s`** raw `eval_count / eval_duration` (`68.63 tok/s` end-to-end wall-clock over 10 runs; `58.6 – 62.3 tok/s` when streamed over SSE with sentence-level token flushing) | `tests/test_web_sessions_and_tokens.py` & 10-run benchmark |
+| **Generation Throughput (`qwen3:8b` on RTX 5060 Ti)** | **Median = `72.07 tok/s`** raw `eval_count / eval_duration` (`68.63 tok/s` end-to-end wall-clock over 10 runs; `58.6 – 62.3 tok/s` when streamed over SSE with UX pacing (sentence-level token flushing)) | `tests/test_web_sessions_and_tokens.py` & 10-run benchmark |
 | **Promoted PreAct Macro Cache Hit Latency** | **`p50 = 3.32 ms`, `p95 = 3.98 ms`** SQLite lookup (`p50 = 3.53 ms`, `p95 = 4.27 ms` full `SupervisorHub.plan_or_execute` dispatch over `N = 100` runs) | `tests/test_phases_1_2_3.py` & 100-run benchmark |
 | **Cognitive Router Accuracy (Labeled & Held-Out Benchmarks)** | **30 / 30 (100.0%)** on primary table (`tests/test_system_and_orchestrator.py`); **38 / 40 (95.0%)** raw untuned accuracy on 40-query casual/typo holdout set (`tests/router_holdout.py`) | `tests/test_system_and_orchestrator.py`, `tests/router_holdout.py` |
 | **Remote Sandbox & Scope Enforcement** | **100% pass rate** across server-side scope spoofing (`HTTP 403`), `remote_host` & `remote_web` OS tool removal, per-user memory/upload isolation, and trusted-proxy rate limiting | `tests/test_email_auth_and_isolation.py` |
@@ -25,11 +25,11 @@ Project Libra is a local-first multimodal AI assistant and desktop automation ag
 
 Project Libra uses a dual-interface architecture backed by a single local execution hub:
 1. **Interactive Desktop GUI (`local_desktop` scope)**: A floating PyQt6 interface with wake-word activation (`Faster-Whisper`), screen OCR/vision, and OS automation running directly on Windows 11 for the workstation owner (`59` registered tools).
-2. **Remote Web & Mobile PWA (`remote_host` / `remote_web` scopes)**: A FastAPI web portal featuring Server-Sent Events (SSE) token streaming, collapsible step-by-step thinking traces, and strict role-based tool sandboxing (`29` registered tools for `remote_host`, `22` registered tools for `remote_web`; neither remote scope registers any OS-control or terminal tools).
+2. **Remote Web & Mobile PWA (`remote_host` / `remote_web` scopes)**: A FastAPI web portal featuring Server-Sent Events (SSE) token streaming, collapsible step-by-step thinking traces, and strict role-based tool sandboxing (`28` registered tools for `remote_host`, `21` registered tools for `remote_web`; neither remote scope registers any OS-control or terminal tools).
 3. **Tunnel Provisioning Hierarchy (`web/server.py`)**: Based on `start_web_server_thread` in `web/server.py` (lines `5227–5238`) and `config.json` / `config.local.json`, the server provisions its public tunnel in the following order:
-   - **Primary Tunnel (`ngrok`)**: Calls `ensure_ngrok_tunnel(server_port)` (`web/server.py:5015–5108`), which reads `ngrok.enabled`, `ngrok.authtoken`, and `ngrok.domain` from untracked `config.local.json` (falling back to `config.json`, where `ngrok.enabled` defaults to `false`). When enabled in `config.local.json`, it spawns `ngrok http --domain=<domain> <port>`.
-   - **Automatic Fallback Tunnel (`Cloudflare Quick Tunnel`)**: If `ngrok` is disabled or fails to bind, `start_web_server_thread` calls `ensure_cloudflare_tunnel(server_port)` (`web/server.py:5110–5195`), which spawns `cloudflared.exe tunnel --url http://127.0.0.1:<port>` (`*.trycloudflare.com`).
-   - **Header Identity Support**: `authenticate_request` (`web/server.py:519–525`) also accepts `Cf-Access-Authenticated-User-Email` (Cloudflare Access) and `Tailscale-User-Login` (Tailscale) identity headers if deployed behind either zero-trust proxy (TODO: confirm whether Cloudflare Access or Tailscale will replace `ngrok` in production).
+   - **Primary Tunnel (`ngrok`)**: Calls `ensure_ngrok_tunnel(server_port)` (`web/server.py`), which reads `ngrok.enabled`, `ngrok.authtoken`, and `ngrok.domain` from untracked `config.local.json` (falling back to `config.json`, where `ngrok.enabled` defaults to `false`). When enabled in `config.local.json`, it spawns `ngrok http --domain=<domain> <port>`.
+   - **Automatic Fallback Tunnel (`Cloudflare Quick Tunnel`)**: If `ngrok` is disabled or fails to bind, `start_web_server_thread` calls `ensure_cloudflare_tunnel(server_port)` (`web/server.py`), which spawns `cloudflared.exe tunnel --url http://127.0.0.1:<port>` (`*.trycloudflare.com`).
+   - **Header Identity Support**: `authenticate_request` (`web/server.py`) also accepts `Cf-Access-Authenticated-User-Email` (Cloudflare Access) and `Tailscale-User-Login` (Tailscale) identity headers if deployed behind either zero-trust proxy (TODO: confirm whether Cloudflare Access or Tailscale will replace `ngrok` in production).
 
 ```mermaid
 flowchart TD
@@ -162,19 +162,19 @@ LIBRA/
 ### Pillar 1: SupervisorHub, Tool-Layer Sandbox & Scoped Macro Cache
 **File:** `core/orchestrator.py`
 
-The `SupervisorHub` (`core/orchestrator.py:255–760`) coordinates all requests from the desktop GUI, voice pipeline, and remote web server.
+The `SupervisorHub` (`core/orchestrator.py`) coordinates all requests from the desktop GUI, voice pipeline, and remote web server.
 
 - **Tool-Layer Sandbox (`get_registered_tools`)**:
   - `local_desktop` (`59` tools): Full workstation toolset including OS-control, GUI automation, and Skill Forge.
-  - `remote_host` (`29` tools): Host connected remotely over the web tunnel. All OS-control, file-mutation, GUI-automation, and skill-creation tools (`open_app`, `close_app`, `create_file`, `create_folder`, `gui_action`, `computer_use_agent`, `shutdown`, `create_skill`, `run_learned_skill`, `virus_scan`, `workspace_macro`, `spotify_action`, `media_action`, `clipboard_copilot`) are strictly `local_desktop`-only and are never registered for `remote_host`.
-  - `remote_web` (`22` tools): Tester/Guest sessions (`chat`, `clarify`, `compare_candidates`, `currency_convert`, `deep_research`, `document_rag`, `forget_memory`, `list_skills`, `lookup_entity`, `math_eval`, `ping_check`, `place_detail`, `places_search`, `profile_recall`, `recall_memory`, `remember_fact`, `time`, `unit_convert`, `vision_qa`, `weather`, `web_search`, `world_time`). Host-specific `daily_briefing` and hardware vitals (`system_status` and `/api/vitals`) are excluded from `remote_web`.
-- **Scoped PreAct Macro Cache (`p50 = 3.53 ms`, `p95 = 4.27 ms`)**: Macro cache keys include `client_scope` (`macro:{client_scope}:{norm_trigger}`). In addition, `_execute_macro_chain` (`core/orchestrator.py:372–464`) refuses OS tools whenever `client_scope != "local_desktop"`.
+  - `remote_host` (`28` tools): Host connected remotely over the web tunnel. All OS-control, file-mutation, GUI-automation, and skill-creation tools (`open_app`, `close_app`, `create_file`, `create_folder`, `gui_action`, `computer_use_agent`, `shutdown`, `create_skill`, `run_learned_skill`, `virus_scan`, `workspace_macro`, `spotify_action`, `media_action`, `clipboard_copilot`) are strictly `local_desktop`-only and are never registered for `remote_host`.
+  - `remote_web` (`21` tools): Tester/Guest sessions (`chat`, `clarify`, `compare_candidates`, `currency_convert`, `deep_research`, `document_rag`, `forget_memory`, `list_skills`, `lookup_entity`, `math_eval`, `ping_check`, `place_detail`, `places_search`, `profile_recall`, `recall_memory`, `remember_fact`, `time`, `unit_convert`, `weather`, `web_search`, `world_time`). Host-specific `daily_briefing` and hardware vitals (`system_status` and `/api/vitals`) are excluded from `remote_web`.
+- **Scoped PreAct Macro Cache (`p50 = 3.53 ms`, `p95 = 4.27 ms`)**: Macro cache keys include `client_scope` (`macro:{client_scope}:{norm_trigger}`). In addition, `_execute_macro_chain` (`core/orchestrator.py`) refuses OS tools whenever `client_scope != "local_desktop"`.
 - **Mandatory Destructive Action Confirmation**: Even when a macro is cached, any chain containing destructive actions (`delete`, `remove`, `send`, `install`, `uninstall`, `shutdown`, `format`, `kill`) returns `status="confirmation_required"` and requires explicit user confirmation before execution.
 
 ---
 
 ### Pillar 2: Real-Time-First Cognitive Router & Held-Out Benchmark
-**Files:** `core/llm.py`, `tests/ test_system_and_orchestrator.py`, `tests/router_holdout.py`
+**Files:** `core/llm.py`, `tests/test_system_and_orchestrator.py`, `tests/router_holdout.py`
 
 The `LocalLLM` (`core/llm.py`) router evaluates queries in strict priority order so mixed prompts (e.g. *"hey how are you, what's the bitcoin price right now"*) never get swallowed by greeting patterns:
 1. **Real-Time Signals Checked First**: Checks `realtime_signals` (breaking news, sports leagues, live scores, crypto/stock prices) and `temporal_news_signals` (`news today`, `what happened today`) before chitchat.
