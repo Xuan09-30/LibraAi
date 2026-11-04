@@ -75,7 +75,6 @@ REMOTE_WEB_ALLOWED_TOOLS = {
     "clarify",
     "list_skills",
     "document_rag",
-    "vision_qa",
     "lookup_entity",
 }
 

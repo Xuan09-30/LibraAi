@@ -360,7 +360,7 @@ class FreeUtilityBelt:
         elif isinstance(node, ast.BinOp) and type(node.op) in cls.SAFE_AST_OPS:
             left = cls._eval_ast_node(node.left)
             right = cls._eval_ast_node(node.right)
-            if isinstance(node.op, ast.Pow) and abs(right) > 1000:
+            if isinstance(node.op, ast.Pow) and abs(right) > 100:
                 raise ValueError("Exponent too large")
             return float(cls.SAFE_AST_OPS[type(node.op)](left, right))
         elif isinstance(node, ast.UnaryOp) and type(node.op) in cls.SAFE_AST_OPS:
@@ -563,11 +563,48 @@ class FreeUtilityBelt:
             "voice_response": spoken,
         }
 
-    def check_network_ping(self, dry_run: bool = False) -> Dict[str, Any]:
+    def check_network_ping(self, target_host: Optional[str] = None, dry_run: bool = False) -> Dict[str, Any]:
         """
         Checks local IP address and measures internet connectivity & ping latency
         to 1.1.1.1 / 8.8.8.8.
+        Includes SSRF protection when target_host is provided.
         """
+        if target_host:
+            clean_host = str(target_host).strip().lower()
+            if clean_host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or clean_host.startswith("127."):
+                return {
+                    "status": "blocked",
+                    "sub_action": "network_ping",
+                    "online": False,
+                    "voice_response": "Private or local network targets are blocked."
+                }
+            try:
+                import ipaddress
+                addr_info = socket.getaddrinfo(clean_host, None)
+                for _, _, _, _, sockaddr in addr_info:
+                    ip_str = sockaddr[0]
+                    ip_obj = ipaddress.ip_address(ip_str)
+                    if (
+                        ip_obj.is_private
+                        or ip_obj.is_loopback
+                        or ip_obj.is_link_local
+                        or ip_obj.is_reserved
+                        or str(ip_obj).startswith("169.254.")
+                    ):
+                        return {
+                            "status": "blocked",
+                            "sub_action": "network_ping",
+                            "online": False,
+                            "voice_response": "Private or local network targets are blocked."
+                        }
+            except Exception:
+                return {
+                    "status": "error",
+                    "sub_action": "network_ping",
+                    "online": False,
+                    "voice_response": f"Could not resolve host '{target_host}'."
+                }
+
         local_ip = "127.0.0.1"
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:

@@ -6,6 +6,40 @@ import warnings
 import asyncio
 import httpx
 import urllib.parse
+import ipaddress
+import socket
+
+def is_safe_public_url(url: str) -> bool:
+    """SSRF protection: ensures URL scheme is http/https and destination IP is not private/loopback/metadata."""
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        h_low = hostname.lower().strip()
+        if h_low in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "local"):
+            return False
+        addr_info = socket.getaddrinfo(h_low, None)
+        for _, _, _, _, sockaddr in addr_info:
+            ip_str = sockaddr[0]
+            ip_obj = ipaddress.ip_address(ip_str)
+            if (
+                ip_obj.is_private
+                or ip_obj.is_loopback
+                or ip_obj.is_link_local
+                or ip_obj.is_reserved
+                or ip_obj.is_multicast
+                or str(ip_obj).startswith("169.254.")
+                or str(ip_obj) in ("0.0.0.0", "::")
+            ):
+                return False
+        return True
+    except Exception:
+        return False
 import xml.etree.ElementTree as ET
 import concurrent.futures
 from datetime import datetime
@@ -128,7 +162,7 @@ class HardenedResearchEngine:
         Checks SQLite web_cache first, then extracts clean article text using Trafilatura
         stripping boilerplates/scripts, converting to clean markdown, and caching the result.
         """
-        if not url:
+        if not url or not is_safe_public_url(url):
             return None
 
         # Check cache
@@ -186,7 +220,7 @@ class HardenedResearchEngine:
 
     async def async_clean_markdown_extract(self, url: str) -> Optional[Dict[str, str]]:
         """Fast non-blocking async article extraction."""
-        if not url:
+        if not url or not is_safe_public_url(url):
             return None
 
         # Check cache
