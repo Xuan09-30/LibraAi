@@ -88,7 +88,7 @@ logger = logging.getLogger("libra.web")
 
 DEFAULT_CONFIG = {
 
-    "host": "0.0.0.0",
+    "host": "127.0.0.1",
 
     "port": 8765,
 
@@ -5354,7 +5354,7 @@ def start_web_server_thread(
 
     cfg = load_web_config(config_path)
 
-    server_host = host or cfg.get("host", "0.0.0.0")
+    server_host = host or cfg.get("host", "127.0.0.1")
 
     server_port = port or cfg.get("port", 8765)
 

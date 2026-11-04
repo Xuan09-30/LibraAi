@@ -902,12 +902,12 @@ class AutonomousComputerUseAgent:
         # ------------------------------------------------------------------
         # FINAL STEP: Verify End State Before Caching Workflow
         # ------------------------------------------------------------------
-        # Round 3 Item 6: Enforce workflow template or user config provenance for post-conditions
+        # Round 3 Item 6 & Round 4 Item 8: Enforce workflow template or user config provenance for post-conditions
         effective_post_condition = None
         config_post_conditions = self.get_workflow_post_conditions()
         if post_condition:
             prov = post_condition.get("provenance")
-            if prov == "untrusted_llm":
+            if prov in ("untrusted_llm", "model", "untrusted"):
                 if domain and domain in config_post_conditions:
                     effective_post_condition = dict(config_post_conditions[domain])
                 else:
@@ -917,7 +917,8 @@ class AutonomousComputerUseAgent:
         elif domain and domain in config_post_conditions:
             effective_post_condition = dict(config_post_conditions[domain])
         else:
-            effective_post_condition = parsed.get("post_condition")
+            # Model plan (from parsed) cannot forge template provenance; untrusted LLM plan post-conditions are rejected
+            effective_post_condition = None
         end_state_verified = self._verify_end_state(
             domain=domain,
             search_query=search_q,
