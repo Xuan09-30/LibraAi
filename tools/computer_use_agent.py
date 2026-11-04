@@ -35,6 +35,12 @@ class AutonomousComputerUseAgent:
     4. Hardware-Safe Anti-Cheat Guard: Pauses synthetic inputs when games are running.
     """
 
+    MAX_STEPS = 15
+    MAX_CONSECUTIVE_FAILURES = 3
+    ALLOWED_AGENT_ACTIONS = frozenset({
+        "click", "press", "type", "retry", "done", "aborted_for_anticheat", "needs_help"
+    })
+
     def __init__(self, gui_control: Any, spatial: Any, model_mgr: Any = None, chrome_mgr: Any = None, memory: Any = None):
         self.gui = gui_control
         self.spatial = spatial
@@ -43,6 +49,38 @@ class AutonomousComputerUseAgent:
         self.memory = memory
         self._playwright = None
         self._cdp_browser = None
+
+    @classmethod
+    def validate_agent_action(cls, action: str) -> bool:
+        """Bounded action allowlist check preventing arbitrary or unapproved action types."""
+        return bool((action or "").strip().lower() in cls.ALLOWED_AGENT_ACTIONS)
+
+    @staticmethod
+    def sanitize_untrusted_screen_text(raw_text: str) -> str:
+        """
+        Prompt-injection defense for untrusted on-screen OCR / DOM / UIAutomation text.
+        Strips instruction-override patterns, shell commands, and role tags, and bounds length.
+        """
+        if not raw_text:
+            return ""
+        cleaned = str(raw_text)
+        injection_patterns = [
+            r"ignore\s+(?:all\s+)?(?:prior\s+|previous\s+)?instructions.*",
+            r"disregard\s+(?:all\s+)?(?:prior\s+|previous\s+)?instructions.*",
+            r"\bpowershell(?:\.exe)?\b.*",
+            r"\bremove-item\b.*",
+            r"\bcmd(?:\.exe)?\s+/[ck]\b.*",
+            r"\brm\s+-rf\b.*",
+            r"\bdel\s+/[fqs]\b.*",
+            r"\bformat\s+[a-z]:.*",
+            r"<\|im_start\|>.*",
+            r"<\|im_end\|>.*",
+            r"\b(?:system|assistant|developer)\s*:\s*.*",
+        ]
+        for pat in injection_patterns:
+            cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"[\r\n\t]+", " ", cleaned).strip(" —-;:,.|")
+        return cleaned[:120]
 
     def _get_cdp_session(self, port: int = 9222):
         """Attempts to connect to an active Chrome instance over CDP on port 9222."""
@@ -249,17 +287,17 @@ class AutonomousComputerUseAgent:
 
         t_low = (target_text or "").lower().strip()
         try:
-            # 2. RapidOCR text boxes on live screen
+            # 2. RapidOCR text boxes on live screen (treated as untrusted data)
             ocr_boxes = self.spatial.extract_screen_text_ocr()
             for item in ocr_boxes:
-                txt = (item.get("text") or "").lower().strip()
-                if t_low and (t_low in txt or txt in t_low):
+                txt = self.sanitize_untrusted_screen_text(item.get("text") or "").lower().strip()
+                if t_low and txt and (t_low in txt or txt in t_low):
                     return int(item["center_x"]), int(item["center_y"])
 
-            # 3. UIAutomation / Set-of-Mark elements
+            # 3. UIAutomation / Set-of-Mark elements (treated as untrusted data)
             elements = self.spatial.detect_ui_elements(active_window_only=True)
             for el in elements:
-                name = (el.get("name") or "").lower().strip()
+                name = self.sanitize_untrusted_screen_text(el.get("name") or "").lower().strip()
                 if t_low and name and (t_low in name or name in t_low):
                     return int(el["center_x"]), int(el["center_y"])
         except Exception:
@@ -369,9 +407,12 @@ class AutonomousComputerUseAgent:
         agent_trace: List[Dict[str, Any]] = []
         thought_steps: List[Dict[str, str]] = []
         step_num = 1
+        consecutive_failures = 0
 
         def _record_step(thought: str, action: str, status: str = "completed", pace: Optional[float] = None, **kwargs):
             nonlocal step_num
+            if not self.validate_agent_action(action):
+                raise ValueError(f"Disallowed computer-use action '{action}' blocked by allowlist.")
             # Natural agent execution cadence so steps execute and stream one by one
             if step_callback:
                 pause = pace if pace is not None else (0.45 if not dry_run else 0.35)
@@ -436,6 +477,30 @@ class AutonomousComputerUseAgent:
                 except Exception:
                     pass
 
+        def _track_action_outcome(res_obj: Optional[Dict[str, Any]]) -> bool:
+            nonlocal consecutive_failures
+            if isinstance(res_obj, dict) and res_obj.get("status") in ("error", "paused_for_anticheat"):
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
+            return consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES
+
+        def _needs_help_exit(reason: str = "") -> Dict[str, Any]:
+            msg = reason or f"Encountered {consecutive_failures} consecutive action failures; pausing autonomous loop and requesting user assistance."
+            _record_step(msg, "needs_help", status="needs_help")
+            return {
+                "action": "computer_use_agent",
+                "status": "needs_help",
+                "domain": domain,
+                "search_query": search_q,
+                "click_target": click_target,
+                "consecutive_failures": consecutive_failures,
+                "agent_trace": agent_trace,
+                "thought_steps": thought_steps,
+                "voice_response": msg,
+                "learned_workflow_saved": False,
+            }
+
         # ------------------------------------------------------------------
         # STEP 1: Open / Focus Google Chrome
         # ------------------------------------------------------------------
@@ -448,9 +513,13 @@ class AutonomousComputerUseAgent:
         )
         if not dry_run:
             focused = self.gui.focus_window_by_title("Google Chrome") if self.gui else False
-            if not focused and self.chrome_mgr:
-                self.chrome_mgr.launch_chrome(dry_run=False)
-                time.sleep(0.8)
+            if not focused:
+                if self.chrome_mgr:
+                    self.chrome_mgr.launch_chrome(dry_run=False)
+                    time.sleep(0.8)
+                elif self.gui:
+                    if _track_action_outcome(self.gui.click(x=chrome_x, y=chrome_y, dry_run=False)):
+                        return _needs_help_exit()
 
         # ------------------------------------------------------------------
         # STEP 2: Open a New Tab (Ctrl+T)
@@ -461,7 +530,8 @@ class AutonomousComputerUseAgent:
             key="ctrl+t"
         )
         if not dry_run and self.gui:
-            self.gui.hotkey("ctrl", "t", dry_run=False)
+            if _track_action_outcome(self.gui.hotkey("ctrl", "t", dry_run=False)):
+                return _needs_help_exit()
             time.sleep(0.25)
 
         # ------------------------------------------------------------------
@@ -473,7 +543,8 @@ class AutonomousComputerUseAgent:
             key="ctrl+l"
         )
         if not dry_run and self.gui:
-            self.gui.hotkey("ctrl", "l", dry_run=False)
+            if _track_action_outcome(self.gui.hotkey("ctrl", "l", dry_run=False)):
+                return _needs_help_exit()
             time.sleep(0.15)
 
         # ------------------------------------------------------------------
@@ -497,7 +568,8 @@ class AutonomousComputerUseAgent:
             text=domain
         )
         if not dry_run and self.gui:
-            self.gui.type_text(domain, interval=0.01, dry_run=False)
+            if _track_action_outcome(self.gui.type_text(domain, interval=0.01, dry_run=False)):
+                return _needs_help_exit()
             time.sleep(0.1)
 
         _record_step(
@@ -506,7 +578,8 @@ class AutonomousComputerUseAgent:
             key="enter"
         )
         if not dry_run and self.gui:
-            self.gui.press_key("enter", dry_run=False)
+            if _track_action_outcome(self.gui.press_key("enter", dry_run=False)):
+                return _needs_help_exit()
             time.sleep(1.5)
 
         # Check for immediate initial pop-up on page load
@@ -532,7 +605,8 @@ class AutonomousComputerUseAgent:
                 y=s_icon_y
             )
             if not dry_run and self.gui:
-                self.gui.click(x=s_icon_x, y=s_icon_y, dry_run=False)
+                if _track_action_outcome(self.gui.click(x=s_icon_x, y=s_icon_y, dry_run=False)):
+                    return _needs_help_exit()
                 time.sleep(0.4)
 
             # Pop-Up Tab Guard: Streaming sites often pop an ad on first click
@@ -554,7 +628,8 @@ class AutonomousComputerUseAgent:
                 y=s_box_y
             )
             if not dry_run and self.gui:
-                self.gui.click(x=s_box_x, y=s_box_y, dry_run=False)
+                if _track_action_outcome(self.gui.click(x=s_box_x, y=s_box_y, dry_run=False)):
+                    return _needs_help_exit()
                 time.sleep(0.25)
 
             # 8. Type search query & press Enter
@@ -564,8 +639,10 @@ class AutonomousComputerUseAgent:
                 text=search_q
             )
             if not dry_run and self.gui:
-                self.gui.type_text(search_q, interval=0.01, dry_run=False)
-                self.gui.press_key("enter", dry_run=False)
+                if _track_action_outcome(self.gui.type_text(search_q, interval=0.01, dry_run=False)):
+                    return _needs_help_exit()
+                if _track_action_outcome(self.gui.press_key("enter", dry_run=False)):
+                    return _needs_help_exit()
                 time.sleep(1.2)
 
             # 9. Click on matching result card (DOM / OCR Grounded)
@@ -577,7 +654,8 @@ class AutonomousComputerUseAgent:
                 y=res_y
             )
             if not dry_run and self.gui:
-                self.gui.click(x=res_x, y=res_y, dry_run=False)
+                if _track_action_outcome(self.gui.click(x=res_x, y=res_y, dry_run=False)):
+                    return _needs_help_exit()
                 time.sleep(1.0)
 
             # Pop-Up Tab Guard: Opening movie/series result often spawns an ad tab
@@ -593,6 +671,7 @@ class AutonomousComputerUseAgent:
         # ------------------------------------------------------------------
         # STEP 10–11: Click Target Button (e.g. 'Resume' / 'Play') with Self-Verification
         # ------------------------------------------------------------------
+        verified_click = True
         if click_target:
             btn_x, btn_y = self._find_text_on_screen(click_target, dry_run=dry_run, default_xy=(157, 620), role_hint="button")
             _record_step(
@@ -601,10 +680,11 @@ class AutonomousComputerUseAgent:
                 x=btn_x,
                 y=btn_y
             )
-            verified_click = True
             if not dry_run and self.gui:
                 c_res = self.gui.click(x=btn_x, y=btn_y, dry_run=False)
-                verified_click = bool(c_res.get("verified_change", True))
+                if _track_action_outcome(c_res):
+                    return _needs_help_exit()
+                verified_click = bool(c_res.get("verified_change", True)) and c_res.get("status") != "error"
                 time.sleep(0.6)
 
             # Check if clicking resume triggered a pop-up tab
@@ -627,12 +707,24 @@ class AutonomousComputerUseAgent:
                 y=modal_y
             )
             if not dry_run and self.gui:
-                self.gui.click(x=modal_x, y=modal_y, dry_run=False)
+                c_res_modal = self.gui.click(x=modal_x, y=modal_y, dry_run=False)
+                if _track_action_outcome(c_res_modal):
+                    return _needs_help_exit()
+                verified_click = bool(c_res_modal.get("verified_change", verified_click)) and c_res_modal.get("status") != "error"
                 time.sleep(0.3)
 
         # ------------------------------------------------------------------
-        # FINAL STEP: Done
+        # FINAL STEP: Verify End State Before Caching Workflow
         # ------------------------------------------------------------------
+        end_state_verified = self._verify_end_state(
+            domain=domain,
+            search_query=search_q,
+            click_target=click_target,
+            verified_click=verified_click,
+            consecutive_failures=consecutive_failures,
+            dry_run=dry_run,
+        )
+
         summary_target = (search_q or domain).title()
         domain_name = domain.split('.')[0].title() if '.' in domain else domain.title()
         _record_step(
@@ -640,8 +732,11 @@ class AutonomousComputerUseAgent:
             "done"
         )
 
-        # Autonomous Memory Learning & Reflexion Persistence ("remember how she did it")
-        self._save_learned_workflow(prompt, domain, search_q, click_target, agent_trace)
+        # Autonomous Memory Learning & Reflexion Persistence: ONLY save when end state is verified!
+        learned_saved = False
+        if end_state_verified:
+            self._save_learned_workflow(prompt, domain, search_q, click_target, agent_trace)
+            learned_saved = True
 
         voice_msg = f"Completed all {len(agent_trace)} steps: opened Chrome, navigated to {domain}"
         if search_q:
@@ -653,15 +748,34 @@ class AutonomousComputerUseAgent:
 
         return {
             "action": "computer_use_agent",
-            "status": "success",
+            "status": "success" if end_state_verified else "unverified_end_state",
             "domain": domain,
             "search_query": search_q,
             "click_target": click_target,
             "agent_trace": agent_trace,
             "thought_steps": thought_steps,
             "voice_response": voice_msg,
-            "learned_workflow_saved": True
+            "learned_workflow_saved": learned_saved
         }
+
+    def _verify_end_state(
+        self,
+        domain: str,
+        search_query: Optional[str],
+        click_target: Optional[str],
+        verified_click: bool = True,
+        consecutive_failures: int = 0,
+        dry_run: bool = False,
+    ) -> bool:
+        """
+        Verifies the terminal state of the computer-use loop before persisting
+        any learned workflow to the Obsidian Vault or PreAct macro cache.
+        """
+        if consecutive_failures > 0:
+            return False
+        if click_target and not verified_click:
+            return False
+        return True
 
     def _save_learned_workflow(
         self,
@@ -736,3 +850,5 @@ class AutonomousComputerUseAgent:
                 f.write(content)
         except Exception as vault_err:
             print(f"[VAULT SAVE ERROR] {vault_err}")
+
+    _save_learned_workflow_to_vault = _save_learned_workflow

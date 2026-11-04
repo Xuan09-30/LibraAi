@@ -44,6 +44,15 @@ class GUIControlAgent:
         _attach_thread_desktop()
 
     @staticmethod
+    def _is_anticheat_active() -> bool:
+        try:
+            from core.vram_governor import get_vram_governor
+            gov = get_vram_governor()
+            return bool(gov and gov.is_gaming_lite_mode())
+        except Exception:
+            return False
+
+    @staticmethod
     def is_available() -> bool:
         return PYAUTOGUI_AVAILABLE
 
@@ -102,6 +111,8 @@ class GUIControlAgent:
         """Performs single or multiple mouse clicks at (x, y) or current position."""
         if dry_run:
             return {"status": "success", "action": "click", "x": x, "y": y, "button": button, "dry_run": True, "verified_change": True, "voice_response": f"Prepared {button} click at {x or 'current'}, {y or 'current'}."}
+        if self._is_anticheat_active():
+            return {"status": "paused_for_anticheat", "action": "click", "x": x, "y": y, "verified_change": False, "voice_response": "Anti-Cheat Safe Mode active: PyAutoGUI synthetic input is disabled while a protected game is running."}
 
         if not PYAUTOGUI_AVAILABLE:
             return {"status": "error", "message": "pyautogui not installed", "voice_response": "Desktop automation module is unavailable."}
@@ -153,6 +164,8 @@ class GUIControlAgent:
         clean_key = (key_name or "").lower().strip()
         if dry_run:
             return {"status": "success", "action": "press_key", "key": clean_key, "dry_run": True, "voice_response": f"Prepared key press: {clean_key}."}
+        if self._is_anticheat_active():
+            return {"status": "paused_for_anticheat", "action": "press_key", "key": clean_key, "verified_change": False, "voice_response": "Anti-Cheat Safe Mode active: PyAutoGUI synthetic input is disabled while a protected game is running."}
 
         if not PYAUTOGUI_AVAILABLE:
             return {"status": "error", "message": "pyautogui not installed", "voice_response": "Desktop automation module is unavailable."}
@@ -169,6 +182,8 @@ class GUIControlAgent:
         clean_keys = [str(k).lower().strip() for k in keys if k]
         if dry_run:
             return {"status": "success", "action": "hotkey", "keys": clean_keys, "dry_run": True, "voice_response": f"Prepared hotkey: {'+'.join(clean_keys)}."}
+        if self._is_anticheat_active():
+            return {"status": "paused_for_anticheat", "action": "hotkey", "keys": clean_keys, "verified_change": False, "voice_response": "Anti-Cheat Safe Mode active: PyAutoGUI synthetic input is disabled while a protected game is running."}
 
         if not PYAUTOGUI_AVAILABLE:
             return {"status": "error", "message": "pyautogui not installed", "voice_response": "Desktop automation module is unavailable."}
@@ -184,6 +199,8 @@ class GUIControlAgent:
         """Types arbitrary text string into the currently focused window."""
         if dry_run:
             return {"status": "success", "action": "type_text", "text": text, "dry_run": True, "voice_response": f"Prepared to type: {text[:20]}."}
+        if self._is_anticheat_active():
+            return {"status": "paused_for_anticheat", "action": "type_text", "verified_change": False, "voice_response": "Anti-Cheat Safe Mode active: PyAutoGUI synthetic input is disabled while a protected game is running."}
 
         if not PYAUTOGUI_AVAILABLE:
             return {"status": "error", "message": "pyautogui not installed", "voice_response": "Desktop automation module is unavailable."}
