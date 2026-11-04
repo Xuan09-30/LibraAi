@@ -446,6 +446,93 @@ def send_local_ipc_command(cmd: str):
         pass
 
 # ---------------------------------------------------------------------------
+# CLOUDFLARE ACCESS JWT VERIFICATION (RS256 & JWKS ONLY)
+# ---------------------------------------------------------------------------
+def verify_cloudflare_access_jwt(
+    jwt_assertion: str,
+    team_domain: str = "",
+    audience: str = "",
+    certs_url: str = "",
+    jwks_client: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Round 4 Item 3:
+    Verifies Cloudflare Access assertion tokens.
+    Strictly accepts ONLY RS256 algorithm. Rejects HS256, alg=none, and all symmetric algorithms.
+    Fetches signing keys dynamically from the team JWKS endpoint.
+    Validates aud, iss, and exp claims.
+    """
+    if not jwt_assertion or not isinstance(jwt_assertion, str):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Missing or invalid Cf-Access-Jwt-Assertion header for Cloudflare Access."
+        )
+
+    import jwt
+    from jwt import PyJWKClient
+
+    # Inspect unverified header to reject invalid algorithms before key lookup
+    try:
+        unverified_headers = jwt.get_unverified_header(jwt_assertion)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Unauthorized: Malformed JWT header ({e}).")
+
+    alg = (unverified_headers.get("alg") or "").upper()
+    if alg != "RS256":
+        raise HTTPException(
+            status_code=401,
+            detail=f"Unauthorized: Insecure or unsupported algorithm '{alg}'. Cloudflare Access tokens must use RS256 only."
+        )
+
+    # Resolve JWKS endpoint
+    clean_team = (team_domain or "").strip()
+    if not certs_url and clean_team:
+        certs_url = f"https://{clean_team}.cloudflareaccess.com/cdn-cgi/access/certs"
+    if not certs_url and jwks_client is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Cloudflare Access team_domain or certs_url not configured."
+        )
+
+    expected_iss = f"https://{clean_team}.cloudflareaccess.com" if clean_team else None
+
+    if jwks_client is None:
+        try:
+            jwks_client = PyJWKClient(certs_url)
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"Unauthorized: Failed to initialize JWKS client ({e}).")
+
+    try:
+        signing_key = jwks_client.get_signing_key_from_jwt(jwt_assertion)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Unauthorized: Cloudflare Access signing key not found in JWKS ({e}).")
+
+    decode_opts = {
+        "verify_signature": True,
+        "require": ["exp"] + (["aud"] if audience else []) + (["iss"] if expected_iss else []),
+    }
+    if not audience:
+        decode_opts["verify_aud"] = False
+
+    try:
+        payload = jwt.decode(
+            jwt_assertion,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=audience if audience else None,
+            issuer=expected_iss if expected_iss else None,
+            options=decode_opts
+        )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Unauthorized: Cloudflare Access JWT has expired.")
+    except jwt.InvalidAlgorithmError as e:
+        raise HTTPException(status_code=401, detail=f"Unauthorized: Invalid algorithm ({e}).")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Unauthorized: Cloudflare Access JWT verification failed ({e}).")
+
+    return payload
+
+# ---------------------------------------------------------------------------
 # FASTAPI APPLICATION FACTORY
 # ---------------------------------------------------------------------------
 def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.json") -> FastAPI:
@@ -496,7 +583,6 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     app.state.cloudflare_access_audience = str(cf_cfg.get("audience", "")).strip()
     app.state.cloudflare_access_team_domain = str(cf_cfg.get("team_domain", "")).strip()
     app.state.cloudflare_access_certs_url = str(cf_cfg.get("certs_url", "")).strip()
-    app.state.cloudflare_access_secret = str(cf_cfg.get("secret", "")).strip()
     app.state.tailscale_enabled = bool(ts_cfg.get("enabled", False))
     app.state.allow_custom_user_email_header = bool(cfg.get("allow_custom_user_email_header", False))
 
@@ -592,66 +678,30 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         if cf_access_enabled and raw_cf_email:
             jwt_assertion = (request.headers.get("cf-access-jwt-assertion") or "").strip()
-            if not jwt_assertion:
-                raise HTTPException(
-                    status_code=401,
-                    detail="Unauthorized: Missing Cf-Access-Jwt-Assertion header for Cloudflare Access."
-                )
-            try:
-                import jwt
-                secret = getattr(app.state, "cloudflare_access_secret", "")
-                aud = getattr(app.state, "cloudflare_access_audience", "")
-                certs_url = getattr(app.state, "cloudflare_access_certs_url", "")
+            team_domain = getattr(app.state, "cloudflare_access_team_domain", "")
+            aud = getattr(app.state, "cloudflare_access_audience", "")
+            certs_url = getattr(app.state, "cloudflare_access_certs_url", "")
+            jwks_client = getattr(app.state, "cloudflare_access_jwks_client", None)
 
-                if secret:
-                    decode_opts = {}
-                    if not aud:
-                        decode_opts["verify_aud"] = False
-                    payload = jwt.decode(
-                        jwt_assertion,
-                        secret,
-                        algorithms=["HS256", "RS256"],
-                        audience=aud if aud else None,
-                        options=decode_opts
-                    )
-                elif certs_url:
-                    from jwt import PyJWKClient
-                    jwks_client = PyJWKClient(certs_url)
-                    signing_key = jwks_client.get_signing_key_from_jwt(jwt_assertion)
-                    decode_opts = {}
-                    if not aud:
-                        decode_opts["verify_aud"] = False
-                    payload = jwt.decode(
-                        jwt_assertion,
-                        signing_key.key,
-                        algorithms=["RS256"],
-                        audience=aud if aud else None,
-                        options=decode_opts
-                    )
-                else:
-                    raise HTTPException(
-                        status_code=401,
-                        detail="Unauthorized: Cloudflare Access verification key or certs_url not configured."
-                    )
-                jwt_email = (payload.get("email") or payload.get("sub") or "").lower().strip()
-                if not jwt_email:
-                    raise HTTPException(
-                        status_code=401,
-                        detail="Unauthorized: Cloudflare Access JWT assertion missing email claim."
-                    )
-                if jwt_email != raw_cf_email.lower().strip():
-                    raise HTTPException(
-                        status_code=401,
-                        detail="Unauthorized: Cf-Access-Authenticated-User-Email does not match JWT assertion."
-                    )
-                email = jwt_email
-            except HTTPException:
-                raise
-            except Exception as e:
+            payload = verify_cloudflare_access_jwt(
+                jwt_assertion=jwt_assertion,
+                team_domain=team_domain,
+                audience=aud,
+                certs_url=certs_url,
+                jwks_client=jwks_client
+            )
+            jwt_email = (payload.get("email") or payload.get("sub") or "").lower().strip()
+            if not jwt_email:
                 raise HTTPException(
                     status_code=401,
-                    detail=f"Unauthorized: Invalid Cloudflare Access JWT assertion: {e}"
+                    detail="Unauthorized: Cloudflare Access JWT assertion missing email claim."
                 )
+            if jwt_email != raw_cf_email.lower().strip():
+                raise HTTPException(
+                    status_code=401,
+                    detail="Unauthorized: Cf-Access-Authenticated-User-Email does not match JWT assertion."
+                )
+            email = jwt_email
         elif ts_enabled and raw_ts_email:
             email = raw_ts_email
         elif allow_custom_email and raw_custom_email:

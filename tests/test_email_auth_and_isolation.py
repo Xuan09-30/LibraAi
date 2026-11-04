@@ -18,6 +18,7 @@ import os
 import sys
 import unittest
 import json
+import time
 from fastapi.testclient import TestClient
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -814,13 +815,64 @@ class TestEmailAuthAndIsolation(unittest.TestCase):
         )
         self.assertEqual(res_invalid_jwt.status_code, 401, "Invalid Cf-Access-Jwt-Assertion must return 401!")
 
-        # 2c: Enabled with valid signed JWT assertion matching email and audience -> 200
+        # 2c: Round 4 Item 3 - HS256 and alg=none tokens must be rejected with 401
+        hs_jwt = jwt.encode(
+            {"email": self.admin_email, "aud": "test-cf-aud", "exp": time.time() + 300},
+            "some-symmetric-secret",
+            algorithm="HS256"
+        )
+        res_hs = cf_client.get(
+            "/api/vitals",
+            headers={
+                "Cf-Access-Authenticated-User-Email": self.admin_email,
+                "Cf-Access-Jwt-Assertion": hs_jwt
+            }
+        )
+        self.assertEqual(res_hs.status_code, 401, "HS256 token must be strictly rejected with 401!")
+
+        none_jwt = jwt.encode(
+            {"email": self.admin_email, "aud": "test-cf-aud", "exp": time.time() + 300},
+            key="",
+            algorithm="none"
+        )
+        res_none = cf_client.get(
+            "/api/vitals",
+            headers={
+                "Cf-Access-Authenticated-User-Email": self.admin_email,
+                "Cf-Access-Jwt-Assertion": none_jwt
+            }
+        )
+        self.assertEqual(res_none.status_code, 401, "alg=none token must be strictly rejected with 401!")
+
+        # 2d: Valid RS256 token signed by RSA private key verified via JWKS -> 200
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+        priv_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        priv_pem = priv_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        pub_pem = priv_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+
+        class MockJWKS:
+            def get_signing_key_from_jwt(self, token):
+                class Key:
+                    def __init__(self, k): self.key = k
+                return Key(pub_pem)
+
+        cf_app.state.cloudflare_access_jwks_client = MockJWKS()
+        cf_app.state.cloudflare_access_team_domain = "test"
         valid_payload = {
             "email": self.admin_email,
             "aud": "test-cf-aud",
-            "iss": "https://test.cloudflareaccess.com"
+            "iss": "https://test.cloudflareaccess.com",
+            "exp": time.time() + 300
         }
-        valid_jwt = jwt.encode(valid_payload, cf_secret, algorithm="HS256")
+        valid_jwt = jwt.encode(valid_payload, priv_pem, algorithm="RS256")
         res_valid_jwt = cf_client.get(
             "/api/vitals",
             headers={
@@ -828,7 +880,7 @@ class TestEmailAuthAndIsolation(unittest.TestCase):
                 "Cf-Access-Jwt-Assertion": valid_jwt
             }
         )
-        self.assertEqual(res_valid_jwt.status_code, 200, "Valid signed Cf-Access-Jwt-Assertion must authenticate successfully!")
+        self.assertEqual(res_valid_jwt.status_code, 200, "Valid signed RS256 Cf-Access-Jwt-Assertion must authenticate successfully!")
 
 
     def test_18_round3_item_2_tunnel_specific_client_ip(self):

@@ -40,11 +40,50 @@ class TestWebSessionsAndTokens(unittest.TestCase):
     # 1. CLOUDFLARE IDENTITY & TOKEN AUTHENTICATION TESTS
     # -----------------------------------------------------------------------
     def test_01_cloudflare_identity_headers(self):
-        """Test Cloudflare Cf-Access-Authenticated-User-Email (with valid JWT) and Bearer token."""
+        """Test Cloudflare Cf-Access-Authenticated-User-Email (RS256 only) and Bearer token."""
         import jwt
+        import time
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+
         self.app.state.cloudflare_access_enabled = True
-        self.app.state.cloudflare_access_secret = "test-secret"
-        cf_jwt = jwt.encode({"email": self.admin_email}, "test-secret", algorithm="HS256")
+        priv_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        priv_pem = priv_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        pub_pem = priv_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+
+        class MockJWKS:
+            def get_signing_key_from_jwt(self, token):
+                class Key:
+                    def __init__(self, k): self.key = k
+                return Key(pub_pem)
+
+        self.app.state.cloudflare_access_jwks_client = MockJWKS()
+        self.app.state.cloudflare_access_team_domain = "test"
+
+        # 1. HS256 must be rejected with 401
+        hs_jwt = jwt.encode({"email": self.admin_email, "exp": time.time() + 300}, "secret", algorithm="HS256")
+        res_hs = self.client.get(
+            "/api/vitals",
+            headers={
+                "cf-access-authenticated-user-email": self.admin_email,
+                "cf-access-jwt-assertion": hs_jwt
+            }
+        )
+        self.assertEqual(res_hs.status_code, 401)
+
+        # 2. RS256 must be accepted with 200
+        cf_jwt = jwt.encode(
+            {"email": self.admin_email, "iss": "https://test.cloudflareaccess.com", "exp": time.time() + 300},
+            priv_pem,
+            algorithm="RS256"
+        )
         cf_headers = {
             "cf-access-authenticated-user-email": self.admin_email,
             "cf-access-jwt-assertion": cf_jwt
