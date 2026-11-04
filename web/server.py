@@ -6,6 +6,7 @@ import io
 
 import sys
 
+import hmac
 import json
 
 import time
@@ -483,6 +484,30 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     app.state.rate_limit_max_requests = int(cfg.get("rate_limit_per_minute", 60))
     app.state.rate_limit_window_sec = 60.0
     app.state.rate_limit_buckets = {}
+    app.state.trusted_proxy_ips = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+    def _resolve_client_ip(request: Optional[Request]) -> str:
+        """
+        Round 2 Item E.2:
+        Behind the ngrok/Cloudflare tunnel, rate limiting uses the real client IP
+        (from Cf-Connecting-IP / X-Forwarded-For), but ONLY trusts that header when
+        the TCP connection comes from the local tunnel/proxy (app.state.trusted_proxy_ips),
+        so direct remote clients cannot spoof proxy headers to bypass rate limits.
+        """
+        if request is None:
+            return "unknown"
+        peer_ip = (request.client.host if getattr(request, "client", None) else "") or "unknown"
+        trusted_proxies = getattr(app.state, "trusted_proxy_ips", {"127.0.0.1", "::1", "localhost", "testclient"})
+        if peer_ip in trusted_proxies:
+            cf_ip = (request.headers.get("cf-connecting-ip") or "").strip()
+            if cf_ip:
+                return cf_ip
+            xff = (request.headers.get("x-forwarded-for") or "").strip()
+            if xff:
+                return xff.split(",")[0].strip()
+        return peer_ip
+
+    app.state.resolve_client_ip = _resolve_client_ip
 
     def _enforce_rate_limit(bucket_key: str):
         now_ts = time.time()
@@ -551,8 +576,8 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         elif "libra_auth" in request.cookies:
             token = request.cookies.get("libra_auth", "").strip()
 
-        # Host Master Token
-        if token and token == access_token:
+        # Host Master Token (constant-time comparison via hmac.compare_digest)
+        if token and access_token and hmac.compare_digest(token.encode("utf-8"), str(access_token).encode("utf-8")):
             return {"authenticated": True, "role": "host", "method": "master_token", "token": token, "email": admin_email, "label": "Host Admin"}
 
         # Per-User Unique Token (Multi-User Registered Users or Guest Tokens)
@@ -1086,11 +1111,13 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
     @app.post("/api/auth/send-code")
 
-    async def post_send_verification_code(req: SendCodeRequest):
+    async def post_send_verification_code(req: SendCodeRequest, request: Request):
 
         """Dispatches a strictly unique 6-digit OTP code to the requested email."""
 
         clean_email = req.email.strip().lower()
+        client_ip = _resolve_client_ip(request)
+        _enforce_rate_limit(f"otp_ip:{client_ip}")
         _enforce_rate_limit(f"otp:{clean_email}")
 
         if not clean_email or "@" not in clean_email or "." not in clean_email:
@@ -2330,6 +2357,8 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         req: ChatRequest,
 
+        request: Request,
+
         stream: Optional[bool] = Query(None),
 
         auth: Dict[str, Any] = Depends(authenticate_request)
@@ -2359,8 +2388,10 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                 detail="Forbidden: 'local_desktop' scope cannot be set from a remote request body."
             )
 
-        # Enforce per-user / per-token sliding-window rate limit
-        rate_key = f"chat:{auth.get('email') or auth.get('token') or role}"
+        # Enforce real client IP (from trusted tunnel proxy only) + per-user sliding-window rate limit
+        client_ip = _resolve_client_ip(request)
+        _enforce_rate_limit(f"chat_ip:{client_ip}")
+        rate_key = f"chat:{auth.get('email') or auth.get('token') or role}:{client_ip}"
         _enforce_rate_limit(rate_key)
 
         # Derive client_scope strictly server-side from auth role

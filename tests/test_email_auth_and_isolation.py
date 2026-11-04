@@ -691,6 +691,74 @@ class TestEmailAuthAndIsolation(unittest.TestCase):
             f"Expected network error, got: {res_net}"
         )
 
+
+    def test_16_round2_item_e_hmac_and_trusted_proxy_rate_limit(self):
+        """
+        Round 2 Item E: Auth and rate limiting:
+        1. Compare tokens with hmac.compare_digest.
+        2. Behind the ngrok/Cloudflare tunnel, rate limiting must use the real client IP
+           (from the proxy header) but ONLY trust that header when the request comes from
+           the tunnel/proxy, so clients can't spoof it.
+        """
+        import inspect
+        import web.server as srv_mod
+        import core.memory as mem_mod
+
+        # 1. Verify hmac.compare_digest is used in web/server.py and core/memory.py for token comparisons
+        srv_src = inspect.getsource(srv_mod.create_app)
+        self.assertIn("hmac.compare_digest", srv_src, "web/server.py must use hmac.compare_digest for token comparison!")
+        mem_src = inspect.getsource(mem_mod.MemoryCore.validate_user_token) + inspect.getsource(mem_mod.MemoryCore.validate_guest_token)
+        self.assertIn("hmac.compare_digest", mem_src, "core/memory.py must use hmac.compare_digest for token comparison!")
+
+        # 2. Verify trusted-proxy rate limiting:
+        # (a) When request arrives from trusted local tunnel/proxy (testclient / 127.0.0.1),
+        #     X-Forwarded-For / Cf-Connecting-IP is trusted: two different tunnel client IPs
+        #     get independent rate-limit buckets.
+        resolve_ip = getattr(self.app.state, "resolve_client_ip", None)
+        self.assertTrue(callable(resolve_ip), "app.state.resolve_client_ip helper must be exposed for proxy IP resolution!")
+
+        class DummyClient:
+            def __init__(self, host):
+                self.host = host
+        class DummyReq:
+            def __init__(self, socket_host, headers):
+                self.client = DummyClient(socket_host)
+                self.headers = headers
+
+        # Trusted proxy socket (127.0.0.1) -> uses X-Forwarded-For real client IP
+        req_tunnel_a = DummyReq("127.0.0.1", {"x-forwarded-for": "198.51.100.10, 127.0.0.1"})
+        req_tunnel_b = DummyReq("127.0.0.1", {"cf-connecting-ip": "198.51.100.20"})
+        self.assertEqual(resolve_ip(req_tunnel_a), "198.51.100.10")
+        self.assertEqual(resolve_ip(req_tunnel_b), "198.51.100.20")
+
+        # Untrusted direct remote socket (e.g. 203.0.113.99) spoofing X-Forwarded-For / Cf-Connecting-IP
+        # -> MUST ignore spoofed proxy header and return the real socket IP 203.0.113.99!
+        req_spoof_1 = DummyReq("203.0.113.99", {"x-forwarded-for": "10.0.0.1"})
+        req_spoof_2 = DummyReq("203.0.113.99", {"cf-connecting-ip": "10.0.0.2"})
+        self.assertEqual(resolve_ip(req_spoof_1), "203.0.113.99")
+        self.assertEqual(resolve_ip(req_spoof_2), "203.0.113.99")
+
+        # End-to-end rate limit check with spoofed X-Forwarded-For from an untrusted peer IP:
+        # Rotating X-Forwarded-For on every request must NOT bypass the rate limit when peer is untrusted.
+        self.app.state.rate_limit_max_requests = 3
+        self.app.state.rate_limit_buckets.clear()
+        self.app.state.trusted_proxy_ips = {"127.0.0.1", "::1"}  # exclude 'testclient' to simulate direct untrusted peer
+        try:
+            tester = self.memory.get_or_create_registered_user("spoof_test@example.com")
+            statuses = []
+            for i in range(5):
+                headers = {
+                    "Authorization": f"Bearer {tester['unique_token']}",
+                    "X-Forwarded-For": f"192.0.2.{i + 1}",
+                }
+                r = self.client.post("/api/chat", json={"prompt": "what time is it"}, headers=headers)
+                statuses.append(r.status_code)
+            self.assertIn(429, statuses, f"Spoofed X-Forwarded-For from untrusted peer bypassed rate limit! Got {statuses}")
+        finally:
+            self.app.state.rate_limit_max_requests = 60
+            self.app.state.trusted_proxy_ips = {"127.0.0.1", "::1", "localhost", "testclient"}
+
 if __name__ == "__main__":
     unittest.main()
+
 

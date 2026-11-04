@@ -2,6 +2,7 @@ import os
 
 import re
 
+import hmac
 import json
 
 import sqlite3
@@ -4617,6 +4618,8 @@ class SemanticMemory:
                 return None
 
             tok, label, expires_at, revoked = row
+            if not (hmac.compare_digest(str(tok), str(hashed)) or hmac.compare_digest(str(tok), str(clean))):
+                return None
 
             if expires_at:
 
@@ -4966,7 +4969,7 @@ class SemanticMemory:
 
                     pass
 
-                if clean_code != expected_code:
+                if not hmac.compare_digest(str(clean_code), str(expected_code)):
 
                     cursor.execute("UPDATE email_verifications SET attempts = attempts + 1 WHERE id = ?", (v_id,))
 
@@ -5196,7 +5199,7 @@ class SemanticMemory:
 
             row = cursor.fetchone()
 
-            if row:
+            if row and hmac.compare_digest(str(row[3]), str(token.strip())):
 
                 return {
 
