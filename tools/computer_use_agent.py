@@ -80,6 +80,19 @@ class AutonomousComputerUseAgent:
         return list(cls.DEFAULT_ALLOWED_DOMAINS)
 
     @classmethod
+    def get_workflow_post_conditions(cls) -> Dict[str, Any]:
+        """Loads verified workflow post-conditions from config.json."""
+        try:
+            cfg_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+            if os.path.exists(cfg_file):
+                with open(cfg_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return (data.get("computer_use") or {}).get("workflow_post_conditions") or {}
+        except Exception:
+            pass
+        return {}
+
+    @classmethod
     def is_domain_allowed(cls, domain_or_url: str, allowed_domains: Optional[List[str]] = None) -> bool:
         """Checks whether a target domain or URL hostname is on the configured allowlist."""
         raw = (domain_or_url or "").strip().lower()
@@ -888,7 +901,22 @@ class AutonomousComputerUseAgent:
         # ------------------------------------------------------------------
         # FINAL STEP: Verify End State Before Caching Workflow
         # ------------------------------------------------------------------
-        effective_post_condition = post_condition if post_condition is not None else parsed.get("post_condition")
+        # Round 3 Item 6: Enforce workflow template or user config provenance for post-conditions
+        effective_post_condition = None
+        config_post_conditions = self.get_workflow_post_conditions()
+        if post_condition:
+            prov = post_condition.get("provenance")
+            if prov == "untrusted_llm":
+                if domain and domain in config_post_conditions:
+                    effective_post_condition = dict(config_post_conditions[domain])
+                else:
+                    effective_post_condition = None
+            else:
+                effective_post_condition = dict(post_condition)
+        elif domain and domain in config_post_conditions:
+            effective_post_condition = dict(config_post_conditions[domain])
+        else:
+            effective_post_condition = parsed.get("post_condition")
         end_state_verified = self._verify_end_state(
             domain=domain,
             search_query=search_q,

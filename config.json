@@ -38,6 +38,12 @@
             "example.com",
             "wikipedia.org",
             "github.com"
-        ]
+        ],
+        "workflow_post_conditions": {
+            "cinejoy.pk": {
+                "expected_title": "cinejoy",
+                "expected_url": "cinejoy.pk"
+            }
+        }
     }
 }

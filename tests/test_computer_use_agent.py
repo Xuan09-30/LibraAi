@@ -479,3 +479,70 @@ def test_round2_item_c_concrete_post_condition_verification(tmp_path, monkeypatc
         os.remove(vault_example)
     except PermissionError:
         pass
+
+
+def test_round3_item_6_post_condition_provenance(monkeypatch):
+    """
+    Round 3 Item 6:
+    Post-conditions: If the LLM generates it from the same plan (untrusted),
+    require the post_condition to come from the workflow template or user config.
+    """
+    class AllActionsSucceedGUI:
+        def focus_window_by_title(self, title): return True
+        def hotkey(self, *keys, dry_run=False): return {"status": "success", "verified_change": True}
+        def press_key(self, key, dry_run=False): return {"status": "success", "verified_change": True}
+        def type_text(self, text, interval=0.01, dry_run=False): return {"status": "success", "verified_change": True}
+        def click(self, x=None, y=None, button="left", clicks=1, dry_run=False): return {"status": "success", "verified_change": True}
+
+    class MockSpatialMatchingEndState:
+        def extract_screen_text_ocr(self):
+            return [{"text": "Hannibal Season 1 - Now Playing Resume", "center_x": 500, "center_y": 500}]
+        def detect_ui_elements(self, active_window_only=True):
+            return [{"name": "Hannibal - Cinejoy - Google Chrome", "center_x": 500, "center_y": 50}]
+
+    class DummyMem:
+        def __init__(self):
+            self.saved = 0
+        def record_correction(self, *a, **kw): self.saved += 1
+        def record_action_macro(self, *a, **kw): self.saved += 1
+
+    gov = get_vram_governor()
+    monkeypatch.setattr(gov, "is_gaming_lite_mode", lambda: False)
+
+    agent = AutonomousComputerUseAgent(
+        gui_control=AllActionsSucceedGUI(),
+        spatial=MockSpatialMatchingEndState(),
+        memory=DummyMem()
+    )
+
+    vault_example = os.path.join(PROJECT_ROOT, "assets", "vault", "learned_workflow_example_com.md")
+    if os.path.exists(vault_example):
+        try: os.remove(vault_example)
+        except Exception: pass
+
+    # 1. Untrusted LLM-generated post-condition from the same plan turn must be rejected
+    res_untrusted = agent.execute_task(
+        "Open my chrome and then example.com, find and search hannibal and click resume",
+        dry_run=False,
+        post_condition={
+            "expected_screen_text": "Now Playing",
+            "provenance": "untrusted_llm"
+        }
+    )
+    assert res_untrusted["status"] == "unverified"
+    assert res_untrusted["learned_workflow_saved"] is False
+
+    # 2. Verified post-condition from user config or workflow template must be accepted
+    res_trusted = agent.execute_task(
+        "Open my chrome and then example.com, find and search hannibal and click resume",
+        dry_run=False,
+        post_condition={
+            "expected_screen_text": "Now Playing",
+            "provenance": "template"
+        }
+    )
+    assert res_trusted["status"] == "success"
+    assert res_trusted["learned_workflow_saved"] is True
+    if os.path.exists(vault_example):
+        try: os.remove(vault_example)
+        except Exception: pass
