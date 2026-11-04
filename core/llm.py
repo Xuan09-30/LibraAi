@@ -890,6 +890,23 @@ class LocalLLM:
             "client_scope": client_scope,
         }
 
+    @classmethod
+    def has_realtime_signal(cls, q_lower: str) -> bool:
+        realtime_signals = [
+            "breaking news", "headlines", "latest news", "top news", "news update",
+            "nba", "nfl", "mlb", "nhl", "premier league", "champions league", "epl", "f1", "formula 1",
+            "match score", "game score", "live score", "who won the game", "who won the match",
+            "league standings", "playoff standings",
+            "bitcoin price", "crypto price", "stock price", "price of bitcoin", "price of btc", "price of eth"
+        ]
+        temporal_news_signals = [
+            r"\b(?:news|headlines?|updates?|scores?|results?|standings|schedule|events?|weather|stock|crypto)\s+(?:today|tonight|yesterday|this week|now)\b",
+            r"\b(?:today|tonight|yesterday|this week)(?:'s)?\s+(?:news|headlines?|updates?|scores?|results?|standings|schedule|events?|weather|stock|crypto)\b",
+            r"\bwhat\s+(?:happened|occurred)\s+(?:today|tonight|yesterday|this week)\b",
+            r"\b(?:score|winner|standings)\s+(?:of|in|for)\b"
+        ]
+        return any(sig in q_lower for sig in realtime_signals) or any(re.search(pat, q_lower) for pat in temporal_news_signals)
+
     def plan(self, prompt: str, dry_run: bool = True, client_scope: str = "local_desktop") -> dict:
         """
         Plans the action for a given user prompt.
@@ -1053,9 +1070,12 @@ class LocalLLM:
         # 1.8 CANDIDATE COMPARISON ("compare the first and fourth", "which is better between number 2 and the last one")
         # -------------------------------------------------------------
         is_compare = (
-            re.search(r"\b(?:compare|comparison|versus|vs\.?)\b", q_lower)
-            or re.search(r"\bwhich\s+(?:\w+\s+)?(?:is|one\s+is|would\s+be)\s+(?:better|closer|best|recommended)\b", q_lower)
-            or re.search(r"\bwhich\s+(?:is|one\s+is)\s+(?:better|closer|best|recommended)\b", q_lower)
+            not self.has_realtime_signal(q_lower)
+            and (
+                re.search(r"\b(?:compare|comparison|versus|vs\.?)\b", q_lower)
+                or re.search(r"\bwhich\s+(?:\w+\s+)?(?:is|one\s+is|would\s+be)\s+(?:better|closer|best|recommended)\b", q_lower)
+                or re.search(r"\bwhich\s+(?:is|one\s+is)\s+(?:better|closer|best|recommended)\b", q_lower)
+            )
         )
         if is_compare:
             selected_candidates = self.session_mgr.resolve_ordinals(q_lower)
@@ -2753,9 +2773,12 @@ class LocalLLM:
         # -------------------------------------------------------------
         # 8.14 PROACTIVE DAILY BRIEFING
         # -------------------------------------------------------------
-        briefing_match = re.search(
-            r"\b(?:morning\s+briefing|daily\s+briefing|boot\s+briefing|give\s+me\s+my\s+briefing|good\s+morning\s+libra|good\s+morning|status\s+report|what\s+is\s+my\s+briefing)\b",
-            q_lower
+        briefing_match = (
+            not self.has_realtime_signal(q_lower)
+            and re.search(
+                r"\b(?:morning\s+briefing|daily\s+briefing|boot\s+briefing|give\s+me\s+my\s+briefing|good\s+morning\s+libra|good\s+morning|status\s+report|what\s+is\s+my\s+briefing)\b",
+                q_lower
+            )
         )
         if briefing_match:
             if client_scope == "remote_web":
@@ -3101,8 +3124,7 @@ class LocalLLM:
             r"\b(?:today|tonight|yesterday|this week)(?:'s)?\s+(?:news|headlines?|updates?|scores?|results?|standings|schedule|events?|weather|stock|crypto)\b",
             r"\bwhat\s+(?:happened|occurred)\s+(?:today|tonight|yesterday|this week)\b"
         ]
-        has_temporal_news = any(re.search(pat, q_lower) for pat in temporal_news_signals)
-        has_realtime = any(sig in q_lower for sig in realtime_signals) or has_temporal_news
+        has_realtime = self.has_realtime_signal(q_lower)
 
         # Only treat input as chitchat if it is short (<= 8 words) and has NO real-time signal
         word_count = len(cleaned_query.split())
