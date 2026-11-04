@@ -107,6 +107,11 @@ def test_client(in_memory_db, temp_vault_dir):
         "voice_response": "Executed",
         "action": "chat"
     }
+    mock_hub.plan_or_execute.return_value = {
+        "status": "success",
+        "voice_response": "Executed",
+        "action": "chat"
+    }
 
     app = create_app(hub=mock_hub)
     client = TestClient(app)
@@ -677,8 +682,10 @@ def test_sse_chat_token_streaming(test_client):
             assert events[0]["type"] == "meta"
             assert "session_id" in events[0]
             token_events = [e for e in events if e.get("type") == "token"]
-            assert len(token_events) >= 1
+            # Round 5 Item 1: SSE emits multiple token events, not one final chunk
+            assert len(token_events) >= 2, f"Expected multiple token events, got: {len(token_events)}"
             assert token_events[0]["content"] == "Real-time"
+            assert token_events[1]["content"] == " streaming"
             assert events[-1]["type"] == "done"
             assert events[-1]["token_metrics"]["turn_out"] == 6
 
