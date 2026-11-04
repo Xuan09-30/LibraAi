@@ -115,7 +115,6 @@ import html
 import numpy as np
 import pyaudio
 import torch
-import keyboard
 import queue
 import wave
 import subprocess
@@ -448,11 +447,6 @@ class VoiceAssistantWorker(QThread):
                     except Exception:
                         pass
 
-            hotkey_handle = None
-            try:
-                hotkey_handle = keyboard.add_hotkey(INTERRUPT_HOTKEY, trigger_barge_in)
-            except Exception:
-                pass
 
             # CONSUMER THREAD: Stays alive until synthesis completes AND queue drains
             def playback_worker():
@@ -468,6 +462,14 @@ class VoiceAssistantWorker(QThread):
                     out_stream_holder[0] = out_stream
 
                     while not self.interrupted.is_set():
+                        if sys.platform == "win32":
+                            try:
+                                u32 = ctypes.windll.user32
+                                if (u32.GetAsyncKeyState(0x11) & 0x8000) and (u32.GetAsyncKeyState(0x20) & 0x8000):
+                                    trigger_barge_in()
+                                    break
+                            except Exception:
+                                pass
                         try:
                             # Short block wait so thread remains responsive to barge-in
                             chunk = audio_queue.get(timeout=0.05)
@@ -575,11 +577,6 @@ class VoiceAssistantWorker(QThread):
                     pass
                 time.sleep(0.01)
 
-            if hotkey_handle:
-                try:
-                    keyboard.remove_hotkey(hotkey_handle)
-                except Exception:
-                    pass
 
             consumer_thread.join(timeout=0.5)
             self.visualizer_state.emit(False)
@@ -1152,7 +1149,6 @@ class MainWindowHotkeyThread(QThread):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = True
-        self._keyboard_handle = None
         self._last_trigger_time = 0.0
 
     def _safe_trigger(self):
@@ -1185,12 +1181,7 @@ class MainWindowHotkeyThread(QThread):
             else:
                 print("[GUI Info] Alt + Enter hotkey registered via low-level keyboard hook.")
 
-            # 2. Also register via keyboard module for OS-level reliability
-            try:
-                import keyboard
-                self._keyboard_handle = keyboard.add_hotkey("alt+enter", lambda: self._safe_trigger(), suppress=False)
-            except Exception:
-                pass
+
 
             msg = wintypes.MSG()
             while self._running:
@@ -1208,13 +1199,7 @@ class MainWindowHotkeyThread(QThread):
 
     def stop(self):
         self._running = False
-        if self._keyboard_handle:
-            try:
-                import keyboard
-                keyboard.remove_hotkey(self._keyboard_handle)
-            except Exception:
-                pass
-            self._keyboard_handle = None
+
         if sys.platform == "win32":
             try:
                 import ctypes

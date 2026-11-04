@@ -36,11 +36,7 @@ def _get_clipboard_skill():
 
 clipboard_skill = _get_clipboard_skill()
 
-try:
-    import keyboard
-    KEYBOARD_AVAILABLE = True
-except ImportError:
-    KEYBOARD_AVAILABLE = False
+KEYBOARD_AVAILABLE = False
 
 # Win32 Constants
 MOD_ALT = 0x0001
@@ -120,7 +116,6 @@ class GlobalHotkeyThread(QThread):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = True
-        self._keyboard_handles = []
         self._last_trigger_time = 0.0
 
     def _safe_trigger(self):
@@ -162,25 +157,7 @@ class GlobalHotkeyThread(QThread):
         if success2:
             print("[Spotlight] Fallback hotkey registered: [Ctrl + Shift + L] -> Universal Highlight & Ask.")
 
-        # 2. Register low-level keyboard hook via keyboard module for OS-level reliability
-        if KEYBOARD_AVAILABLE:
-            try:
-                h1 = keyboard.add_hotkey("alt+space", lambda: self._safe_trigger(), suppress=True)
-                self._keyboard_handles.append(h1)
-            except Exception:
-                try:
-                    h1 = keyboard.add_hotkey("alt+space", lambda: self._safe_trigger(), suppress=False)
-                    self._keyboard_handles.append(h1)
-                except Exception:
-                    pass
-
-            try:
-                h2 = keyboard.add_hotkey("ctrl+shift+l", lambda: self._safe_trigger(), suppress=False)
-                self._keyboard_handles.append(h2)
-            except Exception:
-                pass
-
-        if not success1 and not success2 and not self._keyboard_handles:
+        if not success1 and not success2:
             print(f"[Spotlight] Failed to register global hotkeys (Error {ctypes.GetLastError()}).")
             return
 
@@ -199,13 +176,6 @@ class GlobalHotkeyThread(QThread):
 
     def stop(self):
         self._running = False
-        if KEYBOARD_AVAILABLE and self._keyboard_handles:
-            for h in list(self._keyboard_handles):
-                try:
-                    keyboard.remove_hotkey(h)
-                except Exception:
-                    pass
-            self._keyboard_handles.clear()
         if sys.platform == "win32":
             try:
                 ctypes.windll.user32.PostQuitMessage(0)

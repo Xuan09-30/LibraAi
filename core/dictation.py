@@ -20,11 +20,7 @@ except ImportError:
     pyaudio = None
     PYAUDIO_AVAILABLE = False
 
-try:
-    import keyboard
-    KEYBOARD_AVAILABLE = True
-except ImportError:
-    KEYBOARD_AVAILABLE = False
+KEYBOARD_AVAILABLE = False
 
 VK_RCONTROL = 0xA3
 KEYEVENTF_UNICODE = 0x0004
@@ -121,7 +117,6 @@ class WhisperDictationController:
         self._mic_stream = None
         self._pa: Optional[pyaudio.PyAudio] = None
         self._lock = threading.Lock()
-        self._keyboard_handle = None
 
     def set_stt(self, stt_engine: Any):
         self.stt = stt_engine
@@ -133,22 +128,11 @@ class WhisperDictationController:
         self._running = True
         self._thread = threading.Thread(target=self._poll_loop, daemon=True, name="DictationHookWorker")
         self._thread.start()
-        if KEYBOARD_AVAILABLE:
-            try:
-                self._keyboard_handle = keyboard.add_hotkey("ctrl+alt+d", lambda: self.toggle_dictation())
-            except Exception:
-                self._keyboard_handle = None
         print("[Dictation] Whisper Dictation Mode online (Hold Right Control or press Ctrl + Alt + D to dictate).")
 
     def stop(self):
         """Stops the daemon thread."""
         self._running = False
-        if KEYBOARD_AVAILABLE and self._keyboard_handle:
-            try:
-                keyboard.remove_hotkey(self._keyboard_handle)
-            except Exception:
-                pass
-            self._keyboard_handle = None
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=1.0)
         self._cleanup_audio()
@@ -164,26 +148,17 @@ class WhisperDictationController:
             print("[Dictation] Recording finished via [Ctrl + Alt + D]. Transcribing...")
             self._on_key_up()
 
+
+
     def pause(self):
         """Pauses dictation during gaming/anti-cheat."""
         self._paused_for_anticheat = True
         if self._is_recording:
             self._on_key_up()
-        if KEYBOARD_AVAILABLE and self._keyboard_handle:
-            try:
-                keyboard.remove_hotkey(self._keyboard_handle)
-            except Exception:
-                pass
-            self._keyboard_handle = None
 
     def resume(self):
         """Resumes dictation after gaming ends."""
         self._paused_for_anticheat = False
-        if KEYBOARD_AVAILABLE and not self._keyboard_handle:
-            try:
-                self._keyboard_handle = keyboard.add_hotkey("ctrl+alt+d", lambda: self.toggle_dictation())
-            except Exception:
-                pass
 
     def _cleanup_audio(self):
         try:
@@ -225,6 +200,7 @@ class WhisperDictationController:
 
         user32 = ctypes.windll.user32
         was_pressed = False
+        was_cad_pressed = False
         last_ac_check = 0.0
 
         while self._running:
@@ -258,6 +234,18 @@ class WhisperDictationController:
                 # Key up -> Stop recording and transcribe
                 was_pressed = False
                 self._on_key_up()
+
+            # Universal toggle for dictation (Ctrl + Alt + D) via non-hook GetAsyncKeyState
+            ctrl_down = bool(user32.GetAsyncKeyState(0x11) & 0x8000)
+            alt_down = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
+            d_down = bool(user32.GetAsyncKeyState(0x44) & 0x8000)
+            cad_pressed = ctrl_down and alt_down and d_down
+
+            if cad_pressed and not was_cad_pressed:
+                was_cad_pressed = True
+                self.toggle_dictation()
+            elif not cad_pressed and was_cad_pressed:
+                was_cad_pressed = False
 
             if was_pressed and self._is_recording:
                 # Capture chunk
