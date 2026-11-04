@@ -78,27 +78,50 @@ class TestPhase10WebPWA(unittest.TestCase):
     # 2. ZERO-TRUST GMAIL & TOKEN AUTHENTICATION TESTS
     # -----------------------------------------------------------------------
     def test_04_auth_unauthorized_rejection(self):
-        """Test 4: Unauthenticated request returns 401, wrong email returns 403."""
+        """Test 4: Unauthenticated request returns 401, stranger email with valid JWT returns 403, forged returns 401."""
         # No credentials -> 401 Unauthorized
         res_no_auth = self.client.get("/api/vitals")
         self.assertEqual(res_no_auth.status_code, 401)
 
-        # Stranger email header -> 403 Forbidden
-        headers_stranger = {"Cf-Access-Authenticated-User-Email": "stranger@gmail.com"}
+        # Stranger email header without JWT or proxy enabled -> 401 Unauthorized (Item 1 hardening)
+        headers_stranger_forged = {"Cf-Access-Authenticated-User-Email": "stranger@gmail.com"}
+        res_stranger_forged = self.client.get("/api/vitals", headers=headers_stranger_forged)
+        self.assertEqual(res_stranger_forged.status_code, 401)
+
+        # Stranger email with Cloudflare Access enabled and valid JWT -> 403 Forbidden
+        import jwt
+        self.app.state.cloudflare_access_enabled = True
+        self.app.state.cloudflare_access_secret = "test-secret"
+        stranger_jwt = jwt.encode({"email": "stranger@gmail.com"}, "test-secret", algorithm="HS256")
+        headers_stranger = {
+            "Cf-Access-Authenticated-User-Email": "stranger@gmail.com",
+            "Cf-Access-Jwt-Assertion": stranger_jwt
+        }
         res_stranger = self.client.get("/api/vitals", headers=headers_stranger)
         self.assertEqual(res_stranger.status_code, 403)
+        self.app.state.cloudflare_access_enabled = False
 
     def test_05_auth_authorized_gmail_and_token(self):
-        """Test 5: Authorized Gmail and valid Bearer tokens are permitted."""
-        # Authorized Gmail via Cloudflare header
-        headers_cf = {"Cf-Access-Authenticated-User-Email": self.admin_email}
+        """Test 5: Authorized Gmail (via verified Cloudflare Access / custom header) and valid Bearer tokens are permitted."""
+        import jwt
+        # Authorized Gmail via verified Cloudflare Access JWT header
+        self.app.state.cloudflare_access_enabled = True
+        self.app.state.cloudflare_access_secret = "test-secret"
+        cf_jwt = jwt.encode({"email": self.admin_email}, "test-secret", algorithm="HS256")
+        headers_cf = {
+            "Cf-Access-Authenticated-User-Email": self.admin_email,
+            "Cf-Access-Jwt-Assertion": cf_jwt
+        }
         res_cf = self.client.get("/api/vitals", headers=headers_cf)
         self.assertEqual(res_cf.status_code, 200)
+        self.app.state.cloudflare_access_enabled = False
 
-        # Authorized Gmail via custom header
+        # Authorized Gmail via custom header (when explicitly enabled in config)
+        self.app.state.allow_custom_user_email_header = True
         headers_custom = {"X-User-Email": self.admin_email}
         res_custom = self.client.get("/api/vitals", headers=headers_custom)
         self.assertEqual(res_custom.status_code, 200)
+        self.app.state.allow_custom_user_email_header = False
 
         # Valid Bearer token
         headers_token = {"Authorization": f"Bearer {self.token}"}

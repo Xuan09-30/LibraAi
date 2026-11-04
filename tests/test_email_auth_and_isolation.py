@@ -758,6 +758,74 @@ class TestEmailAuthAndIsolation(unittest.TestCase):
             self.app.state.rate_limit_max_requests = 60
             self.app.state.trusted_proxy_ips = {"127.0.0.1", "::1", "localhost", "testclient"}
 
+
+    def test_17_round3_item_1_identity_headers_and_jwt(self):
+        """
+        Round 3 Item 1:
+        authenticate_request must NOT trust Cf-Access-Authenticated-User-Email,
+        Tailscale-User-Login, or X-User-Email unless the matching proxy is explicitly enabled in config.
+        For Cloudflare Access, verify the Cf-Access-Jwt-Assertion JWT.
+        Test: a forged identity header with no token returns 401 on ngrok/quick-tunnel setups.
+        """
+        import jwt
+
+        # Clear any session cookies from previous test runs on the shared client
+        self.client.cookies.clear()
+
+        # Scenario 1: Default configuration (ngrok / quick-tunnel, no Cloudflare Access or Tailscale configured)
+        # Forged Cloudflare header without token must return 401 Unauthorized
+        res_cf_forged = self.client.get("/api/vitals", headers={"Cf-Access-Authenticated-User-Email": self.admin_email})
+        self.assertEqual(res_cf_forged.status_code, 401, "Forged Cf-Access-Authenticated-User-Email without proxy enabled must return 401!")
+
+        # Forged Tailscale header without token must return 401 Unauthorized
+        res_ts_forged = self.client.get("/api/vitals", headers={"Tailscale-User-Login": self.admin_email})
+        self.assertEqual(res_ts_forged.status_code, 401, "Forged Tailscale-User-Login without proxy enabled must return 401!")
+
+        # Forged X-User-Email header without token must return 401 Unauthorized
+        res_x_forged = self.client.get("/api/vitals", headers={"X-User-Email": self.admin_email})
+        self.assertEqual(res_x_forged.status_code, 401, "Forged X-User-Email without allow_custom_user_email_header must return 401!")
+
+        # Scenario 2: Cloudflare Access is explicitly enabled in app config
+        cf_app = create_app(hub=self.hub, config_path="config.json")
+        cf_secret = "test-cf-secret-key-32-bytes-long!!"
+        cf_app.state.cloudflare_access_enabled = True
+        cf_app.state.cloudflare_access_audience = "test-cf-aud"
+        cf_app.state.cloudflare_access_secret = cf_secret
+        cf_client = TestClient(cf_app)
+
+        # 2a: Enabled but missing Cf-Access-Jwt-Assertion header -> 401
+        res_missing_jwt = cf_client.get(
+            "/api/vitals",
+            headers={"Cf-Access-Authenticated-User-Email": self.admin_email}
+        )
+        self.assertEqual(res_missing_jwt.status_code, 401, "Missing Cf-Access-Jwt-Assertion when proxy is enabled must return 401!")
+
+        # 2b: Enabled but invalid / forged JWT assertion -> 401
+        res_invalid_jwt = cf_client.get(
+            "/api/vitals",
+            headers={
+                "Cf-Access-Authenticated-User-Email": self.admin_email,
+                "Cf-Access-Jwt-Assertion": "invalid.jwt.token"
+            }
+        )
+        self.assertEqual(res_invalid_jwt.status_code, 401, "Invalid Cf-Access-Jwt-Assertion must return 401!")
+
+        # 2c: Enabled with valid signed JWT assertion matching email and audience -> 200
+        valid_payload = {
+            "email": self.admin_email,
+            "aud": "test-cf-aud",
+            "iss": "https://test.cloudflareaccess.com"
+        }
+        valid_jwt = jwt.encode(valid_payload, cf_secret, algorithm="HS256")
+        res_valid_jwt = cf_client.get(
+            "/api/vitals",
+            headers={
+                "Cf-Access-Authenticated-User-Email": self.admin_email,
+                "Cf-Access-Jwt-Assertion": valid_jwt
+            }
+        )
+        self.assertEqual(res_valid_jwt.status_code, 200, "Valid signed Cf-Access-Jwt-Assertion must authenticate successfully!")
+
 if __name__ == "__main__":
     unittest.main()
 

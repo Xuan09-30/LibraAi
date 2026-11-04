@@ -40,13 +40,18 @@ class TestWebSessionsAndTokens(unittest.TestCase):
     # 1. CLOUDFLARE IDENTITY & TOKEN AUTHENTICATION TESTS
     # -----------------------------------------------------------------------
     def test_01_cloudflare_identity_headers(self):
-        """Test Cloudflare Cf-Access-Authenticated-User-Email and X-User-Email header authentication."""
-        # Allowed Admin email
+        """Test Cloudflare Cf-Access-Authenticated-User-Email (with valid JWT) and Bearer token."""
+        import jwt
+        self.app.state.cloudflare_access_enabled = True
+        self.app.state.cloudflare_access_secret = "test-secret"
+        cf_jwt = jwt.encode({"email": self.admin_email}, "test-secret", algorithm="HS256")
         cf_headers = {
-            "cf-access-authenticated-user-email": self.admin_email
+            "cf-access-authenticated-user-email": self.admin_email,
+            "cf-access-jwt-assertion": cf_jwt
         }
         res_ok = self.client.get("/api/vitals", headers=cf_headers)
         self.assertEqual(res_ok.status_code, 200)
+        self.app.state.cloudflare_access_enabled = False
 
         # Token authentication
         res_tok = self.client.get("/api/vitals", headers={"Authorization": f"Bearer {self.token}"})

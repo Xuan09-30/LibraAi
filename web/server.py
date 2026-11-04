@@ -124,6 +124,10 @@ def load_web_config(config_path: str = "config.json") -> Dict[str, Any]:
 
                     cfg["allowed_gmail"] = cfg["admin_email"]
 
+                for k in ["cloudflare_access", "tailscale", "cloudflare_quick_tunnel_fallback", "allow_custom_user_email_header"]:
+                    if k in raw_cfg:
+                        cfg[k] = raw_cfg[k]
+
         except Exception as e:
 
             logger.warning(f"Error reading config.json for web_server: {e}")
@@ -486,6 +490,16 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     app.state.rate_limit_buckets = {}
     app.state.trusted_proxy_ips = {"127.0.0.1", "::1", "localhost", "testclient"}
 
+    cf_cfg = cfg.get("cloudflare_access", {})
+    ts_cfg = cfg.get("tailscale", {})
+    app.state.cloudflare_access_enabled = bool(cf_cfg.get("enabled", False))
+    app.state.cloudflare_access_audience = str(cf_cfg.get("audience", "")).strip()
+    app.state.cloudflare_access_team_domain = str(cf_cfg.get("team_domain", "")).strip()
+    app.state.cloudflare_access_certs_url = str(cf_cfg.get("certs_url", "")).strip()
+    app.state.cloudflare_access_secret = str(cf_cfg.get("secret", "")).strip()
+    app.state.tailscale_enabled = bool(ts_cfg.get("enabled", False))
+    app.state.allow_custom_user_email_header = bool(cfg.get("allow_custom_user_email_header", False))
+
     def _resolve_client_ip(request: Optional[Request]) -> str:
         """
         Round 2 Item E.2:
@@ -542,11 +556,85 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         5. Direct localhost access on the host PC (when no external proxy header is present).
         """
         # 1. Header-based email identity (Cloudflare Access / Tailscale / X-User-Email)
-        email = (
-            request.headers.get("cf-access-authenticated-user-email")
-            or request.headers.get("x-user-email")
-            or request.headers.get("tailscale-user-login")
-        )
+        # Round 3 Item 1: authenticate_request must NOT trust Cf-Access-Authenticated-User-Email
+        # or Tailscale-User-Login unless the matching proxy is explicitly enabled in config.
+        # For Cloudflare Access, verify the Cf-Access-Jwt-Assertion JWT.
+        email = None
+        cf_access_enabled = getattr(app.state, "cloudflare_access_enabled", False)
+        ts_enabled = getattr(app.state, "tailscale_enabled", False)
+        allow_custom_email = getattr(app.state, "allow_custom_user_email_header", False)
+
+        raw_cf_email = (request.headers.get("cf-access-authenticated-user-email") or "").strip()
+        raw_ts_email = (request.headers.get("tailscale-user-login") or "").strip()
+        raw_custom_email = (request.headers.get("x-user-email") or "").strip()
+
+        if cf_access_enabled and raw_cf_email:
+            jwt_assertion = (request.headers.get("cf-access-jwt-assertion") or "").strip()
+            if not jwt_assertion:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Unauthorized: Missing Cf-Access-Jwt-Assertion header for Cloudflare Access."
+                )
+            try:
+                import jwt
+                secret = getattr(app.state, "cloudflare_access_secret", "")
+                aud = getattr(app.state, "cloudflare_access_audience", "")
+                certs_url = getattr(app.state, "cloudflare_access_certs_url", "")
+
+                if secret:
+                    decode_opts = {}
+                    if not aud:
+                        decode_opts["verify_aud"] = False
+                    payload = jwt.decode(
+                        jwt_assertion,
+                        secret,
+                        algorithms=["HS256", "RS256"],
+                        audience=aud if aud else None,
+                        options=decode_opts
+                    )
+                elif certs_url:
+                    from jwt import PyJWKClient
+                    jwks_client = PyJWKClient(certs_url)
+                    signing_key = jwks_client.get_signing_key_from_jwt(jwt_assertion)
+                    decode_opts = {}
+                    if not aud:
+                        decode_opts["verify_aud"] = False
+                    payload = jwt.decode(
+                        jwt_assertion,
+                        signing_key.key,
+                        algorithms=["RS256"],
+                        audience=aud if aud else None,
+                        options=decode_opts
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Unauthorized: Cloudflare Access verification key or certs_url not configured."
+                    )
+                jwt_email = (payload.get("email") or payload.get("sub") or "").lower().strip()
+                if not jwt_email:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Unauthorized: Cloudflare Access JWT assertion missing email claim."
+                    )
+                if jwt_email != raw_cf_email.lower().strip():
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Unauthorized: Cf-Access-Authenticated-User-Email does not match JWT assertion."
+                    )
+                email = jwt_email
+            except HTTPException:
+                raise
+            except Exception as e:
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"Unauthorized: Invalid Cloudflare Access JWT assertion: {e}"
+                )
+        elif ts_enabled and raw_ts_email:
+            email = raw_ts_email
+        elif allow_custom_email and raw_custom_email:
+            email = raw_custom_email
+
         if email:
             clean_email = email.lower().strip()
             if clean_email == admin_email or clean_email.startswith(admin_email.split("@")[0]):
