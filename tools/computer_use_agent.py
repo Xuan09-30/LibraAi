@@ -38,8 +38,17 @@ class AutonomousComputerUseAgent:
     MAX_STEPS = 15
     MAX_CONSECUTIVE_FAILURES = 3
     ALLOWED_AGENT_ACTIONS = frozenset({
-        "click", "press", "type", "retry", "done", "aborted_for_anticheat", "needs_help"
+        "click", "press", "type", "hotkey", "navigate", "retry", "done",
+        "aborted_for_anticheat", "needs_help", "confirmation_required"
     })
+    DEFAULT_ALLOWED_DOMAINS = (
+        "google.com",
+        "youtube.com",
+        "cinejoy.pk",
+        "example.com",
+        "wikipedia.org",
+        "github.com",
+    )
 
     def __init__(self, gui_control: Any, spatial: Any, model_mgr: Any = None, chrome_mgr: Any = None, memory: Any = None):
         self.gui = gui_control
@@ -54,6 +63,118 @@ class AutonomousComputerUseAgent:
     def validate_agent_action(cls, action: str) -> bool:
         """Bounded action allowlist check preventing arbitrary or unapproved action types."""
         return bool((action or "").strip().lower() in cls.ALLOWED_AGENT_ACTIONS)
+
+    @classmethod
+    def get_allowed_domains(cls) -> List[str]:
+        """Loads allowlisted navigation domains from config.json (falls back to DEFAULT_ALLOWED_DOMAINS)."""
+        try:
+            cfg_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+            if os.path.exists(cfg_file):
+                with open(cfg_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                domains = (data.get("computer_use") or {}).get("allowed_domains")
+                if isinstance(domains, list) and domains:
+                    return [str(d).strip().lower() for d in domains if str(d).strip()]
+        except Exception:
+            pass
+        return list(cls.DEFAULT_ALLOWED_DOMAINS)
+
+    @classmethod
+    def is_domain_allowed(cls, domain_or_url: str, allowed_domains: Optional[List[str]] = None) -> bool:
+        """Checks whether a target domain or URL hostname is on the configured allowlist."""
+        raw = (domain_or_url or "").strip().lower()
+        if not raw:
+            return True
+        host = re.sub(r"^https?://", "", raw).split("/")[0].split(":")[0].strip()
+        if host.startswith("www."):
+            host = host[4:]
+        allow = [d.lower().lstrip(".") for d in (allowed_domains or cls.get_allowed_domains())]
+        return any(host == d or host.endswith("." + d) for d in allow)
+
+    @classmethod
+    def check_action_risk(cls, action: str, **kwargs) -> Dict[str, Any]:
+        """
+        Round 2 Item B:
+        Evaluates argument-level risk for `type`, `press`, `hotkey`, and `navigate`.
+        Requires user confirmation (`status="confirmation_required"`) for:
+          1. Win+R or Win key launchers
+          2. Opening a terminal / PowerShell / cmd
+          3. Downloads or running executables
+          4. Typing into password or credential fields
+          5. Navigating to a domain not on the allowlist in config.json
+        """
+        act = (action or "").strip().lower()
+        key = str(kwargs.get("key") or "").strip().lower()
+        keys = [str(k).strip().lower() for k in (kwargs.get("keys") or [])]
+        text = str(kwargs.get("text") or "").strip()
+        text_low = text.lower()
+        url = str(kwargs.get("url") or kwargs.get("domain") or "").strip()
+        url_low = url.lower()
+        target_field = str(kwargs.get("target_field") or kwargs.get("role_hint") or "").strip().lower()
+        thought = str(kwargs.get("thought") or "").strip().lower()
+
+        combined_context = " ".join([key, " ".join(keys), text_low, url_low, target_field, thought])
+
+        # 1. Win+R or Win key launchers
+        win_keys = {"win", "lwin", "rwin", "windows", "super", "meta", "winleft", "winright"}
+        if act in ("press", "hotkey", "type"):
+            if key in win_keys or any(k in win_keys for k in keys):
+                return {
+                    "risky": True,
+                    "status": "confirmation_required",
+                    "reason": "Win key / Win+R system launcher requires explicit user confirmation.",
+                    "category": "win_launcher",
+                }
+            if re.search(r"\b(?:win|windows|super)\s*\+\s*[a-z0-9]\b", combined_context) or re.search(r"\b(?:lwin|rwin|winkey)\b", combined_context):
+                return {
+                    "risky": True,
+                    "status": "confirmation_required",
+                    "reason": "Win+R or Windows shortcut launcher requires explicit user confirmation.",
+                    "category": "win_launcher",
+                }
+
+        # 2. Opening a terminal / PowerShell / cmd
+        if act in ("type", "press", "hotkey", "navigate"):
+            if re.search(r"\b(?:powershell(?:\.exe)?|pwsh(?:\.exe)?|cmd(?:\.exe)?|wt\.exe| bash(?:\.exe)?|wsl(?:\.exe)?|command\s+prompt|terminal)\b", combined_context):
+                return {
+                    "risky": True,
+                    "status": "confirmation_required",
+                    "reason": "Opening or typing commands into a terminal/PowerShell/cmd requires explicit user confirmation.",
+                    "category": "terminal_execution",
+                }
+
+        # 3. Downloads or running executables
+        if act in ("type", "press", "hotkey", "navigate", "click"):
+            if re.search(r"\.(?:exe|msi|bat|cmd|ps1|vbs|scr|jar|com|reg)\b", combined_context) or re.search(r"\b(?:download|installer|setup|payload|execute)\b", combined_context):
+                return {
+                    "risky": True,
+                    "status": "confirmation_required",
+                    "reason": "Downloading or running an executable/script requires explicit user confirmation.",
+                    "category": "executable_or_download",
+                }
+
+        # 4. Typing into password or credential fields
+        if act == "type":
+            if re.search(r"\b(?:password|passwd|passcode|credential|secret|api[_\s-]?key|private[_\s-]?key|auth[_\s-]?token|totp|otp|pin\s+code|ssn|credit\s+card)\b", f"{target_field} {thought} {text_low}"):
+                return {
+                    "risky": True,
+                    "status": "confirmation_required",
+                    "reason": "Typing into a password or credential field requires explicit user confirmation.",
+                    "category": "credential_input",
+                }
+
+        # 5. Navigating to a domain not on the allowlist in config
+        if act == "navigate" or (act == "type" and kwargs.get("is_navigation")):
+            nav_target = url or text
+            if nav_target and not cls.is_domain_allowed(nav_target):
+                return {
+                    "risky": True,
+                    "status": "confirmation_required",
+                    "reason": f"Domain '{nav_target}' is not on the computer_use.allowed_domains allowlist in config.json.",
+                    "category": "unallowed_domain",
+                }
+
+        return {"risky": False, "status": "ok"}
 
     @staticmethod
     def sanitize_untrusted_screen_text(raw_text: str) -> str:
@@ -408,6 +529,56 @@ class AutonomousComputerUseAgent:
         thought_steps: List[Dict[str, str]] = []
         step_num = 1
         consecutive_failures = 0
+
+        def _confirmation_required_exit(risk_info: Dict[str, Any], attempted_action: str, **AttemptKwargs) -> Dict[str, Any]:
+            reason = risk_info.get("reason") or "High-risk computer-use action requires explicit user confirmation."
+            entry: Dict[str, Any] = {
+                "step": step_num,
+                "thought": f"Paused for user confirmation: {reason}",
+                "action": "confirmation_required",
+                "attempted_action": attempted_action,
+                "risk_category": risk_info.get("category", "risky_action"),
+            }
+            entry.update(AttemptKwargs)
+            agent_trace.append(entry)
+            thought_steps.append({
+                "step": f"Step {step_num}: CONFIRMATION REQUIRED",
+                "title": f"Confirmation Required ({risk_info.get('category', 'risky_action')})",
+                "status": "confirmation_required",
+                "detail": reason,
+            })
+            return {
+                "action": "computer_use_agent",
+                "status": "confirmation_required",
+                "reason": reason,
+                "risk_category": risk_info.get("category", "risky_action"),
+                "domain": domain,
+                "search_query": search_q,
+                "click_target": click_target,
+                "agent_trace": agent_trace,
+                "thought_steps": thought_steps,
+                "voice_response": f"Confirmation required before proceeding: {reason}",
+                "learned_workflow_saved": False,
+            }
+
+        # Pre-flight prompt & goal risk gates (never execute even Step 1 if prompt requests Win+R, terminal, password entry, or executable download)
+        prompt_risk = self.check_action_risk("type", text=prompt, thought=prompt)
+        if prompt_risk.get("status") == "confirmation_required":
+            return _confirmation_required_exit(prompt_risk, "type", text=prompt)
+
+        nav_risk = self.check_action_risk("navigate", domain=domain, url=domain)
+        if nav_risk.get("status") == "confirmation_required":
+            return _confirmation_required_exit(nav_risk, "navigate", domain=domain)
+
+        if search_q:
+            sq_risk = self.check_action_risk("type", text=search_q, target_field="search_input")
+            if sq_risk.get("status") == "confirmation_required":
+                return _confirmation_required_exit(sq_risk, "type", text=search_q)
+
+        if click_target:
+            ct_risk = self.check_action_risk("click", text=click_target, thought=f"click {click_target}")
+            if ct_risk.get("status") == "confirmation_required":
+                return _confirmation_required_exit(ct_risk, "click", target=click_target)
 
         def _record_step(thought: str, action: str, status: str = "completed", pace: Optional[float] = None, **kwargs):
             nonlocal step_num

@@ -245,3 +245,111 @@ def test_gui_control_disables_pyautogui_during_anticheat_game_mode(monkeypatch):
     assert gui.press_key("enter", dry_run=False)["status"] == "paused_for_anticheat"
     assert gui.hotkey("ctrl", "t", dry_run=False)["status"] == "paused_for_anticheat"
     assert gui.type_text("hello", dry_run=False)["status"] == "paused_for_anticheat"
+
+
+def test_round2_item_b_risky_action_gates():
+    """
+    Round 2 Item B:
+    1. ALLOWED_AGENT_ACTIONS limits verbs, not effects. Add a risk check on arguments
+       for type, press, hotkey, and navigate. Require user confirmation
+       (return status="confirmation_required") for:
+       - Win+R or Win key launchers
+       - Opening a terminal/PowerShell/cmd
+       - Downloads or running executables
+       - Typing into password or credential fields
+       - Navigating to a domain not on an allowlist in config
+    2. Show each risky case returns confirmation_required and is NOT executed,
+       and a normal safe workflow still runs.
+    """
+    class SpyGUI:
+        def __init__(self):
+            self.executed_calls = []
+        def focus_window_by_title(self, title):
+            self.executed_calls.append(("focus", title))
+            return True
+        def hotkey(self, *keys, dry_run=False):
+            self.executed_calls.append(("hotkey", keys))
+            return {"status": "success", "verified_change": True}
+        def press_key(self, key, dry_run=False):
+            self.executed_calls.append(("press", key))
+            return {"status": "success", "verified_change": True}
+        def type_text(self, text, interval=0.01, dry_run=False):
+            self.executed_calls.append(("type", text))
+            return {"status": "success", "verified_change": True}
+        def click(self, x=None, y=None, button="left", clicks=1, dry_run=False):
+            self.executed_calls.append(("click", x, y))
+            return {"status": "success", "verified_change": True}
+
+    spy = SpyGUI()
+    agent = AutonomousComputerUseAgent(gui_control=spy, spatial=None)
+
+    # 1. Direct check_action_risk unit checks on arguments for type, press, hotkey, navigate:
+    # (a) Win+R or Win key launchers
+    r_win_r = agent.check_action_risk("hotkey", keys=["win", "r"])
+    assert r_win_r["status"] == "confirmation_required"
+    r_press_win = agent.check_action_risk("press", key="win+r")
+    assert r_press_win["status"] == "confirmation_required"
+    r_press_winkey = agent.check_action_risk("press", key="lwin")
+    assert r_press_winkey["status"] == "confirmation_required"
+
+    # (b) Opening a terminal / PowerShell / cmd
+    r_ps = agent.check_action_risk("type", text="powershell.exe -NoProfile -Command whoami")
+    assert r_ps["status"] == "confirmation_required"
+    r_cmd = agent.check_action_risk("type", text="cmd.exe /c calc")
+    assert r_cmd["status"] == "confirmation_required"
+
+    # (c) Downloads or running executables
+    r_exe = agent.check_action_risk("navigate", url="https://example.com/payload_installer.exe")
+    assert r_exe["status"] == "confirmation_required"
+    r_dl = agent.check_action_risk("type", text="download setup.msi and run")
+    assert r_dl["status"] == "confirmation_required"
+
+    # (d) Typing into password or credential fields
+    r_pwd = agent.check_action_risk("type", text="Hunter2!", target_field="password input box")
+    assert r_pwd["status"] == "confirmation_required"
+    r_cred = agent.check_action_risk("type", text="sk-12345", thought="I will type into the credential / api_key field")
+    assert r_cred["status"] == "confirmation_required"
+
+    # (e) Navigating to a domain not on an allowlist in config
+    r_unallowed_domain = agent.check_action_risk("navigate", domain="evil-phishing-unlisted.xyz")
+    assert r_unallowed_domain["status"] == "confirmation_required"
+
+    # 2. End-to-end execute_task checks: risky tasks return confirmation_required and do NOT execute the risky action
+    spy.executed_calls.clear()
+    res_unlisted = agent.execute_task(
+        "Open my chrome and then evil-phishing-unlisted.xyz, find and search login and click submit",
+        dry_run=False
+    )
+    assert res_unlisted["status"] == "confirmation_required"
+    assert not any(c[0] == "type" and "evil-phishing-unlisted.xyz" in str(c[1]) for c in spy.executed_calls)
+
+    spy.executed_calls.clear()
+    res_winr = agent.execute_task(
+        "Press win+r and open powershell.exe",
+        dry_run=False
+    )
+    assert res_winr["status"] == "confirmation_required"
+    assert len(spy.executed_calls) == 0
+
+    spy.executed_calls.clear()
+    res_exe = agent.execute_task(
+        "Open my chrome and then example.com, find and search malware.exe and click download",
+        dry_run=False
+    )
+    assert res_exe["status"] == "confirmation_required"
+    assert not any(c[0] == "type" and "malware.exe" in str(c[1]) for c in spy.executed_calls)
+
+    spy.executed_calls.clear()
+    res_passwd = agent.execute_task(
+        "Open my chrome and then example.com, type my secret password into the password field and click login",
+        dry_run=False
+    )
+    assert res_passwd["status"] == "confirmation_required"
+    assert len(spy.executed_calls) == 0
+
+    # 3. Normal safe workflow on an allowlisted domain still runs
+    res_safe = agent.execute_task(
+        "Open my chrome and then cinejoy.pk, find and search hannibal and click resume",
+        dry_run=True
+    )
+    assert res_safe["status"] == "success"

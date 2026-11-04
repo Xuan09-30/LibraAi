@@ -29,5 +29,15 @@
         "enabled": true,
         "repo": "REDACTED/LibraAi",
         "token": "YOUR_GITHUB_TOKEN"
+    },
+    "computer_use": {
+        "allowed_domains": [
+            "google.com",
+            "youtube.com",
+            "cinejoy.pk",
+            "example.com",
+            "wikipedia.org",
+            "github.com"
+        ]
     }
 }
