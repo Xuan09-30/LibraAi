@@ -1,3 +1,4 @@
+from ui.tokens import get_shared_qss, STATUS_THEMES
 import os
 import sys
 
@@ -1301,7 +1302,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
     def init_ui(self):
         self.setWindowTitle("Project Libra")
         self.resize(1180, 780)
-        self.setStyleSheet("background-color: #09090b; color: #f8fafc; font-family: 'Segoe UI', -apple-system, sans-serif;")
+        self.setStyleSheet(get_shared_qss())
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -1672,23 +1673,24 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
     def update_status(self, text: str):
         self.status_banner.setText(text)
-        if "SPEAKING" in text:
-            self.status_banner.setStyleSheet(
-                "background: #160f29; color: #c084fc; border: 1px solid #9333ea; border-radius: 6px; padding: 9px;"
-            )
-        elif "RECORDING" in text or "FOLLOW-UP" in text:
-            self.status_banner.setStyleSheet(
-                "background: #092019; color: #34d399; border: 1px solid #059669; border-radius: 6px; padding: 9px;"
-            )
-        elif "PROCESSING" in text or "TRANSCRIBING" in text:
-            self.status_banner.setStyleSheet(
-                "background: #231608; color: #fbbf24; border: 1px solid #d97706; border-radius: 6px; padding: 9px;"
-            )
+        upper = text.upper()
+        if "SPEAKING" in upper:
+            theme = STATUS_THEMES.get("SPEAKING")
+        elif "RECORDING" in upper or "FOLLOW-UP" in upper or "LISTENING" in upper:
+            theme = STATUS_THEMES.get("LISTENING")
+        elif "PROCESSING" in upper or "TRANSCRIBING" in upper or "THINKING" in upper:
+            theme = STATUS_THEMES.get("THINKING")
         else:
-            self.status_banner.setStyleSheet(
-                "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #091322, stop:0.5 #13243d, stop:1 #091322); "
-                "color: #00ffcc; border: 1px solid #00e5ff; border-radius: 6px; padding: 9px;"
-            )
+            theme = STATUS_THEMES.get("IDLE")
+        
+        self.status_banner.setStyleSheet(f"""
+            background: {theme['bg']};
+            color: {theme['color']};
+            border: 1px solid {theme['border']};
+            border-radius: 8px;
+            padding: 9px;
+            font-weight: 600;
+        """)
 
     def append_log(self, sender: str, msg: str):
         safe_msg = html.escape(str(msg))

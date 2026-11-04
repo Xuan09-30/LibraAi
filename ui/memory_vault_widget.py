@@ -1,3 +1,4 @@
+from ui.tokens import get_shared_qss
 import os
 import sys
 from typing import Optional, List, Dict, Any
@@ -278,10 +279,15 @@ class MemoryVaultWidget(QDialog):
         add_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         add_btn.setStyleSheet("""
             QPushButton {
-                background: #fafafa; color: #09090b;
-                border: 1px solid #fafafa; border-radius: 6px; padding: 8px 14px;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 rgba(0, 240, 255, 0.16), stop:1 rgba(14, 165, 233, 0.22));
+                color: #00f0ff;
+                border: 1px solid rgba(0, 240, 255, 0.45);
+                border-radius: 8px;
+                padding: 8px 14px;
             }
-            QPushButton:hover { background: #059669; }
+            QPushButton:hover {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 rgba(0, 240, 255, 0.28), stop:1 rgba(14, 165, 233, 0.35));
+            }
         """)
         add_btn.clicked.connect(self._create_fact_dialog)
         controls.addWidget(add_btn, stretch=2)

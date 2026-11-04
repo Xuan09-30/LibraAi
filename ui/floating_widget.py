@@ -72,8 +72,8 @@ class FloatingHUDPill(QWidget):
         container.setGeometry(0, 0, 520, 48)
         container.setStyleSheet("""
             QWidget {
-                background-color: rgba(24, 24, 27, 0.96);
-                border: 1px solid rgba(255, 255, 255, 0.12);
+                background-color: rgba(18, 22, 34, 0.96);
+                border: 1px solid rgba(0, 240, 255, 0.25);
                 border-radius: 24px;
             }
         """)
