@@ -50,12 +50,13 @@ class AutonomousComputerUseAgent:
         "github.com",
     )
 
-    def __init__(self, gui_control: Any, spatial: Any, model_mgr: Any = None, chrome_mgr: Any = None, memory: Any = None):
+    def __init__(self, gui_control: Any, spatial: Any, model_mgr: Any = None, chrome_mgr: Any = None, memory: Any = None, vault_dir: Optional[str] = None):
         self.gui = gui_control
         self.spatial = spatial
         self.model_mgr = model_mgr
         self.chrome_mgr = chrome_mgr
         self.memory = memory
+        self.vault_dir = vault_dir or os.environ.get("LIBRA_VAULT_DIR")
         self._playwright = None
         self._cdp_browser = None
 
@@ -1110,7 +1111,7 @@ class AutonomousComputerUseAgent:
 
         # 2. Save to Obsidian Vault Markdown (Permanent Human & Agent Readable)
         try:
-            vault_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "vault")
+            vault_dir = getattr(self, "vault_dir", None) or os.environ.get("LIBRA_VAULT_DIR") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "vault")
             os.makedirs(vault_dir, exist_ok=True)
             vault_file = os.path.join(vault_dir, f"learned_workflow_{clean_domain}.md")
 

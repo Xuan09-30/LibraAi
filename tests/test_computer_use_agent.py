@@ -121,7 +121,7 @@ def test_loop_execution_and_memory_persistence():
     assert "navigate cinejoy.pk" in mem.corrections[0][0]
     assert len(mem.macros) == 1
     # Verify vault markdown was created
-    vault_file = os.path.join(PROJECT_ROOT, "assets", "vault", "learned_workflow_cinejoy_pk.md")
+    vault_file = os.path.join(os.environ.get("LIBRA_VAULT_DIR") or os.path.join(PROJECT_ROOT, "assets", "vault"), "learned_workflow_cinejoy_pk.md")
     assert os.path.exists(vault_file)
     with open(vault_file, "r", encoding="utf-8") as f:
         content = f.read()
@@ -430,7 +430,7 @@ def test_round2_item_c_concrete_post_condition_verification(tmp_path, monkeypatc
     # Case 2: Workflow has a concrete post-condition, all actions succeed (failures == 0),
     #         but the actual end state (window title / URL / on-screen text) is WRONG
     #         -> must NOT get saved to the vault or memory!
-    vault_example = os.path.join(PROJECT_ROOT, "assets", "vault", "learned_workflow_example_com.md")
+    vault_example = os.path.join(os.environ.get("LIBRA_VAULT_DIR") or os.path.join(PROJECT_ROOT, "assets", "vault"), "learned_workflow_example_com.md")
     if os.path.exists(vault_example):
         try:
             os.remove(vault_example)
@@ -515,7 +515,7 @@ def test_round3_item_6_post_condition_provenance(monkeypatch):
         memory=DummyMem()
     )
 
-    vault_example = os.path.join(PROJECT_ROOT, "assets", "vault", "learned_workflow_example_com.md")
+    vault_example = os.path.join(os.environ.get("LIBRA_VAULT_DIR") or os.path.join(PROJECT_ROOT, "assets", "vault"), "learned_workflow_example_com.md")
     if os.path.exists(vault_example):
         try: os.remove(vault_example)
         except Exception: pass

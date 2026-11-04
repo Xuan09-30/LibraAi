@@ -68,6 +68,8 @@ class SemanticMemory:
 
         db_path: Optional[str] = None,
 
+        vault_dir: Optional[str] = None,
+
     ):
 
         if db_path is not None:
@@ -84,7 +86,11 @@ class SemanticMemory:
 
             project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-            self.db_path = os.path.join(project_root, db_filename)
+            override_db = os.environ.get("LIBRA_MEMORY_DB")
+            if override_db and db_path is None and db_filename == "assets/libra_memory.db":
+                self.db_path = override_db
+            else:
+                self.db_path = os.path.join(project_root, db_filename)
 
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
 
@@ -96,7 +102,8 @@ class SemanticMemory:
 
         self.dim = dim
 
-        self.vault_dir = os.path.join(project_root if db_filename != ":memory:" else ".", "assets", "vault")
+        override_vault = os.environ.get("LIBRA_VAULT_DIR")
+        self.vault_dir = vault_dir or override_vault or os.path.join(project_root if db_filename != ":memory:" else ".", "assets", "vault")
 
         os.makedirs(self.vault_dir, exist_ok=True)
 
