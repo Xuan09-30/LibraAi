@@ -284,6 +284,44 @@ class TestEmailAuthAndIsolation(unittest.TestCase):
         self.assertEqual(res_del.status_code, 200)
         self.assertIsNone(self.memory.get_registered_user_by_email(invite_email))
 
+    def test_10_server_side_client_scope_and_403_on_local_desktop_spoof(self):
+        """
+        Tier 1 Security: Derive client_scope server-side from the auth token, never from the request body.
+        Sending 'client_scope': 'local_desktop' as a remote user must return HTTP 403.
+        """
+        # Authenticate as a remote tester user
+        res_tester = self.client.post(
+            "/api/auth/google-login",
+            json={"email": "spoof_tester@example.com", "display_name": "Spoof Tester"}
+        )
+        self.assertEqual(res_tester.status_code, 200)
+        tester_tok = res_tester.json()["token"]
+        tester_headers = {"Authorization": f"Bearer {tester_tok}"}
+
+        # 1. Remote user sends client_scope='local_desktop' to /api/chat -> must return 403
+        res_chat_spoof = self.client.post(
+            "/api/chat",
+            json={"prompt": "open notepad", "client_scope": "local_desktop", "synthesize_audio": False},
+            headers=tester_headers
+        )
+        self.assertEqual(res_chat_spoof.status_code, 403)
+
+        # 2. Remote user sends client_scope='local_desktop' to /api/chat?stream=true -> must return 403
+        res_stream_spoof = self.client.post(
+            "/api/chat?stream=true",
+            json={"prompt": "open notepad", "client_scope": "local_desktop", "stream": True, "synthesize_audio": False},
+            headers=tester_headers
+        )
+        self.assertEqual(res_stream_spoof.status_code, 403)
+
+        # 3. Remote user sends client_scope='local_desktop' to /api/sessions/new -> must return 403
+        res_sess_spoof = self.client.post(
+            "/api/sessions/new",
+            json={"title": "Spoof Session", "client_scope": "local_desktop"},
+            headers=tester_headers
+        )
+        self.assertEqual(res_sess_spoof.status_code, 403)
+
 
 if __name__ == "__main__":
     unittest.main()

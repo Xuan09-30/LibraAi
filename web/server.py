@@ -2023,7 +2023,19 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         stitle = (req.title if req and req.title else "New Chat")
 
-        scope = (req.client_scope if req and req.client_scope else "remote_web")
+        role = str(auth.get("role", "guest")).lower()
+        req_scope = (req.client_scope if req and req.client_scope else "").strip().lower()
+        if role != "host" and req_scope and req_scope != "remote_web":
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: client_scope is derived server-side; remote users cannot request privileged scope."
+            )
+        if req_scope == "local_desktop" and auth.get("method") != "localhost_direct":
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: 'local_desktop' scope cannot be set from a remote request body."
+            )
+        scope = "remote_host" if role == "host" else "remote_web"
 
         user_email = auth.get("email", "")
 
@@ -2316,10 +2328,20 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         """
 
-        role = auth.get("role", "guest")
+        role = str(auth.get("role", "guest")).lower()
+        req_scope = (req.client_scope or "").strip().lower()
+        if role != "host" and req_scope and req_scope != "remote_web":
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: client_scope is derived server-side; remote users cannot request privileged scope."
+            )
+        if req_scope == "local_desktop" and auth.get("method") != "localhost_direct":
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: 'local_desktop' scope cannot be set from a remote request body."
+            )
 
-        # If host, grant remote_host scope (allows desktop app launch on PC!); if guest, sandbox to remote_web
-
+        # Derive client_scope strictly server-side from auth role
         scope = "remote_host" if role == "host" else "remote_web"
 
         memory = getattr(supervisor.llm, "memory", None)
@@ -2491,7 +2513,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                 if is_desktop_cmd or is_desktop_open or is_desktop_close:
 
-                    if role == "guest":
+                    if role != "host":
 
                         sandbox_msg = "Guest Mode active: Desktop OS control is restricted to the host owner."
 
@@ -2855,7 +2877,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                     nonlocal full_text, thought_steps, sentence_buffer, sentence_idx, in_tok, out_tok, tok_sec
 
-                    eff_scope = req.client_scope or scope
+                    eff_scope = scope
 
                     # Autonomous Computer-Use ReAct & Loop Execution
                     if AutonomousComputerUseAgent.is_computer_use_prompt(req.prompt.strip()):
@@ -3413,7 +3435,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         if is_desktop_cmd or is_desktop_open or is_desktop_close:
 
-            if role == "guest":
+            if role != "host":
 
                 sandbox_msg = "Guest Mode active: Desktop OS control is restricted to the host owner."
 
@@ -3427,13 +3449,13 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                     "action": "remote_sandbox_blocked",
 
-                    "client_scope": req.client_scope or scope,
+                    "client_scope": scope,
 
                     "token_metrics": {"input_tokens": 0, "output_tokens": max(1, len(sandbox_msg)//4), "tokens_per_sec": 0.0}
 
                 }
 
-            elif is_desktop_open and (explicit_pc_target or req.client_scope == "remote_host"):
+            elif is_desktop_open and role == "host" and explicit_pc_target:
 
                 m_app = re.search(r"^(?:please\s+)?(?:open|launch|start|run)\s+(.+?)(?:\s+on\s+(?:my\s+)?pc)?$", req.prompt.strip(), re.IGNORECASE)
 
@@ -3463,7 +3485,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                 }
 
-        effective_scope = "remote_host" if (role == "host" and (explicit_pc_target or req.client_scope == "remote_host")) else "remote_web"
+        effective_scope = "remote_host" if (role == "host" and explicit_pc_target) else "remote_web"
 
         # 1. Ensure or auto-create session thread
 
@@ -3959,7 +3981,19 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         sid = session_id or request.query_params.get("session_id")
 
-        scope = client_scope or request.query_params.get("client_scope", "remote_web")
+        role_audio = str(auth.get("role", "guest")).lower()
+        req_audio_scope = (client_scope or request.query_params.get("client_scope", "")).strip().lower()
+        if role_audio != "host" and req_audio_scope and req_audio_scope != "remote_web":
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: client_scope is derived server-side; remote users cannot request privileged scope."
+            )
+        if req_audio_scope == "local_desktop" and auth.get("method") != "localhost_direct":
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: 'local_desktop' scope cannot be set from a remote request body."
+            )
+        scope = "remote_host" if role_audio == "host" else "remote_web"
 
         if not sid:
 
