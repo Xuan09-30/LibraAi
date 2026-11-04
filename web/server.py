@@ -3046,48 +3046,17 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                 tok_sec = 0.0
 
-                # Check if prompt is an explicit search, real-time news/sports/events, weather, window, or tool query
-
-                realtime_search_patterns = [
-
-                    # 1. Explicit search & lookup
-
-                    r"\b(?:search|google|look\s+up|find\s+out|find\s+info|browse|check\s+online|research)\b",
-
-                    # 2. News, headlines, updates, events
-
-                    r"\b(?:news|headline|headlines|latest|current|currently|recent|recently|trending|update|updates|happening|what\s+happened)\b",
-
-                    # 3. Temporal indicators (today, yesterday, now, etc.)
-
-                    r"\b(?:today|tonight|yesterday|tomorrow|this\s+morning|this\s+week|this\s+month|this\s+year|right\s+now|at\s+the\s+moment)\b",
-
-                    # 4. Sports, leagues & games
-
-                    r"\b(?:nba|nfl|mlb|nhl|premier\s+league|epl|champions\s+league|uefa|fifa|world\s+cup|f1|formula\s+1|ufc|boxing|olympics|esports|game\s+score|match\s+score|who\s+won|standings|playoffs|finals|trade|traded)\b",
-
-                    # 5. Financial markets & assets
-
-                    r"\b(?:stock|stocks|crypto|bitcoin|btc|ethereum|eth|nasdaq|dow\s+jones|s&p|gold\s+price|market\s+price|exchange\s+rate)\b",
-
-                    # 6. Weather & environmental conditions
-
-                    r"\b(?:weather|forecast|temperature|rain|raining|humidity|snow|sunny|storm|typhoon|earthquake)\b",
-
-                    # 7. World leaders, active roles, current entities
-
-                    r"\b(?:who\s+(?:is\s+the\s+current|is\s+currently|leads|plays\s+for|signed\s+with|traded\s+to)|current\s+president|prime\s+minister)\b",
-
-                    # 8. Active desktop inspection
-
-                    r"\b(?:what\s+window|what\s+application|what\s+am\s+i\s+playing|currently\s+looking\s+at)\b",
-
-                    # 9. Factual queries requiring verified ground truth & anti-hallucination
-                    r"\b(?:what\s+is\s+the\s+difference|how\s+many|what\s+year|when\s+was|who\s+wrote|who\s+invented|who\s+discovered|who\s+directed|who\s+starred|capital\s+of|population\s+of|specs\s+of|release\s+date|how\s+to\s+fix|what\s+caused)\b"
-
-                ]
-
-                is_tool_or_search_query = any(re.search(pat, req.prompt.strip(), re.IGNORECASE) for pat in realtime_search_patterns) or AutonomousComputerUseAgent.is_computer_use_prompt(req.prompt.strip())
+                # Single Cognitive Router (Round 4 Item 4):
+                # Web path uses the exact same router as the desktop (SupervisorHub / LocalLLM.plan)
+                # Removing duplicate realtime_search_patterns regex list
+                planned_route = supervisor.plan_or_execute(
+                    req.prompt.strip(),
+                    dry_run=True,
+                    client_scope=scope,
+                    session_id=sid
+                )
+                planned_action = planned_route.get("action", "chat")
+                is_tool_or_search_query = (planned_action != "chat")
 
                 async def _run_supervisor_self_correction(reason_note: str = ""):
 
@@ -3155,13 +3124,20 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                         src_names = ", ".join([s.get("name", "Web") for s in srcs[:2]]) if srcs else "Live Web"
 
                         q_snippet = req.prompt.strip()[:65]
-                        thought_steps = [
-                            {"step": 1, "title": "Intent & Scope Analysis", "detail": f"Recognized inquiry for '{q_snippet}'. Enforcing client scope: {eff_scope}.", "action": "analyze_intent", "status": "done"},
-                            {"step": 2, "title": "Contextual & Memory Vault Recall", "detail": f"Queried episodic memory and profile context for '{q_snippet}'.", "action": "memory_recall", "status": "done"},
-                            {"step": 3, "title": "Autonomous Tool & Web Intelligence", "detail": f"Dispatched '{action_name}'. Retrieved and grounded verified intelligence from {src_names}.", "action": action_name, "status": "done"},
-                            {"step": 4, "title": "Reflexion & Safety Verification", "detail": "Critiqued retrieved data for source credibility, token grounding, and anti-hallucination compliance.", "action": "critique_and_verify", "status": "done"},
-                            {"step": 5, "title": "Factual Synthesis & Delivery", "detail": "Synthesized verified response with citations and token analytics.", "action": "synthesize", "status": "done"}
-                        ]
+                        if action_name == "chat":
+                            thought_steps = [
+                                {"step": 1, "title": "Intent & Scope Analysis", "detail": f"Recognized conversational query for '{q_snippet}'. Enforcing client scope: {eff_scope}.", "action": "analyze_intent", "status": "done"},
+                                {"step": 2, "title": "Contextual & Memory Vault Recall", "detail": f"Queried episodic memory and profile context for '{q_snippet}'.", "action": "memory_recall", "status": "done"},
+                                {"step": 3, "title": "Neural Synthesis & Response", "detail": "Generated conversational response grounded in session context and persona.", "action": "chat", "status": "done"}
+                            ]
+                        else:
+                            thought_steps = [
+                                {"step": 1, "title": "Intent & Scope Analysis", "detail": f"Recognized inquiry for '{q_snippet}'. Enforcing client scope: {eff_scope}.", "action": "analyze_intent", "status": "done"},
+                                {"step": 2, "title": "Contextual & Memory Vault Recall", "detail": f"Queried episodic memory and profile context for '{q_snippet}'.", "action": "memory_recall", "status": "done"},
+                                {"step": 3, "title": "Autonomous Tool & Web Intelligence", "detail": f"Dispatched '{action_name}'. Retrieved and grounded verified intelligence from {src_names}.", "action": action_name, "status": "done"},
+                                {"step": 4, "title": "Reflexion & Safety Verification", "detail": "Critiqued retrieved data for source credibility, token grounding, and anti-hallucination compliance.", "action": "critique_and_verify", "status": "done"},
+                                {"step": 5, "title": "Factual Synthesis & Delivery", "detail": "Synthesized verified response with citations and token analytics.", "action": "synthesize", "status": "done"}
+                            ]
 
                     if thought_steps and not AutonomousComputerUseAgent.is_computer_use_prompt(req.prompt.strip()):
                         for s_item in thought_steps:
