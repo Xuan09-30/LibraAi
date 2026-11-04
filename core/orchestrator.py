@@ -38,6 +38,26 @@ BLOCKED_REMOTE_ACTIONS = {
     "virus_scan",
 }
 
+DESTRUCTIVE_MACRO_ACTIONS = {
+    "shutdown",
+    "delete_file",
+    "delete_folder",
+    "remove_file",
+    "send_email",
+    "install_package",
+    "install_app",
+    "uninstall_app",
+    "format_drive",
+    "wipe_memory",
+}
+
+DESTRUCTIVE_MACRO_PATTERNS = [
+    r"\b(?:delete|remove|erase|wipe|format|uninstall)\b",
+    r"\b(?:send|dispatch)\s+(?:an?\s+)?(?:email|message|report)\b",
+    r"\b(?:install)\b",
+    r"\b(?:shut\s*down|reboot|restart)\b",
+]
+
 REMOTE_SANDBOX_PATTERNS = [
     r"\b(?:launch|open|start|run|close|kill|shut\s*down)\s+(?:the\s+)?(?:app|application|game|program|software|chrome|steam|notepad|calc|pc|computer|system)\b",
     r"\b(?:click|double\s+click|right\s+click|press|tap)\s+(?:on\s+)?(?:the\s+)?(?:screen|button|icon|window|profile)\b",
@@ -260,6 +280,107 @@ class SupervisorHub:
             return {"action": action, "status": "success" if success else "error", "voice_response": msg}
         return res
 
+    def is_destructive_macro(self, norm_trigger: str, tool_chain: List[Dict[str, Any]]) -> bool:
+        """Checks if a macro or trigger involves destructive actions (delete, send, install, shutdown)."""
+        for step_item in (tool_chain or []):
+            if step_item.get("action") in DESTRUCTIVE_MACRO_ACTIONS:
+                return True
+            sub_prompt = str((step_item.get("args") or {}).get("target") or (step_item.get("args") or {}).get("prompt") or "")
+            if any(re.search(pat, sub_prompt, re.IGNORECASE) for pat in DESTRUCTIVE_MACRO_PATTERNS):
+                return True
+        if norm_trigger and any(re.search(pat, norm_trigger, re.IGNORECASE) for pat in DESTRUCTIVE_MACRO_PATTERNS):
+            return True
+        return False
+
+    def _execute_macro_chain(
+        self,
+        tool_chain: List[Dict[str, Any]],
+        norm_trigger: str = "",
+        intent_signature: str = "",
+        client_scope: str = "local_desktop",
+        dry_run: bool = False,
+        avg_latency_ms: float = 120.0,
+        t_start: Optional[float] = None,
+        confirmed: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Executes a cached macro tool_chain after verifying:
+        1. Remote scope refusal for OS tools BEFORE any tool execution.
+        2. Explicit user confirmation for destructive actions (delete, send, install, shutdown) even when cached.
+        """
+        t0 = t_start if t_start is not None else time.perf_counter()
+        macro_act = tool_chain[0].get("action") if len(tool_chain) == 1 else "macro_chain"
+
+        # 1. Refuse OS tools for remote_web scope BEFORE invoking _execute_cached_tool
+        if client_scope == "remote_web" and (macro_act in BLOCKED_REMOTE_ACTIONS or any(s.get("action") in BLOCKED_REMOTE_ACTIONS for s in tool_chain)):
+            return {
+                "action": "sandboxed_blocked",
+                "status": "blocked",
+                "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                "client_scope": client_scope
+            }
+
+        # 2. Require confirmation for destructive actions even when macro is cached
+        if not confirmed and self.is_destructive_macro(norm_trigger, tool_chain):
+            return {
+                "action": "confirm_required",
+                "status": "confirmation_required",
+                "requires_confirmation": True,
+                "pending_macro": tool_chain,
+                "trigger": norm_trigger,
+                "voice_response": f"Confirmation required before executing destructive action: {norm_trigger}."
+            }
+
+        profiler.record_preact_cache_hit(
+            trigger=norm_trigger,
+            intent_signature=intent_signature or f"macro:{client_scope}:{norm_trigger}",
+            latency_saved_ms=avg_latency_ms
+        )
+        step_results: List[Dict[str, Any]] = []
+        voice_responses: List[str] = []
+
+        for step_item in tool_chain:
+            act = step_item.get("action", "")
+            args = step_item.get("args", {})
+            res = self._execute_cached_tool(act, args, dry_run=dry_run)
+            step_results.append(res)
+            v = res.get("voice_response")
+            if v and v != "Dry-run response.":
+                voice_responses.append(v)
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        scoped_trig = f"{client_scope}:{norm_trigger}" if norm_trigger else ""
+        if not dry_run and scoped_trig and hasattr(self.llm, "memory") and hasattr(self.llm.memory, "record_action_macro"):
+            self.llm.memory.record_action_macro(
+                scoped_trig,
+                intent_signature or f"macro:{client_scope}:{norm_trigger}",
+                tool_chain,
+                latency_ms=elapsed_ms
+            )
+
+        combined_voice = " ".join(voice_responses) if voice_responses else f"Completed {norm_trigger}."
+        fast_tm = {
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+            "tokens_per_sec": 0.0, "saved_tokens": 350,
+            "model": "preact_macro", "fast_path": True
+        }
+        if hasattr(self.llm, "last_token_metrics"):
+            self.llm.last_token_metrics = dict(fast_tm)
+        out_macro = {
+            "action": macro_act,
+            "compound": len(tool_chain) > 1,
+            "steps": [norm_trigger],
+            "actions": [s.get("action") for s in tool_chain],
+            "step_results": step_results,
+            "voice_response": normalize_for_tts(combined_voice),
+            "preact_cached": True,
+            "token_metrics": fast_tm,
+            "latency_ms": round(elapsed_ms, 2)
+        }
+        if len(step_results) == 1 and isinstance(step_results[0], dict) and step_results[0].get("slug"):
+            out_macro["slug"] = step_results[0]["slug"]
+        return out_macro
+
     def _match_semantic_fastpath(self, prompt: str) -> Optional[Dict[str, Any]]:
         """
         Embedding-Assisted / Lexical Semantic Fast-Path (Phase 9).
@@ -365,73 +486,29 @@ class SupervisorHub:
             return agent.execute_task(prompt, dry_run=dry_run)
 
         norm_trigger = normalize_trigger(prompt)
-        intent_signature = f"macro:{norm_trigger}"
+        scoped_trigger = f"{client_scope}:{norm_trigger}"
+        intent_signature = f"macro:{client_scope}:{norm_trigger}"
         t_start = time.perf_counter()
         sub_steps = self.split_compound_intent(prompt)
 
         # PREACT DETERMINISTIC ACTION MACRO FAST-PATH (<5ms)
         _DYNAMIC_NO_MACRO_ACTIONS = {"chat", "clarify", "error", "active_window", "weather", "world_time", "time", "run_learned_skill", "lookup_entity", "web_search", "deep_research", "computer_use_agent", "daily_briefing"}
         if len(sub_steps) == 1 and hasattr(self.llm, "memory") and hasattr(self.llm.memory, "get_action_macro"):
-            cached_macro = self.llm.memory.get_action_macro(norm_trigger)
+            cached_macro = self.llm.memory.get_action_macro(scoped_trigger) or self.llm.memory.get_action_macro(intent_signature)
+            if cached_macro is None and client_scope == "local_desktop":
+                cached_macro = self.llm.memory.get_action_macro(norm_trigger)
             if cached_macro and cached_macro.get("success_count", 0) >= 2:
                 tool_chain = cached_macro.get("tool_chain", [])
                 if tool_chain and not any(s.get("action") in _DYNAMIC_NO_MACRO_ACTIONS for s in tool_chain):
-                    profiler.record_preact_cache_hit(
-                        trigger=norm_trigger,
+                    return self._execute_macro_chain(
+                        tool_chain=tool_chain,
+                        norm_trigger=norm_trigger,
                         intent_signature=intent_signature,
-                        latency_saved_ms=cached_macro.get("avg_latency_ms", 120.0)
+                        client_scope=client_scope,
+                        dry_run=dry_run,
+                        avg_latency_ms=cached_macro.get("avg_latency_ms", 120.0),
+                        t_start=t_start
                     )
-                    step_results: List[Dict[str, Any]] = []
-                    voice_responses: List[str] = []
-
-                    for step_item in tool_chain:
-                        act = step_item.get("action", "")
-                        args = step_item.get("args", {})
-                        res = self._execute_cached_tool(act, args, dry_run=dry_run)
-                        step_results.append(res)
-                        v = res.get("voice_response")
-                        if v and v != "Dry-run response.":
-                            voice_responses.append(v)
-
-                    elapsed_ms = (time.perf_counter() - t_start) * 1000.0
-                    if not dry_run:
-                        self.llm.memory.record_action_macro(
-                            norm_trigger,
-                            intent_signature,
-                            tool_chain,
-                            latency_ms=elapsed_ms
-                        )
-
-                    combined_voice = " ".join(voice_responses) if voice_responses else f"Completed {norm_trigger}."
-                    macro_act = tool_chain[0].get("action") if len(tool_chain) == 1 else "macro_chain"
-                    if client_scope == "remote_web" and (macro_act in BLOCKED_REMOTE_ACTIONS or any(s.get("action") in BLOCKED_REMOTE_ACTIONS for s in tool_chain)):
-                        return {
-                            "action": "sandboxed_blocked",
-                            "status": "blocked",
-                            "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
-                            "client_scope": client_scope
-                        }
-                    fast_tm = {
-                        "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
-                        "tokens_per_sec": 0.0, "saved_tokens": 350,
-                        "model": "preact_macro", "fast_path": True
-                    }
-                    if hasattr(self.llm, "last_token_metrics"):
-                        self.llm.last_token_metrics = dict(fast_tm)
-                    out_macro = {
-                        "action": macro_act,
-                        "compound": len(tool_chain) > 1,
-                        "steps": [norm_trigger],
-                        "actions": [s.get("action") for s in tool_chain],
-                        "step_results": step_results,
-                        "voice_response": normalize_for_tts(combined_voice),
-                        "preact_cached": True,
-                        "token_metrics": fast_tm,
-                        "latency_ms": round(elapsed_ms, 2)
-                    }
-                    if len(step_results) == 1 and isinstance(step_results[0], dict) and step_results[0].get("slug"):
-                        out_macro["slug"] = step_results[0]["slug"]
-                    return out_macro
 
         # SEMANTIC FAST-PATH ROUTING (Phase 9) (<5ms) - Only for single-clause intents
         if len(sub_steps) == 1:
@@ -478,7 +555,7 @@ class SupervisorHub:
                 tool_chain = [{"action": act, "args": res.get("args", {})}]
                 if hasattr(self.llm, "memory") and hasattr(self.llm.memory, "record_action_macro"):
                     self.llm.memory.record_action_macro(
-                        norm_trigger,
+                        scoped_trigger,
                         intent_signature,
                         tool_chain,
                         latency_ms=elapsed_ms
@@ -526,7 +603,7 @@ class SupervisorHub:
             if successful_chain and len(successful_chain) == len(step_results):
                 if hasattr(self.llm, "memory") and hasattr(self.llm.memory, "record_action_macro"):
                     self.llm.memory.record_action_macro(
-                        norm_trigger,
+                        scoped_trigger,
                         intent_signature,
                         successful_chain,
                         latency_ms=elapsed_ms

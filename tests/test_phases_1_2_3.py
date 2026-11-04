@@ -232,6 +232,60 @@ class TestPhase3PreActDeterministicActionCaching(unittest.TestCase):
         # Cleanup
         self.mem.delete_action_macro(norm)
 
+    def test_09_scoped_macro_cache_and_destructive_confirmation(self):
+        """
+        Tier 1 Security:
+        1. Include client_scope in macro cache key so local_desktop macros do not bleed into remote_web.
+        2. _execute_macro_chain refuses OS tools for remote_web BEFORE invoking _execute_cached_tool.
+        3. Destructive actions (delete, send, install, shutdown) require confirmation even when cached.
+        """
+        trig = "open calculator"
+        norm = normalize_trigger(trig)
+        chain = [{"action": "open_app", "args": {"target": "calc"}}]
+
+        self.mem.delete_action_macro(norm)
+        self.mem.record_action_macro(norm, f"macro:{norm}", chain, latency_ms=10.0)
+        self.mem.record_action_macro(norm, f"macro:{norm}", chain, latency_ms=10.0)
+
+        # Spy on _execute_cached_tool to prove it is NEVER called when remote_web hits a cached macro
+        calls = []
+        orig_exec = self.hub._execute_cached_tool
+        def spy_exec(action, args, dry_run=False):
+            calls.append((action, args))
+            return orig_exec(action, args, dry_run=dry_run)
+        self.hub._execute_cached_tool = spy_exec
+        try:
+            # 1. Remote web scope must not execute local_desktop cached OS macro
+            res_remote = self.hub.plan_or_execute(trig, dry_run=False, client_scope="remote_web")
+            self.assertEqual(res_remote.get("action"), "sandboxed_blocked")
+            self.assertEqual(len(calls), 0, "OS tool was executed before remote_web check!")
+
+            # 2. Direct call to _execute_macro_chain in remote_web scope must refuse OS tools without executing
+            res_chain = self.hub._execute_macro_chain(chain, norm_trigger=norm, intent_signature=f"macro:{norm}", client_scope="remote_web", dry_run=False)
+            self.assertEqual(res_chain.get("action"), "sandboxed_blocked")
+            self.assertEqual(len(calls), 0, "_execute_macro_chain executed OS tool in remote_web scope!")
+
+            # 3. Cached destructive action (delete, send, install) must require confirmation even when cached
+            for d_trig, d_act in [
+                ("delete temp logs", "delete_file"),
+                ("send project report email", "send_email"),
+                ("install python package", "install_package"),
+            ]:
+                d_norm = normalize_trigger(d_trig)
+                d_chain = [{"action": d_act, "args": {"target": d_trig}}]
+                self.mem.record_action_macro(d_norm, f"macro:local_desktop:{d_norm}", d_chain, latency_ms=10.0)
+                self.mem.record_action_macro(d_norm, f"macro:local_desktop:{d_norm}", d_chain, latency_ms=10.0)
+                res_destr = self.hub.plan_or_execute(d_trig, dry_run=False, client_scope="local_desktop")
+                self.assertTrue(res_destr.get("requires_confirmation"), f"Destructive cached macro '{d_trig}' executed without confirmation!")
+                self.assertEqual(res_destr.get("status"), "confirmation_required")
+                self.assertEqual(len(calls), 0, f"Destructive cached macro '{d_trig}' invoked tool before confirmation!")
+                self.mem.delete_action_macro(d_norm)
+                self.mem.delete_action_macro(f"local_desktop:{d_norm}")
+        finally:
+            self.hub._execute_cached_tool = orig_exec
+            self.mem.delete_action_macro(norm)
+            self.mem.delete_action_macro(f"local_desktop:{norm}")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
