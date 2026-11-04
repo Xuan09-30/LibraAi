@@ -19,6 +19,9 @@ try:
 except Exception:
     pass
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: marks tests as slow audio/large-model benchmarks")
+
 @pytest.fixture(autouse=True, scope="session")
 def isolate_test_environment(tmp_path_factory):
     """

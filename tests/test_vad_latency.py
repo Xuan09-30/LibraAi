@@ -64,6 +64,9 @@ def run_test(simulate: bool = True):
     print("[PASS] VAD 0.8s boundary latency test verified.")
 
 
+import pytest
+
+@pytest.mark.slow
 def test_suite():
     run_test(simulate=True)
 
