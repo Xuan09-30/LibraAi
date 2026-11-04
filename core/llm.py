@@ -3074,9 +3074,7 @@ class LocalLLM:
             r"\b(?:any\s+fun\s+stuff\s+(?:we\s+can\s+do|to\s+do)|what\s+should\s+we\s+do|bored|entertain\s+me)\b",
             r"\b(?:tell\s+me\s+a\s+joke|can\s+you\s+sing|who\s+are\s+you)\b",
         ]
-        is_chitchat = any(re.search(pat, q_lower) for pat in chitchat_patterns)
-
-        # Real-time intelligence fast-path: news, sports, current events, crypto
+        # Real-time intelligence fast-path: news, sports, current events, crypto (Checked FIRST)
         realtime_signals = [
             "breaking news", "headlines", "latest news", "top news", "news update",
             "nba", "nfl", "mlb", "nhl", "premier league", "champions league", "epl", "f1", "formula 1",
@@ -3091,12 +3089,21 @@ class LocalLLM:
             r"\bwhat\s+(?:happened|occurred)\s+(?:today|tonight|yesterday|this week)\b"
         ]
         has_temporal_news = any(re.search(pat, q_lower) for pat in temporal_news_signals)
+        has_realtime = any(sig in q_lower for sig in realtime_signals) or has_temporal_news
 
-        if is_chitchat:
-            chosen_action = "chat"
-        elif any(sig in q_lower for sig in realtime_signals) or has_temporal_news:
+        # Only treat input as chitchat if it is short (<= 8 words) and has NO real-time signal
+        word_count = len(cleaned_query.split())
+        is_chitchat = (
+            word_count <= 8
+            and not has_realtime
+            and any(re.search(pat, q_lower) for pat in chitchat_patterns)
+        )
+
+        if has_realtime:
             chosen_action = "web_search"
             search_query = cleaned_query
+        elif is_chitchat:
+            chosen_action = "chat"
         else:
             raw_json = self.call_ollama(
                 model=self.models.get("router", "qwen3:8b"),
