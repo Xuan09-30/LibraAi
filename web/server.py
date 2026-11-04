@@ -500,25 +500,47 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     app.state.tailscale_enabled = bool(ts_cfg.get("enabled", False))
     app.state.allow_custom_user_email_header = bool(cfg.get("allow_custom_user_email_header", False))
 
+    app.state.active_tunnel = cfg.get("active_tunnel", "none")
+
     def _resolve_client_ip(request: Optional[Request]) -> str:
         """
-        Round 2 Item E.2:
-        Behind the ngrok/Cloudflare tunnel, rate limiting uses the real client IP
-        (from Cf-Connecting-IP / X-Forwarded-For), but ONLY trusts that header when
-        the TCP connection comes from the local tunnel/proxy (app.state.trusted_proxy_ips),
-        so direct remote clients cannot spoof proxy headers to bypass rate limits.
+        Round 3 Item 2:
+        Behind the ngrok/Cloudflare tunnel, only trust the header belonging to the active tunnel:
+        - ngrok: X-Forwarded-For, taking the last hop from the proxy (ignoring trusted proxies).
+        - Cloudflare: Cf-Connecting-IP.
+        If the request comes from an active tunnel, only the corresponding tunnel header is trusted.
+        Spoofed headers for the other tunnel are rejected/ignored.
         """
         if request is None:
             return "unknown"
         peer_ip = (request.client.host if getattr(request, "client", None) else "") or "unknown"
         trusted_proxies = getattr(app.state, "trusted_proxy_ips", {"127.0.0.1", "::1", "localhost", "testclient"})
-        if peer_ip in trusted_proxies:
+        if peer_ip not in trusted_proxies:
+            return peer_ip
+
+        active_tunnel = getattr(app.state, "active_tunnel", "none")
+        if active_tunnel == "ngrok":
+            xff = (request.headers.get("x-forwarded-for") or "").strip()
+            if xff:
+                hops = [p.strip() for p in xff.split(",") if p.strip()]
+                non_proxy_hops = [h for h in hops if h not in trusted_proxies]
+                return non_proxy_hops[-1] if non_proxy_hops else hops[-1]
+            return peer_ip
+        elif active_tunnel == "cloudflare":
+            cf_ip = (request.headers.get("cf-connecting-ip") or "").strip()
+            if cf_ip:
+                return cf_ip
+            return peer_ip
+        elif active_tunnel in ("all", "auto"):
             cf_ip = (request.headers.get("cf-connecting-ip") or "").strip()
             if cf_ip:
                 return cf_ip
             xff = (request.headers.get("x-forwarded-for") or "").strip()
             if xff:
-                return xff.split(",")[0].strip()
+                hops = [p.strip() for p in xff.split(",") if p.strip()]
+                non_proxy_hops = [h for h in hops if h not in trusted_proxies]
+                return non_proxy_hops[-1] if non_proxy_hops else hops[-1]
+            return peer_ip
         return peer_ip
 
     app.state.resolve_client_ip = _resolve_client_ip

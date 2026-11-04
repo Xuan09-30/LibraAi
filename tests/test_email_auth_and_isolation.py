@@ -725,11 +725,15 @@ class TestEmailAuthAndIsolation(unittest.TestCase):
                 self.client = DummyClient(socket_host)
                 self.headers = headers
 
-        # Trusted proxy socket (127.0.0.1) -> uses X-Forwarded-For real client IP
+        # Trusted proxy socket (127.0.0.1) -> uses tunnel-specific header for active tunnel
+        self.app.state.active_tunnel = "ngrok"
         req_tunnel_a = DummyReq("127.0.0.1", {"x-forwarded-for": "198.51.100.10, 127.0.0.1"})
-        req_tunnel_b = DummyReq("127.0.0.1", {"cf-connecting-ip": "198.51.100.20"})
         self.assertEqual(resolve_ip(req_tunnel_a), "198.51.100.10")
+
+        self.app.state.active_tunnel = "cloudflare"
+        req_tunnel_b = DummyReq("127.0.0.1", {"cf-connecting-ip": "198.51.100.20"})
         self.assertEqual(resolve_ip(req_tunnel_b), "198.51.100.20")
+        self.app.state.active_tunnel = "none"
 
         # Untrusted direct remote socket (e.g. 203.0.113.99) spoofing X-Forwarded-For / Cf-Connecting-IP
         # -> MUST ignore spoofed proxy header and return the real socket IP 203.0.113.99!
@@ -825,6 +829,86 @@ class TestEmailAuthAndIsolation(unittest.TestCase):
             }
         )
         self.assertEqual(res_valid_jwt.status_code, 200, "Valid signed Cf-Access-Jwt-Assertion must authenticate successfully!")
+
+
+    def test_18_round3_item_2_tunnel_specific_client_ip(self):
+        """
+        Round 3 Item 2:
+        _resolve_client_ip: only trust the header belonging to the active tunnel
+        (ngrok: X-Forwarded-For, last hop from the proxy; Cloudflare: Cf-Connecting-IP).
+        Test a spoofed header for the other tunnel.
+        """
+        resolve_ip = getattr(self.app.state, "resolve_client_ip", None)
+        self.assertTrue(callable(resolve_ip))
+
+        class DummyClient:
+            def __init__(self, host):
+                self.host = host
+
+        class DummyReq:
+            def __init__(self, socket_host, headers):
+                self.client = DummyClient(socket_host)
+                self.headers = headers
+
+        # Case A: Active tunnel is "ngrok"
+        self.app.state.active_tunnel = "ngrok"
+
+        # A1: Request has both ngrok X-Forwarded-For and spoofed Cf-Connecting-IP
+        req_ngrok_with_spoofed_cf = DummyReq(
+            "127.0.0.1",
+            {
+                "x-forwarded-for": "1.2.3.4, 203.0.113.10",
+                "cf-connecting-ip": "198.51.100.99"
+            }
+        )
+        # Must resolve to the last hop of X-Forwarded-For (203.0.113.10), ignoring cf-connecting-ip!
+        self.assertEqual(
+            resolve_ip(req_ngrok_with_spoofed_cf),
+            "203.0.113.10",
+            "Under ngrok tunnel, resolve_ip must use X-Forwarded-For last hop and ignore spoofed Cf-Connecting-IP!"
+        )
+
+        # A2: Request on ngrok tunnel with only spoofed Cf-Connecting-IP (no XFF) -> must return socket peer IP
+        req_ngrok_only_spoofed_cf = DummyReq(
+            "127.0.0.1",
+            {"cf-connecting-ip": "198.51.100.99"}
+        )
+        self.assertEqual(
+            resolve_ip(req_ngrok_only_spoofed_cf),
+            "127.0.0.1",
+            "Under ngrok tunnel, spoofed Cf-Connecting-IP without XFF must be ignored and fallback to socket peer IP!"
+        )
+
+        # Case B: Active tunnel is "cloudflare"
+        self.app.state.active_tunnel = "cloudflare"
+
+        # B1: Request has valid Cf-Connecting-IP and spoofed X-Forwarded-For
+        req_cf_with_spoofed_xff = DummyReq(
+            "127.0.0.1",
+            {
+                "cf-connecting-ip": "198.51.100.25",
+                "x-forwarded-for": "10.0.0.99, 10.0.0.1"
+            }
+        )
+        self.assertEqual(
+            resolve_ip(req_cf_with_spoofed_xff),
+            "198.51.100.25",
+            "Under cloudflare tunnel, resolve_ip must use Cf-Connecting-IP and ignore spoofed X-Forwarded-For!"
+        )
+
+        # B2: Request on Cloudflare tunnel with only spoofed XFF (no Cf-Connecting-IP) -> must return socket peer IP
+        req_cf_only_spoofed_xff = DummyReq(
+            "127.0.0.1",
+            {"x-forwarded-for": "10.0.0.99"}
+        )
+        self.assertEqual(
+            resolve_ip(req_cf_only_spoofed_xff),
+            "127.0.0.1",
+            "Under cloudflare tunnel, spoofed X-Forwarded-For without Cf-Connecting-IP must be ignored and fallback to socket peer IP!"
+        )
+
+        # Restore default active_tunnel
+        self.app.state.active_tunnel = "none"
 
 if __name__ == "__main__":
     unittest.main()
