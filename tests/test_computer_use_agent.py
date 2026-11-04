@@ -432,7 +432,10 @@ def test_round2_item_c_concrete_post_condition_verification(tmp_path, monkeypatc
     #         -> must NOT get saved to the vault or memory!
     vault_example = os.path.join(PROJECT_ROOT, "assets", "vault", "learned_workflow_example_com.md")
     if os.path.exists(vault_example):
-        os.remove(vault_example)
+        try:
+            os.remove(vault_example)
+        except PermissionError:
+            pass
 
     mem2 = DummyMem()
     agent2 = AutonomousComputerUseAgent(
@@ -472,4 +475,7 @@ def test_round2_item_c_concrete_post_condition_verification(tmp_path, monkeypatc
     assert res_verified["learned_workflow_saved"] is True
     assert mem3.saved == 2
     assert os.path.exists(vault_example)
-    os.remove(vault_example)
+    try:
+        os.remove(vault_example)
+    except PermissionError:
+        pass

@@ -574,7 +574,7 @@ class SupervisorHub:
         sub_steps = self.split_compound_intent(prompt)
 
         # PREACT DETERMINISTIC ACTION MACRO FAST-PATH (<5ms)
-        _DYNAMIC_NO_MACRO_ACTIONS = {"chat", "clarify", "error", "active_window", "weather", "world_time", "time", "run_learned_skill", "lookup_entity", "web_search", "deep_research", "computer_use_agent", "daily_briefing"}
+        _DYNAMIC_NO_MACRO_ACTIONS = {"chat", "clarify", "error", "active_window", "weather", "world_time", "time", "run_learned_skill", "lookup_entity", "web_search", "deep_research", "computer_use_agent", "daily_briefing", "remember_fact", "forget_memory", "recall_memory", "document_rag"}
         if len(sub_steps) == 1 and hasattr(self.llm, "memory") and hasattr(self.llm.memory, "get_action_macro"):
             cached_macro = self.llm.memory.get_action_macro(scoped_trigger) or self.llm.memory.get_action_macro(intent_signature)
             if cached_macro is None and client_scope == "local_desktop":
