@@ -38,7 +38,11 @@ def test_parse_navigation_goal():
 
 def test_popup_guard_and_step_execution():
     agent = AutonomousComputerUseAgent(gui_control=None, spatial=None)
-    res = agent.execute_task("Open my chrome and then cinejoy.pk, find and search hannibal and click resume", dry_run=True)
+    res = agent.execute_task(
+        "Open my chrome and then cinejoy.pk, find and search hannibal and click resume",
+        dry_run=True,
+        post_condition={"expected_screen_text": "hannibal", "simulated_state": {"screen_text": "Hannibal - Now Playing"}}
+    )
 
     assert res["status"] == "success"
     assert res["action"] == "computer_use_agent"
@@ -96,7 +100,12 @@ def test_loop_execution_and_memory_persistence():
         streamed_steps.append(s)
 
     prompt = "Open my chrome and then cinejoy.pk, find and search hannibal and click resume"
-    res = agent.execute_task(prompt, dry_run=True, step_callback=callback)
+    res = agent.execute_task(
+        prompt,
+        dry_run=True,
+        step_callback=callback,
+        post_condition={"expected_screen_text": "hannibal", "simulated_state": {"screen_text": "Hannibal - Now Playing"}}
+    )
 
     assert res["status"] == "success"
     assert res["learned_workflow_saved"] is True
@@ -350,6 +359,117 @@ def test_round2_item_b_risky_action_gates():
     # 3. Normal safe workflow on an allowlisted domain still runs
     res_safe = agent.execute_task(
         "Open my chrome and then cinejoy.pk, find and search hannibal and click resume",
-        dry_run=True
+        dry_run=True,
+        post_condition={"expected_screen_text": "hannibal", "simulated_state": {"screen_text": "Hannibal - Now Playing"}}
     )
     assert res_safe["status"] == "success"
+
+
+def test_round2_item_c_concrete_post_condition_verification(tmp_path, monkeypatch):
+    """
+    Round 2 Item C:
+    1. _verify_end_state must check a concrete post-condition per workflow
+       (expected window title, URL, or on-screen text defined with the workflow),
+       not just "an action succeeded and failures == 0".
+    2. If a workflow has no post-condition defined, do not cache it as verified;
+       mark it "unverified".
+    3. Done when: a test where the actions succeed but the end state is wrong
+       does NOT get saved to the vault.
+    """
+    class AllActionsSucceedGUI:
+        def focus_window_by_title(self, title):
+            return True
+        def hotkey(self, *keys, dry_run=False):
+            return {"status": "success", "verified_change": True}
+        def press_key(self, key, dry_run=False):
+            return {"status": "success", "verified_change": True}
+        def type_text(self, text, interval=0.01, dry_run=False):
+            return {"status": "success", "verified_change": True}
+        def click(self, x=None, y=None, button="left", clicks=1, dry_run=False):
+            return {"status": "success", "verified_change": True}
+
+    class MockSpatialWrongEndState:
+        def extract_screen_text_ocr(self):
+            return [{"text": "404 Page Not Found - Error Loading Media", "center_x": 500, "center_y": 500}]
+        def detect_ui_elements(self, active_window_only=True):
+            return [{"name": "Google Chrome - 404 Error", "center_x": 500, "center_y": 50}]
+
+    class MockSpatialMatchingEndState:
+        def extract_screen_text_ocr(self):
+            return [{"text": "Hannibal Season 1 - Now Playing Resume", "center_x": 500, "center_y": 500}]
+        def detect_ui_elements(self, active_window_only=True):
+            return [{"name": "Hannibal - Cinejoy - Google Chrome", "center_x": 500, "center_y": 50}]
+
+    class DummyMem:
+        def __init__(self):
+            self.saved = 0
+        def record_correction(self, *a, **kw):
+            self.saved += 1
+        def record_action_macro(self, *a, **kw):
+            self.saved += 1
+
+    gov = get_vram_governor()
+    monkeypatch.setattr(gov, "is_gaming_lite_mode", lambda: False)
+
+    # Case 1: Workflow has NO post-condition defined -> must be marked "unverified" and NOT saved
+    mem1 = DummyMem()
+    agent1 = AutonomousComputerUseAgent(
+        gui_control=AllActionsSucceedGUI(),
+        spatial=MockSpatialMatchingEndState(),
+        memory=mem1
+    )
+    res_no_post = agent1.execute_task(
+        "Open my chrome and then example.com, find and search hannibal and click resume",
+        dry_run=False,
+        post_condition=None
+    )
+    assert res_no_post["status"] == "unverified"
+    assert res_no_post["learned_workflow_saved"] is False
+    assert mem1.saved == 0
+
+    # Case 2: Workflow has a concrete post-condition, all actions succeed (failures == 0),
+    #         but the actual end state (window title / URL / on-screen text) is WRONG
+    #         -> must NOT get saved to the vault or memory!
+    vault_example = os.path.join(PROJECT_ROOT, "assets", "vault", "learned_workflow_example_com.md")
+    if os.path.exists(vault_example):
+        os.remove(vault_example)
+
+    mem2 = DummyMem()
+    agent2 = AutonomousComputerUseAgent(
+        gui_control=AllActionsSucceedGUI(),
+        spatial=MockSpatialWrongEndState(),
+        memory=mem2
+    )
+    res_wrong_state = agent2.execute_task(
+        "Open my chrome and then example.com, find and search hannibal and click resume",
+        dry_run=False,
+        post_condition={
+            "expected_title": "Hannibal - Cinejoy",
+            "expected_screen_text": "Now Playing",
+            "expected_url": "example.com/watch/hannibal"
+        }
+    )
+    assert res_wrong_state["status"] == "unverified"
+    assert res_wrong_state["learned_workflow_saved"] is False
+    assert mem2.saved == 0
+    assert not os.path.exists(vault_example), "Wrong end state must NOT be saved to the vault!"
+
+    # Case 3: Workflow has a concrete post-condition AND actual end state matches -> verified & saved!
+    mem3 = DummyMem()
+    agent3 = AutonomousComputerUseAgent(
+        gui_control=AllActionsSucceedGUI(),
+        spatial=MockSpatialMatchingEndState(),
+        memory=mem3
+    )
+    res_verified = agent3.execute_task(
+        "Open my chrome and then example.com, find and search hannibal and click resume",
+        dry_run=False,
+        post_condition={
+            "expected_screen_text": "Now Playing"
+        }
+    )
+    assert res_verified["status"] == "success"
+    assert res_verified["learned_workflow_saved"] is True
+    assert mem3.saved == 2
+    assert os.path.exists(vault_example)
+    os.remove(vault_example)

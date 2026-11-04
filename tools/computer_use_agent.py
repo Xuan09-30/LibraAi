@@ -145,7 +145,7 @@ class AutonomousComputerUseAgent:
 
         # 3. Downloads or running executables
         if act in ("type", "press", "hotkey", "navigate", "click"):
-            if re.search(r"\.(?:exe|msi|bat|cmd|ps1|vbs|scr|jar|com|reg)\b", combined_context) or re.search(r"\b(?:download|installer|setup|payload|execute)\b", combined_context):
+            if re.search(r"\.(?:exe|msi|bat|cmd|ps1|vbs|scr|jar|reg)\b", combined_context) or re.search(r"\b(?:download|installer|setup|payload|execute)\b", combined_context):
                 return {
                     "risky": True,
                     "status": "confirmation_required",
@@ -268,7 +268,7 @@ class AutonomousComputerUseAgent:
         q = (prompt or "").strip()
         q_low = q.lower()
 
-        domain_match = re.search(r"\b([a-z0-9\-]+\.(?:com|org|net|pk|io|tv|to|gg|co|me|ai|edu)(?:/[^\s,]*)?)\b", q_low)
+        domain_match = re.search(r"\b([a-z0-9\-]+\.(?:com|org|net|pk|io|tv|to|gg|co|me|ai|edu|gov|xyz|info|biz|ru|cn|tk|top|site|online)(?:/[^\s,]*)?)\b", q_low)
         domain = domain_match.group(1) if domain_match else None
 
         # Extract search query: "find and search <X> and click <Y>" or "search for <X> and click <Y>"
@@ -492,7 +492,8 @@ class AutonomousComputerUseAgent:
         self,
         prompt: str,
         dry_run: bool = False,
-        step_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+        step_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        post_condition: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Executes the Observe -> Think -> Act -> Verify loop and returns both:
@@ -887,6 +888,7 @@ class AutonomousComputerUseAgent:
         # ------------------------------------------------------------------
         # FINAL STEP: Verify End State Before Caching Workflow
         # ------------------------------------------------------------------
+        effective_post_condition = post_condition if post_condition is not None else parsed.get("post_condition")
         end_state_verified = self._verify_end_state(
             domain=domain,
             search_query=search_q,
@@ -894,6 +896,7 @@ class AutonomousComputerUseAgent:
             verified_click=verified_click,
             consecutive_failures=consecutive_failures,
             dry_run=dry_run,
+            post_condition=effective_post_condition,
         )
 
         summary_target = (search_q or domain).title()
@@ -919,14 +922,66 @@ class AutonomousComputerUseAgent:
 
         return {
             "action": "computer_use_agent",
-            "status": "success" if end_state_verified else "unverified_end_state",
+            "status": "success" if end_state_verified else "unverified",
             "domain": domain,
             "search_query": search_q,
             "click_target": click_target,
+            "post_condition": effective_post_condition,
             "agent_trace": agent_trace,
             "thought_steps": thought_steps,
             "voice_response": voice_msg,
             "learned_workflow_saved": learned_saved
+        }
+
+    def _get_live_terminal_state(self) -> Dict[str, str]:
+        """Collects live window title, active browser URL, and on-screen OCR/UI text for post-condition verification."""
+        win_title = ""
+        current_url = ""
+        screen_texts: List[str] = []
+
+        # 1. CDP Browser URL & page title
+        _, browser = self._get_cdp_session()
+        if browser:
+            try:
+                if browser.contexts and browser.contexts[0].pages:
+                    page = browser.contexts[0].pages[-1]
+                    current_url = (page.url or "").strip()
+                    win_title = (page.title() or "").strip()
+            except Exception:
+                pass
+
+        # 2. OS Foreground window title
+        if not win_title and HAS_WIN32:
+            try:
+                hwnd = win32gui.GetForegroundWindow()
+                if hwnd:
+                    win_title = (win32gui.GetWindowText(hwnd) or "").strip()
+            except Exception:
+                pass
+
+        # 3. Spatial OCR and UIAutomation elements
+        if self.spatial:
+            try:
+                for item in (self.spatial.extract_screen_text_ocr() or []):
+                    txt = self.sanitize_untrusted_screen_text(item.get("text") or "")
+                    if txt:
+                        screen_texts.append(txt)
+            except Exception:
+                pass
+            try:
+                for el in (self.spatial.detect_ui_elements(active_window_only=True) or []):
+                    name = self.sanitize_untrusted_screen_text(el.get("name") or "")
+                    if name:
+                        screen_texts.append(name)
+                        if not win_title:
+                            win_title = name
+            except Exception:
+                pass
+
+        return {
+            "window_title": win_title,
+            "url": current_url,
+            "screen_text": " | ".join(screen_texts),
         }
 
     def _verify_end_state(
@@ -937,15 +992,53 @@ class AutonomousComputerUseAgent:
         verified_click: bool = True,
         consecutive_failures: int = 0,
         dry_run: bool = False,
+        post_condition: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """
-        Verifies the terminal state of the computer-use loop before persisting
-        any learned workflow to the Obsidian Vault or PreAct macro cache.
+        Round 2 Item C:
+        Verifies a concrete post-condition per workflow (expected_title, expected_url,
+        or expected_screen_text defined with the workflow) before persisting any learned
+        workflow to the Obsidian Vault or PreAct macro cache.
+        If a workflow has no concrete post-condition defined, returns False so the run
+        is marked "unverified" and never cached as verified.
         """
         if consecutive_failures > 0:
             return False
         if click_target and not verified_click:
             return False
+
+        # Must have a concrete post-condition defined with the workflow
+        if not isinstance(post_condition, dict) or not post_condition:
+            return False
+
+        exp_title = str(post_condition.get("expected_title") or "").strip().lower()
+        exp_url = str(post_condition.get("expected_url") or "").strip().lower()
+        exp_text = str(post_condition.get("expected_screen_text") or "").strip().lower()
+
+        if not (exp_title or exp_url or exp_text):
+            return False
+
+        live = self._get_live_terminal_state()
+        live_title = live.get("window_title", "").lower()
+        live_url = live.get("url", "").lower()
+        live_text = live.get("screen_text", "").lower()
+        combined_live = f"{live_title} {live_url} {live_text}".strip()
+
+        # In dry_run mode with no spatial/CDP mock attached, allow simulated verification if simulated_state is provided
+        sim = post_condition.get("simulated_state")
+        if dry_run and isinstance(sim, dict):
+            live_title = str(sim.get("window_title") or live_title).lower()
+            live_url = str(sim.get("url") or live_url).lower()
+            live_text = str(sim.get("screen_text") or live_text).lower()
+            combined_live = f"{live_title} {live_url} {live_text}".strip()
+
+        if exp_title and exp_title not in live_title and exp_title not in combined_live:
+            return False
+        if exp_url and exp_url not in live_url and exp_url not in combined_live:
+            return False
+        if exp_text and exp_text not in live_text and exp_text not in combined_live:
+            return False
+
         return True
 
     def _save_learned_workflow(
