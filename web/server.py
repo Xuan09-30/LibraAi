@@ -830,7 +830,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
     # -----------------------------------------------------------------------
 
-    upload_dir = os.path.join(PROJECT_ROOT, "assets", "uploads")
+    upload_dir = os.environ.get("LIBRA_UPLOADS_DIR") or os.path.join(PROJECT_ROOT, "assets", "uploads")
 
     os.makedirs(upload_dir, exist_ok=True)
 

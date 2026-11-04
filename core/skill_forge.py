@@ -78,8 +78,13 @@ class SkillForge:
     Discovers, validates, executes, and self-repairs modular skills stored in skills/<skill_slug>/.
     """
 
-    def __init__(self, skills_dir: str = "skills"):
-        self.skills_dir = os.path.join(PROJECT_ROOT, skills_dir)
+    def __init__(self, skills_dir: Optional[str] = None):
+        if skills_dir is None:
+            skills_dir = os.environ.get("LIBRA_SKILLS_DIR") or "skills"
+        if os.path.isabs(skills_dir):
+            self.skills_dir = skills_dir
+        else:
+            self.skills_dir = os.path.join(PROJECT_ROOT, skills_dir)
         os.makedirs(self.skills_dir, exist_ok=True)
         self.registry: Dict[str, Dict[str, Any]] = {}
         self.refresh_registry()

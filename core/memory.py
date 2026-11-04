@@ -103,7 +103,18 @@ class SemanticMemory:
         self.dim = dim
 
         override_vault = os.environ.get("LIBRA_VAULT_DIR")
-        self.vault_dir = vault_dir or override_vault or os.path.join(project_root if db_filename != ":memory:" else ".", "assets", "vault")
+        override_vault = os.environ.get("LIBRA_VAULT_DIR")
+        if not vault_dir and not override_vault:
+            if self.db_path and self.db_path != ":memory:":
+                db_dir = os.path.dirname(os.path.abspath(self.db_path))
+                if "tmp" in db_dir.lower() or "temp" in db_dir.lower() or "pytest" in db_dir.lower():
+                    self.vault_dir = os.path.join(db_dir, "vault")
+                else:
+                    self.vault_dir = os.path.join(project_root, "assets", "vault")
+            else:
+                self.vault_dir = os.path.join(project_root if db_filename != ":memory:" else ".", "assets", "vault")
+        else:
+            self.vault_dir = vault_dir or override_vault
 
         os.makedirs(self.vault_dir, exist_ok=True)
 
@@ -1421,7 +1432,7 @@ class SemanticMemory:
         exp_iso = (now_dt + timedelta(days=int(ttl_days))).isoformat() if ttl_days is not None else None
 
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        lessons_md_path = os.path.join(project_root, "assets", "LESSONS.md")
+        lessons_md_path = os.environ.get("LIBRA_LESSONS_PATH") or os.path.join(project_root, "assets", "LESSONS.md")
         os.makedirs(os.path.dirname(lessons_md_path), exist_ok=True)
         if not os.path.isfile(lessons_md_path):
             with open(lessons_md_path, "w", encoding="utf-8") as f:

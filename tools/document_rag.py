@@ -525,7 +525,8 @@ class DocumentRAGEngine:
     def _sanitize_user_upload_dir(user_email: str) -> str:
         clean = (user_email or "anonymous").strip().lower()
         safe_slug = re.sub(r"[^a-z0-9._@-]", "_", clean) or "anonymous"
-        return os.path.abspath(os.path.join(PROJECT_ROOT, "assets", "uploads", safe_slug))
+        base_uploads = os.environ.get("LIBRA_UPLOADS_DIR") or os.path.join(PROJECT_ROOT, "assets", "uploads")
+        return os.path.abspath(os.path.join(base_uploads, safe_slug))
 
     def query_document(
         self,
