@@ -92,5 +92,55 @@ class TestAuditToolsRound3(unittest.TestCase):
             self.assertEqual(res.get("action"), "sandboxed_blocked")
 
 
+
+    def test_05_docker_hard_timeout_output_cap_and_no_privileges(self):
+        """
+        Round 3 Item 5:
+        Docker: add a hard timeout (30s) and an output size cap (64KB).
+        Confirm no --privileged flag and no docker.sock mount.
+        """
+        from tools.repl_runner import PersistentDataREPL as PythonREPLRunner
+        from core.skill_forge import SkillForge
+        from unittest.mock import patch
+
+        repl = PythonREPLRunner()
+        forge = SkillForge()
+
+        # 1. Confirm no --privileged flag and no docker.sock mount
+        repl_cmd = repl.build_docker_sandbox_command("print('test')")
+        forge_cmd = forge.build_docker_sandbox_command("print('test')")
+
+        for name, cmd in [("repl", repl_cmd), ("forge", forge_cmd)]:
+            cmd_str = " ".join(cmd)
+            self.assertNotIn("--privileged", cmd, f"{name} command must NOT contain --privileged!")
+            self.assertNotIn("docker.sock", cmd_str, f"{name} command must NOT mount docker.sock!")
+
+        # 2. Hard timeout cap (30s max)
+        with patch("subprocess.run") as mock_subproc:
+            class DummyProc:
+                returncode = 0
+                stdout = "ok"
+                stderr = ""
+            mock_subproc.return_value = DummyProc()
+
+            # Pass timeout_sec=120 -> must be capped to 30.0s
+            repl.run_in_docker_sandbox("print('hello')", timeout_sec=120.0, _force_docker_unavailable=False)
+            self.assertTrue(mock_subproc.called)
+            called_timeout = mock_subproc.call_args[1].get("timeout")
+            self.assertLessEqual(called_timeout, 30.0, "Docker execution timeout must be hard-capped at 30s!")
+
+        # 3. Output size cap (64KB)
+        huge_stdout = "A" * (70 * 1024)  # 70KB output
+        with patch("subprocess.run") as mock_subproc:
+            class DummyHugeProc:
+                returncode = 0
+                stdout = huge_stdout
+                stderr = ""
+            mock_subproc.return_value = DummyHugeProc()
+
+            res = repl.run_in_docker_sandbox("print('huge')", timeout_sec=10.0, _force_docker_unavailable=False)
+            self.assertIn("TRUNCATED", res["stdout"], "Output exceeding 64KB must be capped and truncated!")
+            self.assertLessEqual(len(res["stdout"]), 66000, "Truncated output length must be within bound!")
+
 if __name__ == "__main__":
     unittest.main()

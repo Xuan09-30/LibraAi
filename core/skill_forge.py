@@ -198,7 +198,7 @@ class SkillForge:
           --pids-limit 128, --user 65534:65534, --read-only, --tmpfs /tmp:rw,noexec,nosuid,size=64m
         and zero writable host volume mounts.
         """
-        return [
+        cmd = [
             "docker", "run", "--rm",
             "--network", "none",
             "--cap-drop", "ALL",
@@ -213,6 +213,9 @@ class SkillForge:
             "-i", image,
             "python", "-c", code
         ]
+        assert "--privileged" not in cmd, "Docker sandbox cannot use --privileged"
+        assert not any("docker.sock" in str(a) for a in cmd), "Docker sandbox cannot mount docker.sock"
+        return cmd
 
     def execute_in_docker_sandbox(self, code: str, timeout_sec: float = 5.0, _force_docker_unavailable: bool = False) -> Dict[str, Any]:
         """
@@ -228,13 +231,21 @@ class SkillForge:
                 "voice_response": "Cannot execute generated skill code: Docker sandbox is offline."
             }
         cmd = self.build_docker_sandbox_command(code)
+        hard_timeout = min(float(timeout_sec), 30.0)
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=hard_timeout)
+            stdout_text = (proc.stdout or "").strip()
+            stderr_text = (proc.stderr or "").strip()
+            MAX_OUT = 65536
+            if len(stdout_text) > MAX_OUT:
+                stdout_text = stdout_text[:MAX_OUT] + "\n... [TRUNCATED: Output exceeded 64KB cap]"
+            if len(stderr_text) > MAX_OUT:
+                stderr_text = stderr_text[:MAX_OUT] + "\n... [TRUNCATED: Output exceeded 64KB cap]"
             return {
                 "status": "success" if proc.returncode == 0 else "error",
-                "stdout": (proc.stdout or "").strip(),
-                "stderr": (proc.stderr or "").strip(),
-                "error": (proc.stderr or "").strip() if proc.returncode != 0 else None,
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+                "error": stderr_text if proc.returncode != 0 else None,
                 "sandboxed": "docker"
             }
         except Exception as exc:

@@ -130,7 +130,7 @@ class PersistentDataREPL:
           --pids-limit 128, --user 65534:65534, --read-only, --tmpfs /tmp:rw,noexec,nosuid,size=64m
         and zero writable host volume mounts.
         """
-        return [
+        cmd = [
             "docker", "run", "--rm",
             "--network", "none",
             "--cap-drop", "ALL",
@@ -146,6 +146,10 @@ class PersistentDataREPL:
             "-i", image,
             "python", "-c", code
         ]
+        # Round 3 Item 5: verify no privileged mode and no docker.sock mount
+        assert "--privileged" not in cmd, "Docker sandbox cannot use --privileged"
+        assert not any("docker.sock" in str(a) for a in cmd), "Docker sandbox cannot mount docker.sock"
+        return cmd
 
     @staticmethod
     def _run_simulated_container_guard(code: str, timeout_sec: float = 12.0) -> Dict[str, Any]:
@@ -241,15 +245,25 @@ exec(compile({repr(code)}, "<sandbox>", "exec"), {{"__name__": "__main__"}})
                 "variables": {}
             }
         cmd = self.build_docker_sandbox_command(code)
+        # Round 3 Item 5: Hard timeout cap (30s) and output size cap (64KB)
+        hard_timeout = min(float(timeout_sec), 30.0)
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=hard_timeout)
             duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            stdout_text = (proc.stdout or "").strip()
+            stderr_text = (proc.stderr or "").strip()
+            MAX_OUT = 65536
+            if len(stdout_text) > MAX_OUT:
+                stdout_text = stdout_text[:MAX_OUT] + "\n... [TRUNCATED: Output exceeded 64KB cap]"
+            if len(stderr_text) > MAX_OUT:
+                stderr_text = stderr_text[:MAX_OUT] + "\n... [TRUNCATED: Output exceeded 64KB cap]"
+
             return {
                 "status": "success" if proc.returncode == 0 else "error",
-                "stdout": (proc.stdout or "").strip(),
-                "stderr": (proc.stderr or "").strip(),
+                "stdout": stdout_text,
+                "stderr": stderr_text,
                 "result": None,
-                "error": (proc.stderr or "").strip() if proc.returncode != 0 else None,
+                "error": stderr_text if proc.returncode != 0 else None,
                 "duration_ms": duration_ms,
                 "elapsed_sec": round(duration_ms / 1000.0, 4),
                 "dataframes": {},
