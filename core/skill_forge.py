@@ -190,10 +190,35 @@ class SkillForge:
         except Exception:
             return False
 
+    @staticmethod
+    def build_docker_sandbox_command(code: str, image: str = "python:3.11-slim") -> List[str]:
+        """
+        Builds the hardened `docker run` command with:
+          --network none, --cap-drop ALL, --security-opt no-new-privileges,
+          --pids-limit 128, --user 65534:65534, --read-only, --tmpfs /tmp:rw,noexec,nosuid,size=64m
+        and zero writable host volume mounts.
+        """
+        return [
+            "docker", "run", "--rm",
+            "--network", "none",
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--memory", "256m",
+            "--cpus", "1",
+            "--pids-limit", "128",
+            "--user", "65534:65534",
+            "--read-only",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+            "-e", "HOME=/tmp",
+            "-i", image,
+            "python", "-c", code
+        ]
+
     def execute_in_docker_sandbox(self, code: str, timeout_sec: float = 5.0, _force_docker_unavailable: bool = False) -> Dict[str, Any]:
         """
         Executes generated skill Python code inside an isolated Docker sandbox container
-        with --network none, --read-only, and memory/CPU caps.
+        with --network none, --cap-drop ALL, --security-opt no-new-privileges, --pids-limit 128,
+        --user 65534:65534, --read-only, and --tmpfs /tmp.
         """
         import subprocess
         if not self.is_docker_sandbox_available(_force_unavailable=_force_docker_unavailable):
@@ -202,16 +227,7 @@ class SkillForge:
                 "error": "Docker sandbox is required for untrusted generated skill code, but the Docker daemon is unavailable.",
                 "voice_response": "Cannot execute generated skill code: Docker sandbox is offline."
             }
-        cmd = [
-            "docker", "run", "--rm",
-            "--network", "none",
-            "--memory", "256m",
-            "--cpus", "1",
-            "--pids-limit", "64",
-            "--read-only",
-            "-i", "python:3.11-slim",
-            "python", "-c", code
-        ]
+        cmd = self.build_docker_sandbox_command(code)
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
             return {

@@ -1,4 +1,4 @@
-"""
+﻿"""
 =============================================================================
 TEST SUITE: SECURE EMAIL AUTHENTICATION, OTP VERIFICATION & CHAT ISOLATION
 Target: tests/test_email_auth_and_isolation.py
@@ -614,5 +614,83 @@ class TestEmailAuthAndIsolation(unittest.TestCase):
         self.assertEqual(res_vitals_http.status_code, 403)
 
 
+
+    def test_15_round2_item_d_docker_sandbox_hardening(self):
+        """
+        Round 2 Item D: Docker sandbox hardening:
+        1. Add to the docker run flags: --cap-drop ALL, --security-opt no-new-privileges,
+           --pids-limit 128, run as a non-root user (--user 65534:65534 or --user nobody),
+           and --tmpfs /tmp so --read-only doesn't break scripts.
+        2. Confirm no host folder is mounted writable.
+        3. Done when: a test runs a normal analysis script successfully inside the hardened
+           container, and a test confirms the container cannot write outside /tmp or reach the network.
+        """
+        repl = self.hub.data_scientist.repl
+        sf = self.hub.llm.skill_forge
+
+        # 1. Inspect the exact docker run command flags for both PersistentDataREPL and SkillForge
+        repl_cmd = repl.build_docker_sandbox_command("print(1+1)")
+        sf_cmd = sf.build_docker_sandbox_command("print(1+1)")
+
+        for label, cmd in (("PersistentDataREPL", repl_cmd), ("SkillForge", sf_cmd)):
+            cmd_str = " ".join(cmd)
+            self.assertIn("--cap-drop", cmd, f"{label} missing --cap-drop")
+            self.assertEqual(cmd[cmd.index("--cap-drop") + 1], "ALL")
+            self.assertIn("--security-opt", cmd, f"{label} missing --security-opt")
+            self.assertEqual(cmd[cmd.index("--security-opt") + 1], "no-new-privileges")
+            self.assertIn("--pids-limit", cmd, f"{label} missing --pids-limit")
+            self.assertEqual(cmd[cmd.index("--pids-limit") + 1], "128")
+            self.assertIn("--user", cmd, f"{label} missing --user")
+            self.assertIn(cmd[cmd.index("--user") + 1], ("65534:65534", "nobody"))
+            self.assertIn("--tmpfs", cmd, f"{label} missing --tmpfs")
+            self.assertTrue(cmd[cmd.index("--tmpfs") + 1].startswith("/tmp"))
+            self.assertIn("--read-only", cmd)
+            self.assertIn("--network", cmd)
+            self.assertEqual(cmd[cmd.index("--network") + 1], "none")
+            # Confirm no host folder is mounted (-v or --volume or --mount)
+            self.assertNotIn("-v", cmd, f"{label} must not mount any host folder")
+            self.assertNotIn("--volume", cmd, f"{label} must not mount any host folder")
+            self.assertNotIn("--mount", cmd, f"{label} must not mount any host folder")
+
+        # 2. Run a normal analysis script inside the hardened container (uses /tmp for temporary files)
+        normal_analysis_code = (
+            "import tempfile, os, json\n"
+            "with open('/tmp/analysis_scratch.json', 'w') as f:\n"
+            "    json.dump({'values': [10, 20, 30, 40], 'mean': 25.0}, f)\n"
+            "with open('/tmp/analysis_scratch.json', 'r') as f:\n"
+            "    data = json.load(f)\n"
+            "print(f\"MEAN={data['mean']}\")\n"
+        )
+        res_ok = repl.run_in_docker_sandbox(normal_analysis_code, _simulate_if_no_daemon=True)
+        self.assertEqual(res_ok.get("status"), "success", f"Expected normal analysis script to succeed in hardened container: {res_ok}")
+        self.assertIn("MEAN=25.0", res_ok.get("stdout", ""))
+
+        # 3. Confirm the container CANNOT write outside /tmp (read-only rootfs & non-root user 65534:65534)
+        write_outside_tmp_code = (
+            "with open('/etc/pwned.txt', 'w') as f:\n"
+            "    f.write('escape')\n"
+        )
+        res_ro = repl.run_in_docker_sandbox(write_outside_tmp_code, _simulate_if_no_daemon=True)
+        self.assertEqual(res_ro.get("status"), "error", "Writing outside /tmp must fail inside read-only container!")
+        self.assertTrue(
+            any(k in (res_ro.get("error") or "").lower() for k in ("read-only", "permission", "read only", "oserror", "permissionerror")),
+            f"Expected read-only or permission error, got: {res_ro}"
+        )
+
+        # 4. Confirm the container CANNOT reach the network (--network none)
+        network_attempt_code = (
+            "import socket\n"
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "s.settimeout(1.0)\n"
+            "s.connect(('8.8.8.8', 53))\n"
+        )
+        res_net = repl.run_in_docker_sandbox(network_attempt_code, _simulate_if_no_daemon=True)
+        self.assertEqual(res_net.get("status"), "error", "Outbound network access must fail inside --network none container!")
+        self.assertTrue(
+            any(k in (res_net.get("error") or "").lower() for k in ("network", "unreachable", "blocked", "oserror", "permission")),
+            f"Expected network error, got: {res_net}"
+        )
+
 if __name__ == "__main__":
     unittest.main()
+

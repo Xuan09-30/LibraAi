@@ -1,0 +1,21 @@
+# Project Libra Hardened Data-Science & Skill Sandbox Image (Round 2 Item D.3)
+# NOTE: python:3.11-slim does not include numpy, pandas, matplotlib, seaborn, or scikit-learn by default.
+# Build once on the host with:
+#   docker build -f Dockerfile.sandbox -t libra-sandbox:3.11 .
+# Container runs at runtime with --network none, --read-only, --tmpfs /tmp, --cap-drop ALL,
+# --security-opt no-new-privileges, --pids-limit 128, and --user 65534:65534 (nobody).
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    MPLCONFIGDIR=/tmp/matplotlib
+
+RUN pip install --no-cache-dir \
+    numpy \
+    pandas \
+    matplotlib \
+    seaborn \
+    scikit-learn
+
+USER 65534:65534
+WORKDIR /tmp
