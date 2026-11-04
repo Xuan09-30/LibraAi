@@ -192,7 +192,7 @@ class TestWebSessionsAndTokens(unittest.TestCase):
 
     def test_07_fast_path_saved_tokens_telemetry(self):
         """Test fast-path queries report 0 input/output tokens and 350 saved tokens."""
-        res = self.hub.process_command("check system vitals", client_scope="remote_web", dry_run=True)
+        res = self.hub.process_command("check system vitals", client_scope="remote_host", dry_run=True)
         metrics = res.get("token_metrics", {})
         self.assertTrue(metrics.get("fast_path"))
         self.assertEqual(metrics.get("input_tokens"), 0)

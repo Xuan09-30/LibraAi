@@ -862,27 +862,50 @@ class SemanticMemory:
         user_email: str = "",
         role: str = "host"
     ) -> int:
-        """Stores fact in `facts` (isolated by `user_email`) and embedding in `vec_facts`. Returns inserted fact id."""
+        """Stores fact in `facts` (isolated by `user_email` and `user:<email>:*` namespace) and embedding in `vec_facts`."""
         clean_fact = fact.strip()
         if not clean_fact:
             return -1
 
         clean_email = (user_email or "").strip().lower()
+        clean_role = (role or "host").strip().lower()
+        is_host_user = (clean_role == "host") and (not clean_email or clean_email in ("REDACTED", "REDACTED"))
+        if not is_host_user:
+            ns_email = clean_email or "guest@libra.local"
+            clean_email = ns_email
+            if not category.startswith(f"user:{ns_email}:"):
+                category = f"user:{ns_email}:{category}"
         emb = self.embed_text(clean_fact)
         conn = self._get_connection()
         cursor = conn.cursor()
+        fact_id = None
         try:
             cursor.execute(
                 "INSERT INTO facts (content, category, created_at, user_email) VALUES (?, ?, ?, ?)",
                 (clean_fact, category, datetime.now().isoformat(), clean_email)
             )
+            fact_id = cursor.lastrowid
+        except sqlite3.IntegrityError:
+            row_ex = cursor.execute("SELECT id FROM facts WHERE content = ?", (clean_fact,)).fetchone()
+            if row_ex:
+                fact_id = row_ex[0]
+                cursor.execute(
+                    "UPDATE facts SET category = ?, user_email = ?, created_at = ? WHERE id = ?",
+                    (category, clean_email, datetime.now().isoformat(), fact_id)
+                )
         except Exception:
-            cursor.execute(
-                "INSERT INTO facts (content, category, created_at) VALUES (?, ?, ?)",
-                (clean_fact, category, datetime.now().isoformat())
-            )
-        fact_id = cursor.lastrowid
-        if emb and any(emb):
+            try:
+                cursor.execute(
+                    "INSERT INTO facts (content, category, created_at) VALUES (?, ?, ?)",
+                    (clean_fact, category, datetime.now().isoformat())
+                )
+                fact_id = cursor.lastrowid
+            except sqlite3.IntegrityError:
+                row_ex = cursor.execute("SELECT id FROM facts WHERE content = ?", (clean_fact,)).fetchone()
+                if row_ex:
+                    fact_id = row_ex[0]
+        if fact_id and emb and any(emb):
+            cursor.execute("DELETE FROM vec_facts WHERE fact_id = ?", (fact_id,))
             cursor.execute(
                 "INSERT INTO vec_facts (fact_id, embedding) VALUES (?, ?)",
                 (fact_id, sqlite_vec.serialize_float32(emb))
@@ -938,7 +961,7 @@ class SemanticMemory:
                 rank_idx = 1
                 for r in v_rows:
                     fid, content, cat, created_at, dist, row_email = r[0], r[1], r[2], r[3], float(r[4]), (r[5] or "").strip().lower()
-                    if not is_host_query and row_email not in (clean_email,) and cat != "core_deep_memory":
+                    if not is_host_query and row_email != clean_email and not str(cat).startswith(f"user:{clean_email}:"):
                         continue
                     if is_host_query and row_email and row_email not in ("REDACTED", "REDACTED", ""):
                         continue
@@ -973,7 +996,7 @@ class SemanticMemory:
                 rank_idx = 1
                 for r in f_rows:
                     fid, content, cat, created_at, bm25_val, row_email = r[0], r[1], r[2], r[3], float(r[4] or 0.0), (r[5] or "").strip().lower()
-                    if not is_host_query and row_email not in (clean_email,) and cat != "core_deep_memory":
+                    if not is_host_query and row_email != clean_email and not str(cat).startswith(f"user:{clean_email}:"):
                         continue
                     if is_host_query and row_email and row_email not in ("REDACTED", "REDACTED", ""):
                         continue
@@ -1005,95 +1028,104 @@ class SemanticMemory:
             if self.db_path != ":memory:":
                 conn.close()
 
-    def forget_fact(self, query: str, distance_threshold: float = 0.75) -> str | None:
-
-        """Finds closest matching fact in `vec_facts`. If distance <= threshold, deletes the record from both tables and returns the purged text."""
-
+    def forget_fact(
+        self,
+        query: str,
+        distance_threshold: float = 0.75,
+        user_email: str = "",
+        role: str = "host"
+    ) -> str | None:
+        """
+        Finds closest matching fact in `vec_facts` within the caller's namespace (`user:<email>:*` for remote users).
+        Never touches or deletes the host's facts when called by a remote_web user.
+        """
         clean_query = query.strip()
-
         if not clean_query:
-
             return None
 
+        clean_email = (user_email or "").strip().lower()
+        clean_role = (role or "host").strip().lower()
+        is_host_user = (clean_role == "host") and (not clean_email or clean_email in ("REDACTED", "REDACTED"))
+
         emb = self.embed_text(clean_query)
-
         conn = self._get_connection()
-
         cursor = conn.cursor()
-
         purged_text = None
 
         if emb and any(emb):
-
             sql = """
-
-                SELECT f.id, f.content, v.distance
-
+                SELECT f.id, f.content, v.distance, COALESCE(f.user_email, ''), COALESCE(f.category, '')
                 FROM vec_facts v
-
                 JOIN facts f ON f.id = v.fact_id
-
-                WHERE v.embedding MATCH ? AND k = 1
-
+                WHERE v.embedding MATCH ? AND k = 10
                 ORDER BY v.distance ASC
-
             """
-
-            cursor.execute(sql, (sqlite_vec.serialize_float32(emb),))
-
-            match = cursor.fetchone()
-
-            if match:
-
-                fact_id, content, dist = match
-
-                if dist <= distance_threshold:
-
+            try:
+                cursor.execute(sql, (sqlite_vec.serialize_float32(emb),))
+                matches = cursor.fetchall()
+            except Exception:
+                matches = []
+            for fact_id, content, dist, row_email, cat in matches:
+                r_email = (row_email or "").strip().lower()
+                r_cat = (cat or "").strip()
+                if not is_host_user:
+                    if not clean_email or (r_email != clean_email and not r_cat.startswith(f"user:{clean_email}:")):
+                        continue
+                else:
+                    if r_email and r_email not in ("REDACTED", "REDACTED", ""):
+                        continue
+                if float(dist) <= distance_threshold:
                     cursor.execute("DELETE FROM vec_facts WHERE fact_id = ?", (fact_id,))
-
                     cursor.execute("DELETE FROM facts WHERE id = ?", (fact_id,))
-
                     conn.commit()
-
                     purged_text = content
+                    break
 
         # Substring / exact fallback if vector match was slightly above threshold or empty
-
         if purged_text is None:
-
-            cursor.execute("SELECT id, content FROM facts WHERE content LIKE ? LIMIT 1", (f"%{clean_query}%",))
-
-            sub_match = cursor.fetchone()
-
+            if not is_host_user:
+                if clean_email:
+                    cursor.execute(
+                        "SELECT id, content FROM facts WHERE content LIKE ? AND (LOWER(COALESCE(user_email, '')) = ? OR category LIKE ?) LIMIT 1",
+                        (f"%{clean_query}%", clean_email, f"user:{clean_email}:%")
+                    )
+                    sub_match = cursor.fetchone()
+                else:
+                    sub_match = None
+            else:
+                cursor.execute(
+                    "SELECT id, content FROM facts WHERE content LIKE ? AND LOWER(COALESCE(user_email, '')) IN ('', 'REDACTED', 'REDACTED') LIMIT 1",
+                    (f"%{clean_query}%",)
+                )
+                sub_match = cursor.fetchone()
             if sub_match:
-
                 fact_id, content = sub_match
-
                 cursor.execute("DELETE FROM vec_facts WHERE fact_id = ?", (fact_id,))
-
                 cursor.execute("DELETE FROM facts WHERE id = ?", (fact_id,))
-
                 conn.commit()
-
                 purged_text = content
 
         if self.db_path != ":memory:":
-
             conn.close()
-
         return purged_text
 
-    def get_profile_summary(self, limit: int = 10) -> list[str]:
-
-        """Returns the most recent facts stored about the user."""
-
+    def get_profile_summary(self, limit: int = 10, user_email: str = "") -> list[str]:
+        """Returns the most recent facts stored about the user, scoped by user_email."""
         try:
-
+            clean_email = (user_email or "").strip().lower()
+            is_host_query = (not clean_email) or (clean_email in ("REDACTED", "REDACTED"))
             conn = self._get_connection()
-
             cursor = conn.cursor()
-
-            cursor.execute("SELECT content FROM facts ORDER BY id DESC LIMIT ?", (limit,))
+            if not is_host_query:
+                cursor.execute(
+                    "SELECT content FROM facts WHERE LOWER(COALESCE(user_email, '')) = ? OR category LIKE ? ORDER BY id DESC LIMIT ?",
+                    (clean_email, f"user:{clean_email}:%", limit)
+                )
+            else:
+                cursor.execute(
+                    "SELECT content FROM facts WHERE LOWER(COALESCE(user_email, '')) IN ('', 'REDACTED', 'REDACTED') ORDER BY id DESC LIMIT ?",
+                    (limit,)
+                )
 
             rows = cursor.fetchall()
 
@@ -1279,21 +1311,21 @@ class SemanticMemory:
 
         return purged is not None
 
-    def get_context_summary(self, current_query: str = "") -> str:
+    def get_context_summary(self, current_query: str = "", user_email: str = "") -> str:
 
         if current_query:
 
-            relevant = self.recall_relevant(current_query, limit=3)
+            relevant = self.recall_relevant(current_query, limit=3, user_email=user_email)
 
             facts = [r["content"] for r in relevant]
 
             if not facts:
 
-                facts = self.get_profile_summary(limit=3)
+                facts = self.get_profile_summary(limit=3, user_email=user_email)
 
         else:
 
-            facts = self.get_profile_summary(limit=6)
+            facts = self.get_profile_summary(limit=6, user_email=user_email)
 
         if not facts:
 

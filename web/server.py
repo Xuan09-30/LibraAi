@@ -674,10 +674,11 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         file_ext = os.path.splitext(clean_filename)[1].lower()
 
         file_id = uuid.uuid4().hex[:10]
-
+        user_ns = re.sub(r"[^a-z0-9._@-]", "_", (auth.get("email") or auth.get("role") or "anonymous").strip().lower()) or "anonymous"
+        user_upload_dir = os.path.join(upload_dir, user_ns)
+        os.makedirs(user_upload_dir, exist_ok=True)
         saved_name = f"{file_id}_{clean_filename}"
-
-        saved_path = os.path.join(upload_dir, saved_name)
+        saved_path = os.path.join(user_upload_dir, saved_name)
 
         if file_ext in {".exe", ".bat", ".cmd", ".vbs", ".ps1", ".sh", ".msi", ".scr", ".com", ".pif"}:
             raise HTTPException(status_code=400, detail="Executable files are forbidden for upload.")
@@ -710,15 +711,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         }
 
     @app.get("/api/files/{filename}")
-
-    async def get_uploaded_file(filename: str):
-
+    async def get_uploaded_file(filename: str, auth: Dict[str, Any] = Depends(authenticate_request)):
         safe_name = os.path.basename(filename)
-
-        target_path = os.path.join(upload_dir, safe_name)
-
+        user_ns = re.sub(r"[^a-z0-9._@-]", "_", (auth.get("email") or auth.get("role") or "anonymous").strip().lower()) or "anonymous"
+        user_target = os.path.join(upload_dir, user_ns, safe_name)
+        target_path = user_target if os.path.isfile(user_target) else os.path.join(upload_dir, safe_name)
         if not os.path.isfile(target_path):
-
             raise HTTPException(status_code=404, detail="File not found")
 
         # Infer MIME
@@ -2536,13 +2534,13 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                     return
 
-                # 1.2.2 Desktop Execution for Host vs. Guest
+                # 1.2.2 Desktop Execution restricted strictly to local_desktop (never over remote_host or remote_web tunnel)
 
                 if is_desktop_cmd or is_desktop_open or is_desktop_close:
 
-                    if role != "host":
+                    if auth.get("method") != "localhost_direct":
 
-                        sandbox_msg = "Guest Mode active: Desktop OS control is restricted to the host owner."
+                        sandbox_msg = "Remote Web Mode active: Desktop OS control and terminal tools are restricted to local_desktop sessions."
 
                         yield f"data: {json.dumps({'type': 'token', 'content': sandbox_msg})}\n\n"
 
@@ -2906,8 +2904,8 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                     eff_scope = scope
 
-                    # Autonomous Computer-Use ReAct & Loop Execution
-                    if AutonomousComputerUseAgent.is_computer_use_prompt(req.prompt.strip()):
+                    # Autonomous Computer-Use ReAct & Loop Execution (local_desktop only)
+                    if AutonomousComputerUseAgent.is_computer_use_prompt(req.prompt.strip()) and eff_scope == "local_desktop":
                         agent = AutonomousComputerUseAgent(
                             gui_control=getattr(supervisor.llm, "gui_control", None),
                             spatial=getattr(supervisor.llm, "spatial", None),
@@ -3462,9 +3460,9 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         if is_desktop_cmd or is_desktop_open or is_desktop_close:
 
-            if role != "host":
+            if auth.get("method") != "localhost_direct":
 
-                sandbox_msg = "Guest Mode active: Desktop OS control is restricted to the host owner."
+                sandbox_msg = "Remote Web Mode active: Desktop OS control and terminal tools are restricted to local_desktop sessions."
 
                 return {
 
@@ -3474,7 +3472,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                     "voice_response": sandbox_msg,
 
-                    "action": "remote_sandbox_blocked",
+                    "action": "sandboxed_blocked",
 
                     "client_scope": scope,
 
@@ -3512,7 +3510,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                 }
 
-        effective_scope = "remote_host" if (role == "host" and explicit_pc_target) else "remote_web"
+        effective_scope = "local_desktop" if (role == "host" and auth.get("method") == "localhost_direct" and req_scope == "local_desktop") else ("remote_host" if role == "host" else "remote_web")
 
         # 1. Ensure or auto-create session thread
 
@@ -3534,6 +3532,19 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         gen_image_url = None
 
+        if req.attached_file_path:
+            if ".." in re.split(r"[\\/]+", req.attached_file_path) or ".." in req.attached_file_path:
+                raise HTTPException(status_code=403, detail="Forbidden: Path traversal in attached_file_path is not allowed.")
+            if effective_scope != "local_desktop":
+                user_ns = re.sub(r"[^a-z0-9._@-]", "_", (auth.get("email") or auth.get("role") or "anonymous").strip().lower()) or "anonymous"
+                allowed_up_dir = os.path.abspath(os.path.join(upload_dir, user_ns))
+                abs_attach = os.path.abspath(req.attached_file_path)
+                try:
+                    common_up = os.path.commonpath([abs_attach, allowed_up_dir])
+                except ValueError:
+                    common_up = ""
+                if common_up.lower() != allowed_up_dir.lower():
+                    raise HTTPException(status_code=403, detail="Forbidden: Remote users can only attach files uploaded by their own account.")
         if req.attached_file_path and os.path.isfile(req.attached_file_path):
 
             file_ext = os.path.splitext(req.attached_file_path)[1].lower()
@@ -4157,6 +4168,8 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     @app.get("/api/gaming/status")
 
     async def get_gaming_status(auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Gaming shield and host process telemetry are restricted to Host.")
 
         """Returns live Game Detection, Wake-Word Gaming Shield state, and Windows WASAPI app volumes."""
 
@@ -4246,6 +4259,8 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     @app.post("/api/gaming/heal-audio")
 
     async def heal_all_audio(auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Host audio control is restricted to Host.")
 
         """Force-restores all Windows per-application audio sessions to 100% (1.0)."""
 
@@ -4387,7 +4402,9 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
     async def get_vitals(auth: Dict[str, Any] = Depends(authenticate_request)):
 
-        """Returns live PC telemetry: RTX 5060 Ti VRAM, CPU, RAM, and version info."""
+        """Returns live PC telemetry: RTX 5060 Ti VRAM, CPU, RAM, and version info (Host only; hidden from remote_web Tester/Guest)."""
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Hardware vitals are restricted to Host.")
 
         sys_metrics = monitor.get_system_metrics()
 
@@ -4506,10 +4523,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                     await websocket.send_json({"type": "pong", "time": time.time()})
 
                 elif msg_type == "vitals":
-
-                    sys_metrics = monitor.get_system_metrics()
-
-                    await websocket.send_json({"type": "vitals", "data": sys_metrics})
+                    is_ws_host = bool(token and token == access_token)
+                    if not is_ws_host:
+                        await websocket.send_json({"type": "error", "message": "Forbidden: Hardware vitals are restricted to Host."})
+                    else:
+                        sys_metrics = monitor.get_system_metrics()
+                        await websocket.send_json({"type": "vitals", "data": sys_metrics})
 
                 elif msg_type == "chat":
                     prompt = data.get("prompt", "")

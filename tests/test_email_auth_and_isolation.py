@@ -449,5 +449,170 @@ class TestEmailAuthAndIsolation(unittest.TestCase):
             self.app.state.rate_limit_max_requests = 60
 
 
+    def test_14_round2_item_a_remote_scope_restrictions(self):
+        """
+        Round 2 Item A: Remote scope audit and restrictions:
+        A.2: remote_host must NOT get OS-control or terminal tools (open_app, close_app, create_file,
+             create_folder, gui_action, computer_use_agent, shutdown, create_skill) over the tunnel.
+             Make them local_desktop-only. Test: a remote_host session cannot call any of them.
+        A.3: remote_web: confirm forget_memory, recall_memory, remember_fact only touch that user's
+             namespace (user:<email>:*), never the host's facts.
+        A.4: document_rag in remote scopes: restrict to files uploaded by that user. Reject arbitrary
+             paths and path traversal (..). Test both.
+        A.5: daily_briefing and hardware vitals must not be returned to remote_web (Tester/Guest).
+             Remove from their registered tools or redact host details.
+        """
+        local_tools = self.hub.get_registered_tools("local_desktop")
+        remote_host_tools = self.hub.get_registered_tools("remote_host")
+        remote_web_tools = self.hub.get_registered_tools("remote_web")
+
+        # A.2: OS-control and terminal tools must be local_desktop-only (not in remote_host or remote_web)
+        forbidden_os_tools = (
+            "open_app", "close_app", "create_file", "create_folder",
+            "gui_action", "computer_use_agent", "shutdown", "create_skill"
+        )
+        for tool_name in forbidden_os_tools:
+            self.assertIn(tool_name, local_tools)
+            self.assertNotIn(tool_name, remote_host_tools, f"OS tool '{tool_name}' must NOT be registered for remote_host!")
+            self.assertNotIn(tool_name, remote_web_tools, f"OS tool '{tool_name}' must NOT be registered for remote_web!")
+
+        # Test that a remote_host session cannot call any of them
+        os_test_prompts = [
+            "open calculator",
+            "close chrome",
+            "create file test_remote_host.txt",
+            "create folder test_remote_host_dir",
+            "click the start button",
+            "open chrome and go to youtube.com and search for cats",
+            "shutdown my computer",
+            "create a skill to check disk usage",
+        ]
+        for p in os_test_prompts:
+            res = self.hub.process_command(p, client_scope="remote_host", dry_run=False)
+            self.assertEqual(res.get("action"), "sandboxed_blocked", f"Prompt '{p}' was not blocked in remote_host: {res}")
+
+        # Also test /api/chat as remote host over tunnel (with x-forwarded-for proxy header)
+        host_user = self.memory.get_or_create_registered_user("REDACTED", default_role="host")
+        host_headers = {
+            "Authorization": f"Bearer {host_user['unique_token']}",
+            "X-Forwarded-For": "203.0.113.42"
+        }
+        res_chat_host = self.client.post(
+            "/api/chat",
+            json={"prompt": "open notepad", "synthesize_audio": False},
+            headers=host_headers
+        )
+        self.assertEqual(res_chat_host.status_code, 200)
+        self.assertIn(res_chat_host.json().get("action"), ("sandboxed_blocked", "remote_sandbox_blocked"))
+
+        # A.3: remote_web forget_memory, recall_memory, remember_fact only touch user:<email>:* namespace
+        for mem_tool in ("forget_memory", "recall_memory", "remember_fact"):
+            self.assertIn(mem_tool, remote_web_tools, f"'{mem_tool}' must be registered for remote_web!")
+
+        # Seed a host fact
+        self.memory.remember_fact("My secret host project codename is Project Apollo", user_email="REDACTED", role="host")
+
+        # Authenticate as remote_web tester
+        tester_email = "alice_tester@example.com"
+        self.hub.llm.active_user_email = tester_email
+        self.hub.llm.active_user_role = "tester"
+
+        # 1. Tester remembers a fact -> stored under user:alice_tester@example.com:*
+        res_rem = self.hub.process_command("Remember that my favorite color is turquoise", client_scope="remote_web", dry_run=False)
+        self.assertEqual(res_rem.get("action"), "remember_fact")
+
+        # Verify category in DB has user:<email>: prefix
+        conn = self.memory._get_connection()
+        rows_alice = conn.execute(
+            "SELECT category, content FROM facts WHERE LOWER(user_email) = ?",
+            (tester_email,)
+        ).fetchall()
+        if self.memory.db_path != ":memory:":
+            conn.close()
+        self.assertTrue(any(r[0].startswith(f"user:{tester_email}:") and "turquoise" in r[1] for r in rows_alice))
+
+        # 2. Tester tries to recall host's secret codename -> must NOT return host fact
+        recalled_by_alice = self.memory.recall_relevant("Project Apollo", user_email=tester_email)
+        self.assertEqual(len(recalled_by_alice), 0, "Tester must not recall host facts!")
+
+        # 3. Tester tries to forget host's secret codename -> must NOT delete host fact
+        res_forget_host = self.hub.process_command("Forget about Project Apollo", client_scope="remote_web", dry_run=False)
+        self.assertEqual(res_forget_host.get("action"), "forget_memory")
+        host_recalled = self.memory.recall_relevant("Project Apollo", user_email="REDACTED")
+        self.assertGreaterEqual(len(host_recalled), 1, "Host fact was deleted by remote_web tester!")
+
+        # 4. Tester forgets their own fact -> succeeds
+        res_forget_own = self.hub.process_command("Forget about turquoise", client_scope="remote_web", dry_run=False)
+        self.assertEqual(res_forget_own.get("action"), "forget_memory")
+        self.assertEqual(len(self.memory.recall_relevant("turquoise", user_email=tester_email)), 0)
+
+        # A.4: document_rag in remote scopes restricted to files uploaded by that user; reject arbitrary paths and ..
+        # 1. Arbitrary path in remote_web -> rejected
+        rag_arb = self.hub.llm.document_rag.query_document(
+            "README.md",
+            "Summarize this file",
+            dry_run=True,
+            client_scope="remote_web",
+            user_email=tester_email
+        )
+        self.assertEqual(rag_arb.get("status"), "forbidden", f"Expected arbitrary path to be forbidden in remote_web, got {rag_arb}")
+
+        # 2. Path traversal (..) in remote_web and remote_host -> rejected
+        for trav_path in ("../config.json", "..\\config.local.json", "assets/uploads/../../README.md"):
+            rag_trav = self.hub.llm.document_rag.query_document(
+                trav_path,
+                "What is inside?",
+                dry_run=True,
+                client_scope="remote_host",
+                user_email="REDACTED"
+            )
+            self.assertEqual(rag_trav.get("status"), "forbidden", f"Expected path traversal '{trav_path}' to be forbidden, got {rag_trav}")
+
+        # 3. File uploaded by that user succeeds in remote_web, but another user cannot read it
+        tester_user = self.memory.get_or_create_registered_user(tester_email, default_role="tester")
+        tester_headers = {"Authorization": f"Bearer {tester_user['unique_token']}"}
+        up_res = self.client.post(
+            "/api/upload",
+            files={"file": ("alice_notes.txt", b"Alice private research notes about quantum computing.", "text/plain")},
+            headers=tester_headers
+        )
+        self.assertEqual(up_res.status_code, 200)
+        alice_file_path = up_res.json()["file_path"]
+
+        # Alice can query her own uploaded file in remote_web
+        rag_own = self.hub.llm.document_rag.query_document(
+            alice_file_path,
+            "What are the notes about?",
+            dry_run=True,
+            client_scope="remote_web",
+            user_email=tester_email
+        )
+        self.assertEqual(rag_own.get("status"), "success", f"Expected Alice's own upload to succeed, got {rag_own}")
+
+        # Bob (another remote_web user) cannot query Alice's uploaded file
+        rag_other = self.hub.llm.document_rag.query_document(
+            alice_file_path,
+            "What are the notes about?",
+            dry_run=True,
+            client_scope="remote_web",
+            user_email="bob_tester@example.com"
+        )
+        self.assertEqual(rag_other.get("status"), "forbidden", f"Expected Bob to be forbidden from reading Alice's upload, got {rag_other}")
+
+        # A.5: daily_briefing and hardware vitals (system_status) must not be returned to remote_web
+        self.assertNotIn("daily_briefing", remote_web_tools)
+        self.assertNotIn("system_status", remote_web_tools)
+
+        res_brief = self.hub.process_command("give me my daily briefing", client_scope="remote_web", dry_run=False)
+        self.assertEqual(res_brief.get("action"), "sandboxed_blocked")
+
+        res_vitals_cmd = self.hub.process_command("check system status and cpu usage", client_scope="remote_web", dry_run=False)
+        self.assertEqual(res_vitals_cmd.get("action"), "sandboxed_blocked")
+
+        # HTTP /api/vitals must not return host hardware details to remote_web (Tester/Guest)
+        res_vitals_http = self.client.get("/api/vitals", headers=tester_headers)
+        self.assertEqual(res_vitals_http.status_code, 403)
+
+
 if __name__ == "__main__":
     unittest.main()

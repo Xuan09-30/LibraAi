@@ -130,7 +130,10 @@ from PyQt6.QtGui import (
     QFont, QColor, QPainter, QBrush, QLinearGradient,
     QAction, QIcon, QPixmap, QPen, QRadialGradient
 )
-from PyQt6.QtWebEngineWidgets import QWebEngineView
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+except ImportError:
+    QWebEngineView = QWidget
 
 from openwakeword.model import Model
 from core.vad import SileroVADDetector

@@ -39,10 +39,19 @@ BLOCKED_REMOTE_ACTIONS = {
     "create_skill",
     "run_learned_skill",
     "clipboard_copilot",
+    "clipboard_save",
+    "clipboard_assist",
     "active_window",
     "workspace_macro",
+    "launch_workspace",
     "spotify_action",
+    "spotify_play",
+    "spotify_now_playing",
+    "media_control",
     "game_mode",
+    "toggle_game_mode",
+    "show_ui",
+    "hide_ui",
 }
 
 REMOTE_WEB_ALLOWED_TOOLS = {
@@ -56,18 +65,28 @@ REMOTE_WEB_ALLOWED_TOOLS = {
     "compare_candidates",
     "place_detail",
     "recall_memory",
+    "remember_fact",
+    "forget_memory",
     "profile_recall",
-    "daily_briefing",
     "currency_convert",
     "unit_convert",
     "math_eval",
     "ping_check",
     "clarify",
     "list_skills",
-    "system_status",
     "document_rag",
     "vision_qa",
     "lookup_entity",
+}
+
+REMOTE_HOST_ALLOWED_TOOLS = set(REMOTE_WEB_ALLOWED_TOOLS) | {
+    "daily_briefing",
+    "system_status",
+    "schedule_reminder",
+    "list_reminders",
+    "cancel_reminders",
+    "data_science",
+    "persona_update",
 }
 
 DESTRUCTIVE_MACRO_ACTIONS = {
@@ -91,7 +110,7 @@ DESTRUCTIVE_MACRO_PATTERNS = [
 ]
 
 REMOTE_SANDBOX_PATTERNS = [
-    r"\b(?:launch|open|start|run|close|kill|shut\s*down)\s+(?:the\s+)?(?:app|application|game|program|software|chrome|steam|notepad|calc|pc|computer|system)\b",
+    r"\b(?:launch|open|start|run|close|kill|shut\s*down|power\s*off)\s+(?:the\s+|my\s+)?(?:app|application|game|program|software|chrome|steam|notepad|calc|pc|computer|system)\b",
     r"\b(?:click|double\s+click|right\s+click|press|tap)\s+(?:on\s+)?(?:the\s+)?(?:screen|button|icon|window|profile)\b",
     r"\b(?:look\s+at|what\s+is\s+on|see\s+on|capture|check)\s+my\s+screen\b",
     r"\b(?:open|show|reveal)\s+(?:that\s+|the\s+)?(?:folder|directory|file)\b",
@@ -249,21 +268,16 @@ class SupervisorHub:
     def get_registered_tools(self, client_scope: str = "local_desktop") -> set:
         """
         Returns the registered tool allowlist for the given client_scope.
-        remote_web sessions never get OS-control or terminal tools registered.
+        remote_web and remote_host sessions never get OS-control or terminal tools registered.
         """
         if client_scope == "remote_web":
             return set(REMOTE_WEB_ALLOWED_TOOLS)
+        if client_scope == "remote_host":
+            return set(REMOTE_HOST_ALLOWED_TOOLS)
         return (
-            set(REMOTE_WEB_ALLOWED_TOOLS)
+            set(REMOTE_HOST_ALLOWED_TOOLS)
             | set(BLOCKED_REMOTE_ACTIONS)
             | {
-                "remember_fact",
-                "forget_memory",
-                "schedule_reminder",
-                "list_reminders",
-                "cancel_reminders",
-                "data_science",
-                "persona_update",
                 "show_ui",
                 "hide_ui",
             }
@@ -271,7 +285,7 @@ class SupervisorHub:
 
     def _execute_cached_tool(self, action: str, args: dict, dry_run: bool = False, client_scope: str = "local_desktop") -> Dict[str, Any]:
         """Dispatches an already-compiled tool action directly to the runtime module."""
-        if client_scope == "remote_web" and (action in BLOCKED_REMOTE_ACTIONS or action not in self.get_registered_tools("remote_web")):
+        if client_scope != "local_desktop" and (action in BLOCKED_REMOTE_ACTIONS or action not in self.get_registered_tools(client_scope)):
             return {
                 "action": "sandboxed_blocked",
                 "status": "blocked",
@@ -374,14 +388,19 @@ class SupervisorHub:
         t0 = t_start if t_start is not None else time.perf_counter()
         macro_act = tool_chain[0].get("action") if len(tool_chain) == 1 else "macro_chain"
 
-        # 1. Refuse OS tools for remote_web scope BEFORE invoking _execute_cached_tool
-        if client_scope == "remote_web" and (macro_act in BLOCKED_REMOTE_ACTIONS or any(s.get("action") in BLOCKED_REMOTE_ACTIONS for s in tool_chain)):
-            return {
-                "action": "sandboxed_blocked",
-                "status": "blocked",
-                "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
-                "client_scope": client_scope
-            }
+        # 1. Refuse OS tools or unregistered tools for remote scopes BEFORE invoking _execute_cached_tool
+        if client_scope != "local_desktop":
+            reg_tools = self.get_registered_tools(client_scope)
+            if (
+                macro_act in BLOCKED_REMOTE_ACTIONS
+                or any(s.get("action") in BLOCKED_REMOTE_ACTIONS or s.get("action") not in reg_tools for s in tool_chain)
+            ):
+                return {
+                    "action": "sandboxed_blocked",
+                    "status": "blocked",
+                    "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                    "client_scope": client_scope
+                }
 
         # 2. Require confirmation for destructive actions even when macro is cached
         if not confirmed and self.is_destructive_macro(norm_trigger, tool_chain):
@@ -405,7 +424,7 @@ class SupervisorHub:
         for step_item in tool_chain:
             act = step_item.get("action", "")
             args = step_item.get("args", {})
-            res = self._execute_cached_tool(act, args, dry_run=dry_run)
+            res = self._execute_cached_tool(act, args, dry_run=dry_run, client_scope=client_scope)
             step_results.append(res)
             v = res.get("voice_response")
             if v and v != "Dry-run response.":
@@ -486,7 +505,7 @@ class SupervisorHub:
         fast-path single dispatch, or multi-step coordination backed by AgentScratchpad.
         When client_scope == "remote_web", enforces strict sandboxing restricting desktop OS tools.
         """
-        if client_scope == "remote_web":
+        if client_scope != "local_desktop":
             for pat in REMOTE_SANDBOX_PATTERNS:
                 if re.search(pat, prompt, re.IGNORECASE):
                     if not re.search(r"open\s+(?:my\s+)?(?:google|chrome|browser)\s+and\s+search", prompt, re.IGNORECASE):
@@ -532,7 +551,7 @@ class SupervisorHub:
 
         # PHASE 12: AUTONOMOUS COMPUTER-USE REACT LOOP EXECUTION
         if AutonomousComputerUseAgent.is_computer_use_prompt(prompt):
-            if client_scope == "remote_web":
+            if client_scope != "local_desktop":
                 return {
                     "action": "sandboxed_blocked",
                     "status": "blocked",
@@ -577,7 +596,7 @@ class SupervisorHub:
         if len(sub_steps) == 1:
             sem_fast = self._match_semantic_fastpath(prompt)
             if sem_fast:
-                if client_scope == "remote_web" and sem_fast["action"] in BLOCKED_REMOTE_ACTIONS:
+                if client_scope != "local_desktop" and (sem_fast["action"] in BLOCKED_REMOTE_ACTIONS or sem_fast["action"] not in self.get_registered_tools(client_scope)):
                     return {
                         "action": "sandboxed_blocked",
                         "status": "blocked",
@@ -585,7 +604,7 @@ class SupervisorHub:
                         "client_scope": client_scope
                     }
                 profiler.record_metric("semantic_fastpath_hit", 1.0)
-                res = self._execute_cached_tool(sem_fast["action"], sem_fast["args"], dry_run=dry_run)
+                res = self._execute_cached_tool(sem_fast["action"], sem_fast["args"], dry_run=dry_run, client_scope=client_scope)
                 res["semantic_fastpath"] = True
                 res["compound"] = False
                 fast_tm = {
@@ -602,11 +621,11 @@ class SupervisorHub:
 
         # FAST PATH (<5ms): Single intent query
         if len(sub_steps) == 1:
-            if client_scope == "remote_web" and not dry_run:
+            if client_scope != "local_desktop" and not dry_run:
                 # Tool-layer sandbox: inspect planned action in dry_run BEFORE allowing any OS/terminal tool to execute
                 preview = self.llm.plan(prompt, dry_run=True, client_scope=client_scope)
                 preview_act = preview.get("action")
-                if preview_act in BLOCKED_REMOTE_ACTIONS or (preview_act and preview_act not in self.get_registered_tools("remote_web")):
+                if preview_act in BLOCKED_REMOTE_ACTIONS or (preview_act and preview_act not in self.get_registered_tools(client_scope)):
                     return {
                         "action": "sandboxed_blocked",
                         "status": "blocked",
@@ -618,7 +637,7 @@ class SupervisorHub:
             res["compound"] = False
             elapsed_ms = (time.perf_counter() - t_start) * 1000.0
             act = res.get("action")
-            if client_scope == "remote_web" and (act in BLOCKED_REMOTE_ACTIONS or (act and act not in self.get_registered_tools("remote_web"))):
+            if client_scope != "local_desktop" and (act in BLOCKED_REMOTE_ACTIONS or (act and act not in self.get_registered_tools(client_scope))):
                 return {
                     "action": "sandboxed_blocked",
                     "status": "blocked",
@@ -650,10 +669,10 @@ class SupervisorHub:
         for idx, step in enumerate(sub_steps[:self.MAX_STEPS]):
             if idx < len(self.scratchpad.subtasks):
                 self.scratchpad.subtasks[idx]["status"] = "running"
-            if client_scope == "remote_web" and not dry_run:
+            if client_scope != "local_desktop" and not dry_run:
                 preview_step = self.llm.plan(step, dry_run=True, client_scope=client_scope)
                 p_act = preview_step.get("action")
-                if p_act in BLOCKED_REMOTE_ACTIONS or (p_act and p_act not in self.get_registered_tools("remote_web")):
+                if p_act in BLOCKED_REMOTE_ACTIONS or (p_act and p_act not in self.get_registered_tools(client_scope)):
                     return {
                         "action": "sandboxed_blocked",
                         "status": "blocked",
@@ -695,7 +714,7 @@ class SupervisorHub:
                         latency_ms=elapsed_ms
                     )
 
-        if client_scope == "remote_web" and any(a in BLOCKED_REMOTE_ACTIONS for a in actions):
+        if client_scope != "local_desktop" and any(a in BLOCKED_REMOTE_ACTIONS or a not in self.get_registered_tools(client_scope) for a in actions):
             return {
                 "action": "sandboxed_blocked",
                 "status": "blocked",

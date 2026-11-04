@@ -521,20 +521,41 @@ class DocumentRAGEngine:
 
         return rrf_passages[:top_k]
 
+    @staticmethod
+    def _sanitize_user_upload_dir(user_email: str) -> str:
+        clean = (user_email or "anonymous").strip().lower()
+        safe_slug = re.sub(r"[^a-z0-9._@-]", "_", clean) or "anonymous"
+        return os.path.abspath(os.path.join(PROJECT_ROOT, "assets", "uploads", safe_slug))
+
     def query_document(
         self,
         file_query: str,
         question: str,
         llm_callback: Optional[Any] = None,
         dry_run: bool = False,
-        llm: Optional[Any] = None
+        llm: Optional[Any] = None,
+        client_scope: str = "local_desktop",
+        user_email: str = ""
     ) -> Dict[str, Any]:
         """
-        Locates the file using Voidtools Everything, runs auto-security pre-scan,
+        Locates the file using Voidtools Everything (local_desktop only), runs auto-security pre-scan,
         indexes if needed, retrieves matching context chunks, and synthesizes an answer.
+        In remote scopes (remote_web, remote_host), strictly restricts access to files uploaded by
+        that specific user and rejects arbitrary paths and path traversal ('..').
         """
         clean_file_q = (file_query or "").strip()
         clean_question = (question or "").strip()
+
+        # Reject path traversal ('..') across all scopes when raw traversal tokens are present
+        norm_parts = re.split(r"[\\/]+", clean_file_q)
+        if ".." in norm_parts or ".." in clean_file_q:
+            return {
+                "status": "forbidden",
+                "file_query": clean_file_q,
+                "file_path": None,
+                "chunks": [],
+                "voice_response": "Security block: Path traversal ('..') is forbidden."
+            }
 
         # Guard against weather queries polluting document RAG
         if re.search(r"\b(?:weather|forecast|rain\s+forecast|rain\s+chance|temperature)\b", clean_question, re.IGNORECASE):
@@ -545,14 +566,54 @@ class DocumentRAGEngine:
                 "status": "error"
             }
 
-        # 1. Locate file
+        # 1. Locate file (with strict remote scope isolation)
         target_path = None
-        if os.path.isfile(clean_file_q):
-            target_path = os.path.abspath(clean_file_q)
+        if client_scope != "local_desktop":
+            eff_email = (user_email or (getattr(llm, "active_user_email", "") if llm else "") or "").strip().lower()
+            if not eff_email:
+                return {
+                    "status": "forbidden",
+                    "file_query": clean_file_q,
+                    "file_path": None,
+                    "chunks": [],
+                    "voice_response": "Security block: Remote document RAG requires an authenticated user upload namespace."
+                }
+            user_upload_dir = self._sanitize_user_upload_dir(eff_email)
+            os.makedirs(user_upload_dir, exist_ok=True)
+            cand_abs = os.path.abspath(clean_file_q) if os.path.isabs(clean_file_q) else os.path.abspath(os.path.join(user_upload_dir, os.path.basename(clean_file_q)))
+            # Candidate path MUST reside strictly inside this user's upload directory
+            try:
+                common = os.path.commonpath([cand_abs, user_upload_dir])
+            except ValueError:
+                common = ""
+            if common.lower() != user_upload_dir.lower() or not os.path.isfile(cand_abs):
+                # Also check if the user passed just a filename that matches `<file_id>_<filename>` inside their upload dir
+                base_q = os.path.basename(clean_file_q).lower()
+                matched_upload = None
+                if os.path.basename(clean_file_q) == clean_file_q and os.path.isdir(user_upload_dir):
+                    for fname in os.listdir(user_upload_dir):
+                        if fname.lower() == base_q or fname.lower().endswith("_" + base_q):
+                            matched_upload = os.path.abspath(os.path.join(user_upload_dir, fname))
+                            break
+                if matched_upload and os.path.isfile(matched_upload):
+                    target_path = matched_upload
+                else:
+                    return {
+                        "status": "forbidden",
+                        "file_query": clean_file_q,
+                        "file_path": None,
+                        "chunks": [],
+                        "voice_response": "Security block: Remote document access is restricted exclusively to files uploaded by your account."
+                    }
+            else:
+                target_path = cand_abs
         else:
-            found = self.file_mgr.search_path(clean_file_q, folders_only=False)
-            if found and os.path.isfile(found):
-                target_path = found
+            if os.path.isfile(clean_file_q):
+                target_path = os.path.abspath(clean_file_q)
+            else:
+                found = self.file_mgr.search_path(clean_file_q, folders_only=False)
+                if found and os.path.isfile(found):
+                    target_path = found
 
         if not target_path:
             msg = f"I couldn't find any file matching '{clean_file_q}' on your computer."

@@ -881,13 +881,13 @@ class LocalLLM:
         voice = normalize_for_tts(voice)
         return voice
 
-    def _sandbox_blocked_response(self, blocked_action: str = "os_control") -> dict:
+    def _sandbox_blocked_response(self, blocked_action: str = "os_control", client_scope: str = "remote_web") -> dict:
         return {
             "action": "sandboxed_blocked",
             "status": "blocked",
             "blocked_action": blocked_action,
             "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
-            "client_scope": "remote_web",
+            "client_scope": client_scope,
         }
 
     def plan(self, prompt: str, dry_run: bool = True, client_scope: str = "local_desktop") -> dict:
@@ -1213,7 +1213,7 @@ class LocalLLM:
             clean_target = raw_target.rstrip(".?!")
             plan_res = {"action": "forget_memory", "args": {"target": clean_target}, "target": clean_target}
             if not dry_run:
-                purged = self.memory.forget_fact(clean_target)
+                purged = self.memory.forget_fact(clean_target, user_email=getattr(self, "active_user_email", ""), role=getattr(self, "active_user_role", "host" if client_scope == "local_desktop" else "tester"))
                 msg = f"Removed memory regarding {purged}." if purged else f"No memory found for {clean_target}."
                 plan_res["voice_response"] = msg
                 self._record_turn(prompt, msg)
@@ -1241,7 +1241,7 @@ class LocalLLM:
                 if relevant:
                     facts_str = "\n".join([f"- {r['content']}" for r in relevant])
                 else:
-                    facts_str = self.memory.get_context_summary(current_query=query)
+                    facts_str = self.memory.get_context_summary(current_query=query, user_email=getattr(self, "active_user_email", ""))
                 synth = (
                     f"You are Libra. Location: {self.city}.\n"
                     f"<user_context>\n{facts_str}\n</user_context>\n\n"
@@ -1521,10 +1521,10 @@ class LocalLLM:
                     self._record_turn(prompt, plan_res["voice_response"])
                 return plan_res
 
-        shutdown_match = re.search(r"^(?:please\s+)?(?:shut\s*down|power\s*off)\s*(?:the\s+)?(?:pc|computer|system)[\.\?!]*$", q_lower)
+        shutdown_match = re.search(r"^(?:please\s+)?(?:shut\s*down|power\s*off)\s*(?:the\s+|my\s+)?(?:pc|computer|system)[\.\?!]*$", q_lower)
         if shutdown_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("shutdown")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("shutdown", client_scope=client_scope)
             self.pending_confirmation = "shutdown"
             success, msg = self.dispatcher.request_shutdown(confirmed=False, dry_run=dry_run)
             plan_res = {"action": "shutdown", "args": {"confirmed": False}, "voice_response": msg}
@@ -1557,8 +1557,8 @@ class LocalLLM:
             or re.search(show_ui_patterns, cmd_query)
         )
         if show_ui_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("show_ui")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("show_ui", client_scope=client_scope)
             plan_res = {"action": "show_ui", "args": {}}
             msg = "I'm right here. Displaying neural interface."
             plan_res["voice_response"] = msg
@@ -1581,8 +1581,8 @@ class LocalLLM:
             or re.search(hide_ui_patterns, cmd_query)
         )
         if hide_ui_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("hide_ui")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("hide_ui", client_scope=client_scope)
             plan_res = {"action": "hide_ui", "args": {}}
             msg = "Hiding interface. I will remain active in the background."
             plan_res["voice_response"] = msg
@@ -1609,7 +1609,7 @@ class LocalLLM:
                 )
             )
         )
-        if is_awaiting_app and client_scope != "remote_web":
+        if is_awaiting_app and client_scope == "local_desktop":
             app_cand = q_lower.strip().rstrip(".?!")
             app_cand = re.sub(r"^(?:please\s+)?(?:launch|open|play|start|run)\s+", "", app_cand).strip()
             app_cand = re.sub(r"\s+for\s+me$", "", app_cand).strip()
@@ -1645,8 +1645,8 @@ class LocalLLM:
         # Incomplete launch prompt detection
         incomplete_launch = re.search(r"^(?:alright,?\s*|okay\s+now,?\s*|can\s+you\s+|please\s+)?(?:launch|open|play|start)[\s\.\?!]*$", q_lower)
         if incomplete_launch and not any(k in q_lower for k in ["folder", "window", "terminal", "powershell"]):
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("open_app")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("open_app", client_scope=client_scope)
             self.session_state["pending_action"] = "open_app"
             msg = "What application or game would you like me to launch?"
             plan_res = {
@@ -1669,8 +1669,8 @@ class LocalLLM:
             or re.search(r"\b(?:create|make|write)\s+(?:a\s+)?(?:new\s+)?(?:python\s+)?(?:script|file)\s+([a-zA-Z0-9_\-\.]+)(?:\s+(?:and|with|containing)\s+(.+))?", q_lower)
         )
         if file_create_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("create_file")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("create_file", client_scope=client_scope)
             raw_file_name = file_create_match.group(1).strip().rstrip(".?!")
             extra_instructions = (file_create_match.group(2) or "").strip().rstrip(".?!") if file_create_match.lastindex >= 2 else ""
             
@@ -1713,8 +1713,8 @@ class LocalLLM:
             or re.search(r"\bwe\s+can\s+put\s+(.+)", q_lower)
         )
         if file_edit_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("write_file")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("write_file", client_scope=client_scope)
             var_match = re.search(r"(?:called|named)\s+([a-zA-Z_]\w*).*?(?:is\s+equal\s+to|=|equals)\s+(\d+|['\"][^'\"]*['\"])", q_lower)
             if var_match:
                 v_name, v_val = var_match.group(1), var_match.group(2)
@@ -1757,8 +1757,8 @@ class LocalLLM:
             )
         )
         if explicit_file_open or named_file_open or context_file_open or correction_file_open:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("open_file")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("open_file", client_scope=client_scope)
             if explicit_file_open:
                 target_file_query = explicit_file_open.group(1).strip()
             elif named_file_open:
@@ -1821,8 +1821,8 @@ class LocalLLM:
                 break
 
         if folder_create_data:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("create_folder")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("create_folder", client_scope=client_scope)
             raw_name, parent_loc = folder_create_data
             clean_name = re.sub(r"\b(?:first|for\s+me|please|called|named|new)\b", "", raw_name, flags=re.IGNORECASE).strip()
             clean_name = re.sub(r"\s+on\s+(?:my\s+|the\s+)?desktop$", "", clean_name, flags=re.IGNORECASE).strip()
@@ -1858,8 +1858,8 @@ class LocalLLM:
             )
         )
         if is_pronoun_folder:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("open_folder")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("open_folder", client_scope=client_scope)
             target_folder = (
                 self.last_context.get("folder")
                 or getattr(self.file_mgr, "last_folder_path", None)
@@ -1918,8 +1918,8 @@ class LocalLLM:
             or re.search(r"(?:show|reveal)\s+(.+?)\s+in\s+file\s+explorer[\.\?!]*$", q_lower)
         )
         if open_folder_match and not re.search(r"\b(?:create|make|read)\s+folder\b", q_lower):
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("open_folder")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("open_folder", client_scope=client_scope)
             folder_target = open_folder_match.group(1).strip().rstrip(".?!")
             folder_target = re.sub(r"^(?:called|named|folder\s+called|folder\s+named)\s+", "", folder_target, flags=re.IGNORECASE).strip()
             folder_target = re.sub(r"^(?:a\s+|the\s+|that\s+)?folder\s+", "", folder_target, flags=re.IGNORECASE).strip()
@@ -1989,8 +1989,8 @@ class LocalLLM:
                 open_app_match = False
 
         if open_app_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("open_app")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("open_app", client_scope=client_scope)
             # Strip prefixes like "up ", "my ", "the ", "app "
             raw_app = re.sub(r"^(?:up\s+|my\s+|the\s+|app\s+)+", "", raw_app, flags=re.IGNORECASE).strip()
             raw_app = re.sub(r"\s+(?:app|application)$", "", raw_app, flags=re.IGNORECASE).strip()
@@ -2144,8 +2144,8 @@ class LocalLLM:
             or re.search(r"\b(?:close|shut\s+down|exit|kill|terminate)\s+(?:the\s+)?([a-zA-Z0-9_\-\s]+?)(?:\s+for\s+me|\s+right\s+now|\s+now|\s+immediately|\s+asap|\s+thank\s+you)*[\.\?!]*$", q_lower)
         )
         if close_app_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("close_app")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("close_app", client_scope=client_scope)
             target = close_app_match.group(1).strip()
             target = re.sub(r"[\.\?!]+$", "", target).strip()
             target = re.sub(r"\s+(?:for\s+me|thank\s+you|thanks|please|right\s+now|now|immediately|asap)$", "", target, flags=re.IGNORECASE).strip()
@@ -2187,6 +2187,8 @@ class LocalLLM:
             or re.search(r"\bhow\s+hot\s+is\s+my\s+(?:gpu|cpu|pc)\b", q_lower)
         )
         if system_status_match:
+            if client_scope == "remote_web":
+                return self._sandbox_blocked_response("system_status", client_scope=client_scope)
             is_windows = bool(re.search(r"\b(?:windows?|apps?)\b", q_lower) and not re.search(r"\b(?:cpu|ram|memory|gpu|vram|status)\b", q_lower))
             sub_type = "windows" if is_windows else "metrics"
             plan_res = {
@@ -2214,8 +2216,8 @@ class LocalLLM:
         # -------------------------------------------------------------
         game_mode_match = re.search(r"^(?:please\s+)?(enable|turn\s+on|activate|disable|turn\s+off|exit)\s+game\s+mode[\.\?!]*$", q_lower)
         if game_mode_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("toggle_game_mode")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("toggle_game_mode", client_scope=client_scope)
             action_word = game_mode_match.group(1).strip()
             enabled = action_word in ["enable", "turn on", "activate"]
             res = self.model_mgr.set_game_mode(enabled, dry_run=dry_run)
@@ -2276,8 +2278,8 @@ class LocalLLM:
             )
         )
         if screen_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("analyze_screen")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("analyze_screen", client_scope=client_scope)
             w_info = self.window_engine.get_active_window_info(dry_run=dry_run)
             res = self.model_mgr.analyze_screen(prompt, window_info=w_info, dry_run=dry_run)
             plan_res = {
@@ -2300,8 +2302,8 @@ class LocalLLM:
             or (re.search(r"\b(?:click|press|tap)\s+it\b", q_lower) and not any(w in q_lower for w in ["screen showing", "in-game name"]))
         )
         if gui_click_match and not any(w in q_lower for w in ["screen showing", "in-game name", "error"]):
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("gui_action")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("gui_action", client_scope=client_scope)
             raw_target = gui_click_match.group(1).strip() if (hasattr(gui_click_match, "group") and gui_click_match.lastindex) else "it"
             raw_target = re.sub(r"(?:for\s+me|please|thanks|right\s+now|now|if\s+you\s+can)+$", "", raw_target).strip().rstrip(".?!")
             target = raw_target
@@ -2385,8 +2387,8 @@ class LocalLLM:
             )
         )
         if active_window_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("active_window")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("active_window", client_scope=client_scope)
             win_res = self.window_engine.handle_contextual_query(
                 prompt=prompt,
                 clipboard_agent=self.clipboard_agent,
@@ -2419,8 +2421,8 @@ class LocalLLM:
         # -------------------------------------------------------------
         clipboard_save_match = re.search(r"\bsave\s+(?:my\s+)?clipboard\s+(?:to\s+(?:a\s+)?note(?:\s+called)?|as\s+(?:a\s+)?note(?:\s+called)?|as|to\s+note)\s+['\"]?(.+?)['\"]?[\.\?!]*$", q_lower)
         if clipboard_save_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("clipboard_save")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("clipboard_save", client_scope=client_scope)
             note_title = clipboard_save_match.group(1).strip().strip("'\"").rstrip(".?!")
             plan_res = {"action": "clipboard_save", "args": {"title": note_title}, "title": note_title}
             if not dry_run:
@@ -2441,8 +2443,8 @@ class LocalLLM:
             or re.search(r"\b(?:view\s+or\s+analyze\s+(?:the\s+|this\s+)?file|analyze\s+this\s+file|explain\s+this\s+file|what\s+does\s+this\s+file\s+do)\b", q_lower)
         )
         if clipboard_assist_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("clipboard_assist")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("clipboard_assist", client_scope=client_scope)
             is_summary = bool(re.search(r"\b(?:summarize|brief\s+summary|overview)\b", q_lower))
             is_explain = bool(re.search(r"\b(?:explain|debug|diagnose|fix\s+the\s+error|solve|troubleshoot|review\s+code)\b", q_lower))
             is_read = not (is_summary or is_explain)
@@ -2529,8 +2531,8 @@ class LocalLLM:
             or re.search(r"\b(?:scan\s+my\s+downloads\s+folder|scan\s+downloads\s+folder|scan\s+my\s+downloads|scan\s+downloads)\b", q_norm_scan)
         )
         if virus_scan_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("virus_scan")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("virus_scan", client_scope=client_scope)
             raw_target = None
             if virus_scan_match.groups() and virus_scan_match.group(1):
                 raw_target = virus_scan_match.group(1).strip()
@@ -2628,15 +2630,24 @@ class LocalLLM:
                 "file": doc_file,
                 "question": rag_question
             }
+            active_email = getattr(self, "active_user_email", "")
             if not dry_run:
-                rag_res = self.document_rag.query_document(doc_file, rag_question, dry_run=False, llm=self)
+                rag_res = self.document_rag.query_document(
+                    doc_file, rag_question, dry_run=False, llm=self,
+                    client_scope=client_scope, user_email=active_email
+                )
+                plan_res["status"] = rag_res.get("status", "success")
                 plan_res["voice_response"] = normalize_for_tts(rag_res.get("voice_response", f"Read {doc_file}."))
                 plan_res["chunks"] = rag_res.get("chunks", [])
                 plan_res["file_path"] = rag_res.get("file_path")
                 self.session_state["last_action"] = "document_rag"
                 self._record_turn(prompt, plan_res["voice_response"])
             else:
-                rag_res = self.document_rag.query_document(doc_file, rag_question, dry_run=True)
+                rag_res = self.document_rag.query_document(
+                    doc_file, rag_question, dry_run=True,
+                    client_scope=client_scope, user_email=active_email
+                )
+                plan_res["status"] = rag_res.get("status", "success")
                 plan_res["voice_response"] = rag_res.get("voice_response", f"Ready to query {doc_file}.")
                 plan_res["chunks"] = rag_res.get("chunks", [])
             return plan_res
@@ -2650,8 +2661,8 @@ class LocalLLM:
             or re.search(r"^(?:please\s+)?(?:exit|reset|leave)\s+(?:workspace|workspace\s+profile|workspace\s+mode)[\.\?!]*$", q_lower)
         )
         if workspace_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("launch_workspace")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("launch_workspace", client_scope=client_scope)
             mode_name = workspace_match.group(1).strip() if workspace_match.groups() and workspace_match.group(1) else "reset"
             plan_res = {
                 "action": "launch_workspace",
@@ -2673,8 +2684,8 @@ class LocalLLM:
             q_lower,
         )
         if spotify_now_playing_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("spotify_now_playing")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("spotify_now_playing", client_scope=client_scope)
             np_res = self.spotify_agent.get_now_playing(dry_run=dry_run)
             plan_res = {
                 "action": "spotify_now_playing",
@@ -2697,8 +2708,8 @@ class LocalLLM:
             or re.search(r"^(?:open|launch)\s+spotify[\.\?!]*$", q_lower)
         )
         if spotify_play_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("spotify_play")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("spotify_play", client_scope=client_scope)
             raw_match_query = ""
             if spotify_play_match.groups() and spotify_play_match.group(1):
                 raw_match_query = spotify_play_match.group(1).strip()
@@ -2724,8 +2735,8 @@ class LocalLLM:
             or re.search(r"^(?:pause|resume|skip|next\s+song|previous\s+song|volume\s+up|volume\s+down|mute|unmute)[\.\?!]*$", q_lower)
         )
         if media_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("media_control")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("media_control", client_scope=client_scope)
             plan_res = {
                 "action": "media_control",
                 "args": {"command": q_lower}
@@ -2747,6 +2758,8 @@ class LocalLLM:
             q_lower
         )
         if briefing_match:
+            if client_scope == "remote_web":
+                return self._sandbox_blocked_response("daily_briefing", client_scope=client_scope)
             plan_res = {
                 "action": "daily_briefing",
                 "args": {}
@@ -2871,8 +2884,8 @@ class LocalLLM:
             or re.search(r"\bsave\s+(?:that\s+|this\s+)?workflow\s+as\s+(?:a\s+)?skill\s*(?:called|named)?\s*(.+)$", q_lower)
         )
         if skill_create_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("create_skill")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("create_skill", client_scope=client_scope)
             raw_task = skill_create_match.group(1).strip().rstrip(".?!")
             res = self.skill_forge.create_skill(
                 raw_task,
@@ -2935,8 +2948,8 @@ class LocalLLM:
         # -------------------------------------------------------------
         matched_skill = self.skill_forge.match_skill(prompt)
         if matched_skill:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("run_learned_skill")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("run_learned_skill", client_scope=client_scope)
             slug = matched_skill.get("slug")
             plan_res = {
                 "action": "run_learned_skill",
@@ -3017,8 +3030,8 @@ class LocalLLM:
                     self._record_turn(prompt, plan_res["voice_response"])
                 return self._process_response(plan_res, prompt, dry_run=dry_run)
             elif s_intent == "open_app" and s_slot:
-                if client_scope == "remote_web":
-                    return self._sandbox_blocked_response("open_app")
+                if client_scope != "local_desktop":
+                    return self._sandbox_blocked_response("open_app", client_scope=client_scope)
                 self.last_context["app"] = s_slot
                 plan_res = {
                     "action": "open_app",
@@ -3034,8 +3047,8 @@ class LocalLLM:
                     plan_res["voice_response"] = f"Allowlisted launch prepared for {s_slot}."
                 return self._process_response(plan_res, prompt, dry_run=dry_run)
             elif s_intent == "close_app" and s_slot:
-                if client_scope == "remote_web":
-                    return self._sandbox_blocked_response("close_app")
+                if client_scope != "local_desktop":
+                    return self._sandbox_blocked_response("close_app", client_scope=client_scope)
                 plan_res = {
                     "action": "close_app",
                     "args": {"target": s_slot, "target_app": s_slot},

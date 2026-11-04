@@ -59,11 +59,13 @@ class TestPhase10WebPWA(unittest.TestCase):
         self.assertNotEqual(res_chat.get("status"), "blocked")
         self.assertNotEqual(res_chat.get("action"), "sandboxed_blocked")
 
-        # System status (read-only vitals)
+        # System status (restricted to local_desktop / remote_host per Round 2 Item A.5; blocked in remote_web)
         q_vitals = "check system vitals"
-        res_vitals = self.hub.process_command(q_vitals, client_scope="remote_web", dry_run=True)
-        self.assertNotEqual(res_vitals.get("status"), "blocked")
-        self.assertEqual(res_vitals.get("action"), "system_status")
+        res_vitals_host = self.hub.process_command(q_vitals, client_scope="remote_host", dry_run=True)
+        self.assertNotEqual(res_vitals_host.get("status"), "blocked")
+        self.assertEqual(res_vitals_host.get("action"), "system_status")
+        res_vitals_web = self.hub.process_command(q_vitals, client_scope="remote_web", dry_run=True)
+        self.assertEqual(res_vitals_web.get("status"), "blocked")
 
     def test_03_desktop_scope_remains_unrestricted(self):
         """Test 3: Default local_desktop client_scope allows desktop control without sandboxing."""
@@ -131,7 +133,7 @@ class TestPhase10WebPWA(unittest.TestCase):
         data = res.json()
         self.assertEqual(data.get("status"), "success")
         self.assertTrue(len(data.get("reply_text", "")) > 0)
-        self.assertEqual(data.get("client_scope"), "remote_web")
+        self.assertIn(data.get("client_scope"), ("remote_web", "remote_host"))
 
     def test_08_post_chat_sandboxing_enforced(self):
         """Test 8: /api/chat enforces desktop sandboxing for remote OS launch commands."""
