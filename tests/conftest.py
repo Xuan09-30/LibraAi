@@ -43,11 +43,25 @@ def isolate_test_environment(tmp_path_factory):
     if os.path.isfile(real_db):
         shutil.copy2(real_db, test_db)
 
+    test_soul = str(test_sandbox / "SOUL.md")
+    real_soul = os.path.join(PROJECT_ROOT, "assets", "SOUL.md")
+    if os.path.isfile(real_soul):
+        shutil.copy2(real_soul, test_soul)
+
+    test_user = str(test_sandbox / "USER.md")
+    real_user = os.path.join(PROJECT_ROOT, "assets", "USER.md")
+    if os.path.isfile(real_user):
+        shutil.copy2(real_user, test_user)
+
     orig_vault = os.environ.get("LIBRA_VAULT_DIR")
     orig_db = os.environ.get("LIBRA_MEMORY_DB")
+    orig_soul = os.environ.get("LIBRA_SOUL_PATH")
+    orig_user = os.environ.get("LIBRA_USER_PATH")
 
     os.environ["LIBRA_VAULT_DIR"] = str(test_vault)
     os.environ["LIBRA_MEMORY_DB"] = test_db
+    os.environ["LIBRA_SOUL_PATH"] = test_soul
+    os.environ["LIBRA_USER_PATH"] = test_user
 
     yield
 
@@ -60,3 +74,13 @@ def isolate_test_environment(tmp_path_factory):
         os.environ["LIBRA_MEMORY_DB"] = orig_db
     else:
         os.environ.pop("LIBRA_MEMORY_DB", None)
+
+    if orig_soul is not None:
+        os.environ["LIBRA_SOUL_PATH"] = orig_soul
+    else:
+        os.environ.pop("LIBRA_SOUL_PATH", None)
+
+    if orig_user is not None:
+        os.environ["LIBRA_USER_PATH"] = orig_user
+    else:
+        os.environ.pop("LIBRA_USER_PATH", None)

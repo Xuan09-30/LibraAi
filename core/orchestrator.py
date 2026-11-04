@@ -52,6 +52,8 @@ BLOCKED_REMOTE_ACTIONS = {
     "toggle_game_mode",
     "show_ui",
     "hide_ui",
+    "persona_update",
+    "update_personality",
 }
 
 REMOTE_WEB_ALLOWED_TOOLS = {
@@ -85,7 +87,6 @@ REMOTE_HOST_ALLOWED_TOOLS = set(REMOTE_WEB_ALLOWED_TOOLS) | {
     "list_reminders",
     "cancel_reminders",
     "data_science",
-    "persona_update",
 }
 
 DESTRUCTIVE_MACRO_ACTIONS = {

@@ -2955,8 +2955,8 @@ class LocalLLM:
             or re.search(r"\b(?:update\s+your\s+soul|change\s+your\s+personality|change\s+your\s+tone)\b", q_lower)
         )
         if personality_match:
-            if client_scope == "remote_web":
-                return self._sandbox_blocked_response("update_personality")
+            if client_scope != "local_desktop":
+                return self._sandbox_blocked_response("update_personality", client_scope=client_scope)
             ack_msg = self.persona.update_soul_trait(cleaned_query)
             plan_res = {
                 "action": "update_personality",
