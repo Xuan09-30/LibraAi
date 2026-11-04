@@ -36,6 +36,38 @@ BLOCKED_REMOTE_ACTIONS = {
     "select_profile",
     "media_action",
     "virus_scan",
+    "create_skill",
+    "run_learned_skill",
+    "clipboard_copilot",
+    "active_window",
+    "workspace_macro",
+    "spotify_action",
+    "game_mode",
+}
+
+REMOTE_WEB_ALLOWED_TOOLS = {
+    "chat",
+    "web_search",
+    "deep_research",
+    "weather",
+    "world_time",
+    "time",
+    "places_search",
+    "compare_candidates",
+    "place_detail",
+    "recall_memory",
+    "profile_recall",
+    "daily_briefing",
+    "currency_convert",
+    "unit_convert",
+    "math_eval",
+    "ping_check",
+    "clarify",
+    "list_skills",
+    "system_status",
+    "document_rag",
+    "vision_qa",
+    "lookup_entity",
 }
 
 DESTRUCTIVE_MACRO_ACTIONS = {
@@ -214,8 +246,39 @@ class SupervisorHub:
 
         return [prompt]
 
-    def _execute_cached_tool(self, action: str, args: dict, dry_run: bool = False) -> Dict[str, Any]:
+    def get_registered_tools(self, client_scope: str = "local_desktop") -> set:
+        """
+        Returns the registered tool allowlist for the given client_scope.
+        remote_web sessions never get OS-control or terminal tools registered.
+        """
+        if client_scope == "remote_web":
+            return set(REMOTE_WEB_ALLOWED_TOOLS)
+        return (
+            set(REMOTE_WEB_ALLOWED_TOOLS)
+            | set(BLOCKED_REMOTE_ACTIONS)
+            | {
+                "remember_fact",
+                "forget_memory",
+                "schedule_reminder",
+                "list_reminders",
+                "cancel_reminders",
+                "data_science",
+                "persona_update",
+                "show_ui",
+                "hide_ui",
+            }
+        )
+
+    def _execute_cached_tool(self, action: str, args: dict, dry_run: bool = False, client_scope: str = "local_desktop") -> Dict[str, Any]:
         """Dispatches an already-compiled tool action directly to the runtime module."""
+        if client_scope == "remote_web" and (action in BLOCKED_REMOTE_ACTIONS or action not in self.get_registered_tools("remote_web")):
+            return {
+                "action": "sandboxed_blocked",
+                "status": "blocked",
+                "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                "client_scope": client_scope,
+                "blocked_action": action
+            }
         if action == "open_app":
             target = args.get("app_id") or args.get("target", "")
             res = self.llm.dispatcher.launch_app(target, dry_run=dry_run)
@@ -539,11 +602,23 @@ class SupervisorHub:
 
         # FAST PATH (<5ms): Single intent query
         if len(sub_steps) == 1:
-            res = self.llm.plan(prompt, dry_run=dry_run)
+            if client_scope == "remote_web" and not dry_run:
+                # Tool-layer sandbox: inspect planned action in dry_run BEFORE allowing any OS/terminal tool to execute
+                preview = self.llm.plan(prompt, dry_run=True, client_scope=client_scope)
+                preview_act = preview.get("action")
+                if preview_act in BLOCKED_REMOTE_ACTIONS or (preview_act and preview_act not in self.get_registered_tools("remote_web")):
+                    return {
+                        "action": "sandboxed_blocked",
+                        "status": "blocked",
+                        "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                        "client_scope": client_scope,
+                        "blocked_action": preview_act
+                    }
+            res = self.llm.plan(prompt, dry_run=dry_run, client_scope=client_scope)
             res["compound"] = False
             elapsed_ms = (time.perf_counter() - t_start) * 1000.0
             act = res.get("action")
-            if client_scope == "remote_web" and act in BLOCKED_REMOTE_ACTIONS:
+            if client_scope == "remote_web" and (act in BLOCKED_REMOTE_ACTIONS or (act and act not in self.get_registered_tools("remote_web"))):
                 return {
                     "action": "sandboxed_blocked",
                     "status": "blocked",
@@ -575,7 +650,18 @@ class SupervisorHub:
         for idx, step in enumerate(sub_steps[:self.MAX_STEPS]):
             if idx < len(self.scratchpad.subtasks):
                 self.scratchpad.subtasks[idx]["status"] = "running"
-            res = self.llm.plan(step, dry_run=dry_run)
+            if client_scope == "remote_web" and not dry_run:
+                preview_step = self.llm.plan(step, dry_run=True, client_scope=client_scope)
+                p_act = preview_step.get("action")
+                if p_act in BLOCKED_REMOTE_ACTIONS or (p_act and p_act not in self.get_registered_tools("remote_web")):
+                    return {
+                        "action": "sandboxed_blocked",
+                        "status": "blocked",
+                        "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                        "client_scope": client_scope,
+                        "blocked_action": p_act
+                    }
+            res = self.llm.plan(step, dry_run=dry_run, client_scope=client_scope)
             if idx < len(self.scratchpad.subtasks):
                 self.scratchpad.subtasks[idx]["action"] = res.get("action", step)
                 self.scratchpad.subtasks[idx]["args"] = res.get("args", {})

@@ -322,6 +322,48 @@ class TestEmailAuthAndIsolation(unittest.TestCase):
         )
         self.assertEqual(res_sess_spoof.status_code, 403)
 
+    def test_11_tool_layer_sandbox_and_docker_code_execution_guard(self):
+        """
+        Tier 1 Security:
+        1. remote_web sessions never get OS-control or terminal tools registered.
+        2. Prompts that bypass regex (e.g. 'fire up Roblox', 'create a python file called pwned.py')
+           are blocked at the tool layer BEFORE any OS tool function is invoked.
+        3. SkillForge and PersistentDataREPL execute LLM-generated code only via Docker sandbox.
+        """
+        # 1. Verify OS/terminal tools are never registered for remote_web
+        remote_tools = self.hub.get_registered_tools("remote_web")
+        for forbidden in ("open_app", "close_app", "create_file", "create_folder", "gui_action", "computer_use_agent", "shutdown", "create_skill"):
+            self.assertNotIn(forbidden, remote_tools)
+
+        # 2. Spy on underlying OS tools and verify regex-bypassing prompts NEVER invoke them in remote_web
+        invoked_os_tools = []
+        orig_launch = self.hub.llm.dispatcher.launch_app
+        orig_create_file = self.hub.llm.file_mgr.create_file
+        self.hub.llm.dispatcher.launch_app = lambda *a, **kw: (invoked_os_tools.append(("launch_app", a, kw)) or (True, "Launched"))
+        self.hub.llm.file_mgr.create_file = lambda *a, **kw: (invoked_os_tools.append(("create_file", a, kw)) or (True, "Created", "pwned.py"))
+        try:
+            for bypass_prompt in (
+                "fire up Roblox",
+                "create a python file called pwned.py",
+            ):
+                res = self.hub.process_command(bypass_prompt, client_scope="remote_web", dry_run=False)
+                self.assertEqual(res.get("action"), "sandboxed_blocked", f"Bypass prompt '{bypass_prompt}' was not blocked at tool layer!")
+                self.assertEqual(len(invoked_os_tools), 0, f"Underlying OS tool was invoked before blocking for '{bypass_prompt}'!")
+        finally:
+            self.hub.llm.dispatcher.launch_app = orig_launch
+            self.hub.llm.file_mgr.create_file = orig_create_file
+
+        # 3. Verify PersistentDataREPL and SkillForge require Docker sandbox for untrusted generated code
+        repl = self.hub.data_scientist.repl
+        res_repl = repl.run_code("import os; print(os.getcwd())", require_docker_sandbox=True, _force_docker_unavailable=True)
+        self.assertEqual(res_repl.get("status"), "sandbox_error")
+        self.assertIn("Docker sandbox", res_repl.get("error", ""))
+
+        sf = self.hub.llm.skill_forge
+        res_sf = sf.execute_in_docker_sandbox("print('hello')", _force_docker_unavailable=True)
+        self.assertEqual(res_sf.get("status"), "sandbox_error")
+        self.assertIn("Docker sandbox", res_sf.get("error", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

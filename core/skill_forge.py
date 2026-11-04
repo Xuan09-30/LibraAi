@@ -178,6 +178,56 @@ class SkillForge:
 
         return None
 
+    @staticmethod
+    def is_docker_sandbox_available(_force_unavailable: bool = False) -> bool:
+        """Checks if Docker daemon is running and accessible for isolated skill execution."""
+        if _force_unavailable:
+            return False
+        import subprocess
+        try:
+            proc = subprocess.run(["docker", "info"], capture_output=True, text=True, timeout=3.0)
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    def execute_in_docker_sandbox(self, code: str, timeout_sec: float = 5.0, _force_docker_unavailable: bool = False) -> Dict[str, Any]:
+        """
+        Executes generated skill Python code inside an isolated Docker sandbox container
+        with --network none, --read-only, and memory/CPU caps.
+        """
+        import subprocess
+        if not self.is_docker_sandbox_available(_force_unavailable=_force_docker_unavailable):
+            return {
+                "status": "sandbox_error",
+                "error": "Docker sandbox is required for untrusted generated skill code, but the Docker daemon is unavailable.",
+                "voice_response": "Cannot execute generated skill code: Docker sandbox is offline."
+            }
+        cmd = [
+            "docker", "run", "--rm",
+            "--network", "none",
+            "--memory", "256m",
+            "--cpus", "1",
+            "--pids-limit", "64",
+            "--read-only",
+            "-i", "python:3.11-slim",
+            "python", "-c", code
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+            return {
+                "status": "success" if proc.returncode == 0 else "error",
+                "stdout": (proc.stdout or "").strip(),
+                "stderr": (proc.stderr or "").strip(),
+                "error": (proc.stderr or "").strip() if proc.returncode != 0 else None,
+                "sandboxed": "docker"
+            }
+        except Exception as exc:
+            return {
+                "status": "sandbox_error",
+                "error": f"Docker sandbox execution error: {exc}",
+                "voice_response": "Generated skill execution failed inside Docker sandbox."
+            }
+
     def validate_skill_code(self, code: str) -> Tuple[bool, str]:
         """
         Parses skill code through the AST Security Sandbox.

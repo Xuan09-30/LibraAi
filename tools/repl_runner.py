@@ -110,7 +110,75 @@ class PersistentDataREPL:
                 self.user_ns.pop(k, None)
             self._seed_scientific_imports()
 
-    def run_code(self, code: str, timeout_sec: float = 12.0) -> Dict[str, Any]:
+    @staticmethod
+    def is_docker_sandbox_available(_force_unavailable: bool = False) -> bool:
+        """Checks whether the Docker daemon is reachable for isolated container execution."""
+        if _force_unavailable:
+            return False
+        import subprocess
+        try:
+            proc = subprocess.run(["docker", "info"], capture_output=True, text=True, timeout=3.0)
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    def run_in_docker_sandbox(self, code: str, timeout_sec: float = 12.0, _force_docker_unavailable: bool = False) -> Dict[str, Any]:
+        """
+        Executes generated Python code inside a network-disabled, memory/CPU-capped,
+        read-only Docker sandbox container (never in-process on the host).
+        """
+        import subprocess
+        t0 = time.perf_counter()
+        if not self.is_docker_sandbox_available(_force_unavailable=_force_docker_unavailable):
+            return {
+                "status": "sandbox_error",
+                "stdout": "",
+                "stderr": "",
+                "result": None,
+                "error": "Docker sandbox is required to execute generated code, but the Docker daemon is unavailable.",
+                "duration_ms": round((time.perf_counter() - t0) * 1000.0, 2),
+                "dataframes": {},
+                "variables": {}
+            }
+        cmd = [
+            "docker", "run", "--rm",
+            "--network", "none",
+            "--memory", "256m",
+            "--cpus", "1",
+            "--pids-limit", "64",
+            "--read-only",
+            "-i", "python:3.11-slim",
+            "python", "-c", code
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
+            duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            return {
+                "status": "success" if proc.returncode == 0 else "error",
+                "stdout": (proc.stdout or "").strip(),
+                "stderr": (proc.stderr or "").strip(),
+                "result": None,
+                "error": (proc.stderr or "").strip() if proc.returncode != 0 else None,
+                "duration_ms": duration_ms,
+                "elapsed_sec": round(duration_ms / 1000.0, 4),
+                "dataframes": {},
+                "variables": {},
+                "sandboxed": "docker"
+            }
+        except Exception as exc:
+            duration_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+            return {
+                "status": "sandbox_error",
+                "stdout": "",
+                "stderr": "",
+                "result": None,
+                "error": f"Docker sandbox execution error: {exc}",
+                "duration_ms": duration_ms,
+                "dataframes": {},
+                "variables": {}
+            }
+
+    def run_code(self, code: str, timeout_sec: float = 12.0, require_docker_sandbox: bool = False, _force_docker_unavailable: bool = False) -> Dict[str, Any]:
         """
         Redirects `stdout` and `stderr`, runs `code` in the persistent namespace,
         and returns:
@@ -125,6 +193,9 @@ class PersistentDataREPL:
             "variables": dict
         }
         """
+        if require_docker_sandbox:
+            return self.run_in_docker_sandbox(code, timeout_sec=timeout_sec, _force_docker_unavailable=_force_docker_unavailable)
+
         clean_code = (code or "").strip()
         if not clean_code:
             return {
