@@ -480,6 +480,25 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
     monitor = SystemMonitor()
 
+    app.state.rate_limit_max_requests = int(cfg.get("rate_limit_per_minute", 60))
+    app.state.rate_limit_window_sec = 60.0
+    app.state.rate_limit_buckets = {}
+
+    def _enforce_rate_limit(bucket_key: str):
+        now_ts = time.time()
+        max_reqs = getattr(app.state, "rate_limit_max_requests", 60)
+        win_sec = getattr(app.state, "rate_limit_window_sec", 60.0)
+        buckets = getattr(app.state, "rate_limit_buckets", {})
+        history = [t for t in buckets.get(bucket_key, []) if now_ts - t < win_sec]
+        if len(history) >= max_reqs:
+            buckets[bucket_key] = history
+            raise HTTPException(
+                status_code=429,
+                detail="Too Many Requests: Rate limit exceeded. Please wait before sending more requests."
+            )
+        history.append(now_ts)
+        buckets[bucket_key] = history
+
     static_dir = os.path.join(os.path.dirname(__file__), "static")
 
     # -----------------------------------------------------------------------
@@ -1074,6 +1093,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         """Dispatches a strictly unique 6-digit OTP code to the requested email."""
 
         clean_email = req.email.strip().lower()
+        _enforce_rate_limit(f"otp:{clean_email}")
 
         if not clean_email or "@" not in clean_email or "." not in clean_email:
 
@@ -2341,8 +2361,15 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                 detail="Forbidden: 'local_desktop' scope cannot be set from a remote request body."
             )
 
+        # Enforce per-user / per-token sliding-window rate limit
+        rate_key = f"chat:{auth.get('email') or auth.get('token') or role}"
+        _enforce_rate_limit(rate_key)
+
         # Derive client_scope strictly server-side from auth role
         scope = "remote_host" if role == "host" else "remote_web"
+        if hasattr(supervisor, "llm") and supervisor.llm is not None:
+            supervisor.llm.active_user_email = (auth.get("email") or "").strip().lower()
+            supervisor.llm.active_user_role = role
 
         memory = getattr(supervisor.llm, "memory", None)
 

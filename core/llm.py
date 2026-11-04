@@ -1198,7 +1198,7 @@ class LocalLLM:
             clean_fact = raw_fact.rstrip(".?!")
             plan_res = {"action": "remember_fact", "args": {"fact": clean_fact}, "fact": clean_fact}
             if not dry_run:
-                self.memory.remember_fact(clean_fact)
+                self.memory.remember_fact(clean_fact, user_email=getattr(self, "active_user_email", ""), role=getattr(self, "active_user_role", "host" if client_scope == "local_desktop" else "tester"))
                 msg = f"Got it. I've committed that to memory: {clean_fact}."
                 plan_res["voice_response"] = msg
                 self._record_turn(prompt, msg)
@@ -1237,7 +1237,7 @@ class LocalLLM:
             query = recall_match.group(1).strip().rstrip(".?!")
             plan_res = {"action": "recall_memory", "args": {"query": query}, "query": query}
             if not dry_run:
-                relevant = self.memory.recall_relevant(query, limit=3)
+                relevant = self.memory.recall_relevant(query, limit=3, user_email=getattr(self, "active_user_email", ""))
                 if relevant:
                     facts_str = "\n".join([f"- {r['content']}" for r in relevant])
                 else:
@@ -3141,7 +3141,7 @@ class LocalLLM:
         else:
             plan_res = {"action": "chat", "args": {}}
             if not dry_run:
-                relevant_memories = self.memory.recall_relevant(prompt, limit=2)
+                relevant_memories = self.memory.recall_relevant(prompt, limit=2, user_email=getattr(self, "active_user_email", ""))
                 relevant_episodes = self.memory.recall_episodes(prompt, limit=2)
                 ctx_blocks = []
                 # Phase 11: Ingest live active window and currently running game so chat never hallucinates stale games

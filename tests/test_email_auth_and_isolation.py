@@ -365,5 +365,89 @@ class TestEmailAuthAndIsolation(unittest.TestCase):
         self.assertIn("Docker sandbox", res_sf.get("error", ""))
 
 
+
+    def test_12_memory_isolation_tester_cannot_write_host_vault_or_lessons(self):
+        """
+        Tier 1 Security:
+        Isolate memory per user so a Tester cannot write to the Host's vault (assets/vault/)
+        or LESSONS.md, nor overwrite Host semantic facts.
+        """
+        tester = self.memory.get_or_create_registered_user("tester_mem@example.com")
+        tester_headers = {"Authorization": f"Bearer {tester['unique_token']}"}
+
+        # 1. Tester attempting to POST/PUT/DELETE on /api/vault is rejected with 403
+        r_post = self.client.post(
+            "/api/vault",
+            json={"entity": "host_pc", "relation": "owner", "value": "tester_spoof"},
+            headers=tester_headers
+        )
+        self.assertEqual(r_post.status_code, 403)
+
+        # 2. Direct memory calls with non-host role must not write to Host LESSONS.md or Host vault
+        lid = self.memory.record_correction(
+            "open browser",
+            "opened edge",
+            "open chrome",
+            user_email="tester_mem@example.com",
+            role="tester"
+        )
+        self.assertEqual(lid, -1, "Tester should not be permitted to write operational rules to Host LESSONS.md!")
+
+        fid = self.memory.upsert_semantic_fact(
+            "user",
+            "favorite_drink",
+            "matcha",
+            user_email="tester_mem@example.com",
+            role="tester"
+        )
+        # Host semantic facts for entity='user' must not be polluted by tester
+        host_facts = self.memory.get_semantic_facts(entity="user")
+        self.assertFalse(any(f.get("value") == "matcha" for f in host_facts))
+
+    def test_13_hashed_expiring_invite_tokens_and_rate_limiting(self):
+        """
+        Tier 1 Security:
+        1. Guest/invite tokens are stored hashed (SHA-256) in SQLite, never in plaintext,
+           and enforce expiration by default.
+        2. Rate limiting returns HTTP 429 when request burst exceeds limit.
+        """
+        # 1. Create guest token and inspect raw SQLite table to verify hashed storage & default expiry
+        created = self.memory.create_guest_token(label="TempEvaluator")
+        raw_tok = created["token"]
+        self.assertTrue(raw_tok.startswith("libra_guest_"))
+        self.assertIsNotNone(created.get("expires_at"), "Guest token must have an expiration timestamp by default!")
+
+        conn = self.memory._get_connection()
+        rows = conn.execute("SELECT token FROM guest_tokens WHERE label = 'TempEvaluator' ORDER BY rowid DESC").fetchall()
+        if self.memory.db_path != ":memory:":
+            conn.close()
+        self.assertGreaterEqual(len(rows), 1)
+        stored_tok = rows[0][0]
+        self.assertNotEqual(stored_tok, raw_tok, "Plaintext guest token must not be stored in SQLite!")
+        self.assertTrue(stored_tok.startswith("sha256:"))
+
+        # Validation still works with raw token
+        valid = self.memory.validate_guest_token(raw_tok)
+        self.assertIsNotNone(valid)
+        self.assertEqual(valid["label"], "TempEvaluator")
+
+        # Expired token is rejected
+        expired = self.memory.create_guest_token(label="ExpiredEval", expires_in_days=-1)
+        self.assertIsNone(self.memory.validate_guest_token(expired["token"]))
+
+        # 2. Rate limiting check on /api/chat
+        tester = self.memory.get_or_create_registered_user("ratelimit_user@example.com")
+        headers = {"Authorization": f"Bearer {tester['unique_token']}"}
+        self.app.state.rate_limit_max_requests = 3
+        try:
+            statuses = []
+            for i in range(5):
+                r = self.client.post("/api/chat", json={"prompt": "what time is it"}, headers=headers)
+                statuses.append(r.status_code)
+            self.assertIn(429, statuses, f"Expected HTTP 429 rate limit in statuses, got {statuses}")
+        finally:
+            self.app.state.rate_limit_max_requests = 60
+
+
 if __name__ == "__main__":
     unittest.main()

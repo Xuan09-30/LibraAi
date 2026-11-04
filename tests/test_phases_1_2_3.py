@@ -122,6 +122,36 @@ class TestPhase1MarkovAndHMEM(unittest.TestCase):
         self.assertEqual(facts.get("in_game_name"), "Kyodon")
 
 
+
+    def test_10_lessons_expiry_conflict_resolution_and_hybrid_rrf_recall(self):
+        """
+        Tier 2 Memory Correctness:
+        1. Counterfactual rules in LESSONS support TTL expiry and conflict resolution
+           (newer rule for the same trigger supersedes conflicting older rule).
+        2. Hybrid sqlite-vec + FTS5 recall merges vector and lexical rankings via
+           Reciprocal Rank Fusion (RRF).
+        """
+        # 1. Conflict resolution: record two conflicting rules for the same trigger
+        self.mem.record_correction("launch code editor", "opened notepad", "open vscode", ttl_days=30)
+        self.mem.record_correction("launch code editor", "opened vscode", "open cursor", ttl_days=30)
+        lessons = self.mem.recall_lesson_objects("launch code editor")
+        self.assertEqual(len(lessons), 1, f"Conflicting older lesson was not superseded! Got: {lessons}")
+        self.assertEqual(lessons[0]["corrected_action"], "open cursor")
+
+        # 2. Expiry: record a rule that is already expired (ttl_days=-1)
+        self.mem.record_correction("open music player", "opened wmp", "open spotify", ttl_days=-1)
+        expired_lessons = self.mem.recall_lesson_objects("open music player")
+        self.assertEqual(len(expired_lessons), 0, "Expired counterfactual lesson should not be recalled!")
+
+        # 3. Hybrid sqlite-vec + FTS5 Reciprocal Rank Fusion (RRF)
+        self.mem.remember_fact("The user's primary GPU is an NVIDIA GeForce RTX 5060 Ti with 16GB VRAM.")
+        self.mem.remember_fact("The user enjoys eating spicy Ayam Gepuk in Kepong.")
+        rrf_results = self.mem.recall_relevant("RTX 5060 Ti 16GB VRAM", limit=2)
+        self.assertGreaterEqual(len(rrf_results), 1)
+        self.assertIn("RTX 5060 Ti", rrf_results[0]["content"])
+        self.assertIn("rrf_score", rrf_results[0], "Expected rrf_score from Reciprocal Rank Fusion!")
+
+
 class TestPhase2DualPassVisionAndSoM(unittest.TestCase):
     def setUp(self):
         self.spatial = SpatialGroundingEngine()

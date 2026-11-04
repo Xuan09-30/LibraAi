@@ -10,7 +10,8 @@ import sqlite_vec
 
 import requests
 
-from datetime import datetime
+import hashlib
+from datetime import datetime, timedelta
 
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -289,7 +290,7 @@ class SemanticMemory:
 
         """)
 
-        # 6. Counterfactual correction lessons table (v8.0)
+        # 6. Counterfactual correction lessons table (v8.0 + Tier 2 Expiry & Conflict Resolution)
 
         cursor.execute("""
 
@@ -303,11 +304,60 @@ class SemanticMemory:
 
                 corrected_action TEXT NOT NULL,
 
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+                expires_at TIMESTAMP NULL,
+
+                superseded INTEGER DEFAULT 0,
+
+                user_email TEXT DEFAULT ''
 
             )
 
         """)
+
+        try:
+            l_cols = [c[1] for c in cursor.execute("PRAGMA table_info(lessons)").fetchall()]
+            if "expires_at" not in l_cols:
+                cursor.execute("ALTER TABLE lessons ADD COLUMN expires_at TIMESTAMP NULL")
+            if "superseded" not in l_cols:
+                cursor.execute("ALTER TABLE lessons ADD COLUMN superseded INTEGER DEFAULT 0")
+            if "user_email" not in l_cols:
+                cursor.execute("ALTER TABLE lessons ADD COLUMN user_email TEXT DEFAULT ''")
+        except Exception:
+            pass
+
+        try:
+            f_cols = [c[1] for c in cursor.execute("PRAGMA table_info(facts)").fetchall()]
+            if "user_email" not in f_cols:
+                cursor.execute("ALTER TABLE facts ADD COLUMN user_email TEXT DEFAULT ''")
+            cursor.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+                    content,
+                    category,
+                    content='facts',
+                    content_rowid='id'
+                )
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+                    INSERT INTO facts_fts(rowid, content, category) VALUES (new.id, new.content, new.category);
+                END;
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+                    INSERT INTO facts_fts(facts_fts, rowid, content, category) VALUES('delete', old.id, old.content, old.category);
+                END;
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
+                    INSERT INTO facts_fts(facts_fts, rowid, content, category) VALUES('delete', old.id, old.content, old.category);
+                    INSERT INTO facts_fts(rowid, content, category) VALUES (new.id, new.content, new.category);
+                END;
+            """)
+            cursor.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
+        except Exception:
+            pass
 
         # 7. Vector virtual table for lessons using vec0 (v8.0)
 
@@ -805,125 +855,155 @@ class SemanticMemory:
 
             return [0.0] * self.dim
 
-    def remember_fact(self, fact: str, category: str = "user_fact") -> int:
-
-        """Stores fact in `facts` and embedding in `vec_facts`. Returns inserted fact id."""
-
+    def remember_fact(
+        self,
+        fact: str,
+        category: str = "user_fact",
+        user_email: str = "",
+        role: str = "host"
+    ) -> int:
+        """Stores fact in `facts` (isolated by `user_email`) and embedding in `vec_facts`. Returns inserted fact id."""
         clean_fact = fact.strip()
-
         if not clean_fact:
-
             return -1
 
+        clean_email = (user_email or "").strip().lower()
         emb = self.embed_text(clean_fact)
-
         conn = self._get_connection()
-
         cursor = conn.cursor()
-
-        cursor.execute(
-
-            "INSERT INTO facts (content, category, created_at) VALUES (?, ?, ?)",
-
-            (clean_fact, category, datetime.now().isoformat())
-
-        )
-
-        fact_id = cursor.lastrowid
-
-        if emb and any(emb):
-
+        try:
             cursor.execute(
-
-                "INSERT INTO vec_facts (fact_id, embedding) VALUES (?, ?)",
-
-                (fact_id, sqlite_vec.serialize_float32(emb))
-
+                "INSERT INTO facts (content, category, created_at, user_email) VALUES (?, ?, ?, ?)",
+                (clean_fact, category, datetime.now().isoformat(), clean_email)
             )
-
+        except Exception:
+            cursor.execute(
+                "INSERT INTO facts (content, category, created_at) VALUES (?, ?, ?)",
+                (clean_fact, category, datetime.now().isoformat())
+            )
+        fact_id = cursor.lastrowid
+        if emb and any(emb):
+            cursor.execute(
+                "INSERT INTO vec_facts (fact_id, embedding) VALUES (?, ?)",
+                (fact_id, sqlite_vec.serialize_float32(emb))
+            )
         conn.commit()
-
         if self.db_path != ":memory:":
-
             conn.close()
-
         return fact_id
 
-    def recall_relevant(self, query: str, limit: int = 3, distance_threshold: float = 0.50) -> list[dict]:
-
-        """Runs KNN vector search against `vec_facts` JOIN `facts` ORDER BY distance LIMIT k."""
-
+    def recall_relevant(
+        self,
+        query: str,
+        limit: int = 3,
+        distance_threshold: float = 0.50,
+        user_email: str = "",
+        rrf_k: int = 60
+    ) -> list[dict]:
+        """
+        Hybrid Semantic Recall (Tier 2):
+        Runs KNN vector search against `vec_facts` AND BM25 full-text search against `facts_fts`,
+        merging rankings with Reciprocal Rank Fusion (RRF: 1/(k + rank_vec) + 1/(k + rank_fts))
+        while enforcing per-user memory isolation (`user_email`).
+        """
         clean_query = query.strip()
-
         if not clean_query:
-
             return []
 
-        emb = self.embed_text(clean_query)
-
-        if not emb or not any(emb):
-
-            return []
+        clean_email = (user_email or "").strip().lower()
+        is_host_query = (not clean_email) or (clean_email in ("REDACTED", "REDACTED"))
 
         conn = self._get_connection()
-
         cursor = conn.cursor()
+        candidates_by_id: dict[int, dict] = {}
+        vec_ranks: dict[int, int] = {}
+        fts_ranks: dict[int, int] = {}
 
-        sql = """
+        try:
+            # 1. Dense Vector KNN leg (sqlite-vec)
+            emb = self.embed_text(clean_query)
+            if emb and any(emb):
+                sql_vec = """
+                    SELECT f.id, f.content, f.category, f.created_at, v.distance, COALESCE(f.user_email, '')
+                    FROM vec_facts v
+                    JOIN facts f ON f.id = v.fact_id
+                    WHERE v.embedding MATCH ? AND k = ?
+                    ORDER BY v.distance ASC
+                """
+                try:
+                    cursor.execute(sql_vec, (sqlite_vec.serialize_float32(emb), max(limit * 3, 10)))
+                    v_rows = cursor.fetchall()
+                except Exception:
+                    v_rows = []
+                rank_idx = 1
+                for r in v_rows:
+                    fid, content, cat, created_at, dist, row_email = r[0], r[1], r[2], r[3], float(r[4]), (r[5] or "").strip().lower()
+                    if not is_host_query and row_email not in (clean_email,) and cat != "core_deep_memory":
+                        continue
+                    if is_host_query and row_email and row_email not in ("REDACTED", "REDACTED", ""):
+                        continue
+                    if dist <= distance_threshold:
+                        vec_ranks[fid] = rank_idx
+                        rank_idx += 1
+                        candidates_by_id[fid] = {
+                            "id": fid,
+                            "content": content,
+                            "category": cat,
+                            "created_at": created_at,
+                            "distance": dist
+                        }
 
-            SELECT
+            # 2. Lexical FTS5 BM25 leg (facts_fts)
+            tokens = [t for t in re.findall(r"[a-zA-Z0-9]+", clean_query) if len(t) >= 2]
+            if tokens:
+                fts_expr = " OR ".join(f'"{t}"*' for t in tokens[:8])
+                sql_fts = """
+                    SELECT f.id, f.content, f.category, f.created_at, bm25(facts_fts) AS bm25_score, COALESCE(f.user_email, '')
+                    FROM facts f
+                    JOIN facts_fts ON f.id = facts_fts.rowid
+                    WHERE facts_fts MATCH ?
+                    ORDER BY bm25(facts_fts) ASC
+                    LIMIT ?
+                """
+                try:
+                    cursor.execute(sql_fts, (fts_expr, max(limit * 3, 10)))
+                    f_rows = cursor.fetchall()
+                except Exception:
+                    f_rows = []
+                rank_idx = 1
+                for r in f_rows:
+                    fid, content, cat, created_at, bm25_val, row_email = r[0], r[1], r[2], r[3], float(r[4] or 0.0), (r[5] or "").strip().lower()
+                    if not is_host_query and row_email not in (clean_email,) and cat != "core_deep_memory":
+                        continue
+                    if is_host_query and row_email and row_email not in ("REDACTED", "REDACTED", ""):
+                        continue
+                    fts_ranks[fid] = rank_idx
+                    rank_idx += 1
+                    if fid not in candidates_by_id:
+                        candidates_by_id[fid] = {
+                            "id": fid,
+                            "content": content,
+                            "category": cat,
+                            "created_at": created_at,
+                            "distance": 0.35
+                        }
 
-                f.id,
+            # 3. Reciprocal Rank Fusion (RRF) merge
+            merged = []
+            for fid, item in candidates_by_id.items():
+                r_v = vec_ranks.get(fid)
+                r_f = fts_ranks.get(fid)
+                rrf_score = (1.0 / (rrf_k + r_v) if r_v is not None else 0.0) + (1.0 / (rrf_k + r_f) if r_f is not None else 0.0)
+                item["rrf_score"] = round(rrf_score, 6)
+                item["vec_rank"] = r_v
+                item["fts_rank"] = r_f
+                merged.append(item)
 
-                f.content,
-
-                f.category,
-
-                f.created_at,
-
-                v.distance
-
-            FROM vec_facts v
-
-            JOIN facts f ON f.id = v.fact_id
-
-            WHERE v.embedding MATCH ? AND k = ?
-
-            ORDER BY v.distance ASC
-
-        """
-
-        cursor.execute(sql, (sqlite_vec.serialize_float32(emb), limit))
-
-        rows = cursor.fetchall()
-
-        results = []
-
-        for r in rows:
-
-            dist = float(r[4])
-
-            if dist <= distance_threshold:
-
-                results.append({
-
-                    "id": r[0],
-
-                    "content": r[1],
-
-                    "category": r[2],
-
-                    "created_at": r[3],
-
-                    "distance": dist
-
-                })
-
-        if self.db_path != ":memory:":
-
-            conn.close()
-
-        return results
+            merged.sort(key=lambda x: (-x["rrf_score"], x.get("distance", 1.0)))
+            return merged[:limit]
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
 
     def forget_fact(self, query: str, distance_threshold: float = 0.75) -> str | None:
 
@@ -1271,240 +1351,177 @@ class SemanticMemory:
 
             conn.close()
 
-    def record_correction(self, trigger_query: str, mistake: str, correction: str) -> int:
-
+    def record_correction(
+        self,
+        trigger_query: str,
+        mistake: str,
+        correction: str,
+        user_email: str = "",
+        role: str = "host",
+        ttl_days: int = 90
+    ) -> int:
         """
-
-        Counterfactual Correction Memory (v8.0):
-
-        Records an explicit user operational correction in `lessons`, indexes its vector
-
-        in `vec_lessons`, and appends a structured rule entry to `assets/LESSONS.md`.
-
+        Counterfactual Correction Memory (v8.0 + Tier 1/2 Hardening):
+        - Enforces per-user isolation: Testers/Guests cannot write to Host `LESSONS.md` or `lessons`.
+        - Conflict resolution: Marks older rules for the same normalized `context_trigger` as `superseded = 1`.
+        - Expiry: Attaches a TTL timestamp (`expires_at`) defaulting to 90 days.
         """
-
-        clean_trigger = (trigger_query or "").strip()
-
-        clean_mistake = (mistake or "").strip()
-
-        clean_correction = (correction or "").strip()
-
-        if not clean_trigger or not clean_correction:
-
+        clean_role = (role or "host").strip().lower()
+        clean_email = (user_email or "").strip().lower()
+        if clean_role != "host" or (clean_email and clean_email not in ("REDACTED", "REDACTED")):
             return -1
 
+        clean_trigger = (trigger_query or "").strip()
+        clean_mistake = (mistake or "").strip()
+        clean_correction = (correction or "").strip()
+        if not clean_trigger or not clean_correction:
+            return -1
+
+        now_dt = datetime.now()
+        exp_iso = (now_dt + timedelta(days=int(ttl_days))).isoformat() if ttl_days is not None else None
+
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-
         lessons_md_path = os.path.join(project_root, "assets", "LESSONS.md")
-
         os.makedirs(os.path.dirname(lessons_md_path), exist_ok=True)
-
         if not os.path.isfile(lessons_md_path):
-
             with open(lessons_md_path, "w", encoding="utf-8") as f:
-
                 f.write("# Project Libra — Counterfactual Correction & Operational Lesson Memory\n\n")
 
         entry_line = (
-
             f"- **Trigger**: `{clean_trigger}` | **Avoid**: `{clean_mistake}` "
-
-            f"| **Corrected Action**: `{clean_correction}` ({datetime.now().strftime('%Y-%m-%d %H:%M')})\n"
-
+            f"| **Corrected Action**: `{clean_correction}` | **Expires**: `{exp_iso or 'never'}` "
+            f"({now_dt.strftime('%Y-%m-%d %H:%M')})\n"
         )
-
         try:
-
             with open(lessons_md_path, "a", encoding="utf-8") as f:
-
                 f.write(entry_line)
-
         except Exception as e:
-
             print(f"[SemanticMemory LESSONS.md Write Warning]: {e}")
 
         emb = self.embed_text(clean_trigger)
-
         conn = self._get_connection()
-
         cursor = conn.cursor()
-
         try:
-
+            # Conflict resolution: mark any existing active rule with the same trigger as superseded
             cursor.execute(
-
-                "INSERT INTO lessons (context_trigger, error_action, corrected_action, created_at) VALUES (?, ?, ?, ?)",
-
-                (clean_trigger, clean_mistake, clean_correction, datetime.now().isoformat())
-
+                "UPDATE lessons SET superseded = 1 WHERE LOWER(context_trigger) = ? AND COALESCE(superseded, 0) = 0",
+                (clean_trigger.lower(),)
             )
-
+            cursor.execute(
+                "INSERT INTO lessons (context_trigger, error_action, corrected_action, created_at, expires_at, superseded, user_email) VALUES (?, ?, ?, ?, ?, 0, ?)",
+                (clean_trigger, clean_mistake, clean_correction, now_dt.isoformat(), exp_iso, clean_email)
+            )
             lesson_id = cursor.lastrowid
-
             if emb and any(emb):
-
                 cursor.execute(
-
                     "INSERT INTO vec_lessons (lesson_id, embedding) VALUES (?, ?)",
-
                     (lesson_id, sqlite_vec.serialize_float32(emb))
-
                 )
-
             conn.commit()
-
             return lesson_id
-
         except Exception as e:
-
             print(f"[SemanticMemory Record Correction Error]: {e}")
-
             return -1
-
         finally:
-
             if self.db_path != ":memory:":
-
                 conn.close()
 
     def recall_lesson_objects(self, query: str, threshold: float = 0.70) -> list[dict]:
-
-        """Returns structured lesson dictionaries matching `query` via vector KNN or exact/substring match."""
-
+        """
+        Returns active, non-expired, non-superseded lesson dictionaries matching `query`.
+        Resolves conflicts by keeping only the newest rule per `context_trigger`.
+        """
         clean_q = (query or "").strip()
-
         if not clean_q:
-
             return []
 
+        now_iso = datetime.now().isoformat()
         matched_lessons = []
-
         seen_ids = set()
-
+        seen_triggers = set()
         conn = self._get_connection()
-
         cursor = conn.cursor()
-
         try:
-
-            # 1. Exact or substring trigger match (deterministic & offline resilient)
-
             cursor.execute(
-
-                "SELECT id, context_trigger, error_action, corrected_action FROM lessons ORDER BY id DESC"
-
+                "SELECT id, context_trigger, error_action, corrected_action, expires_at, COALESCE(superseded, 0) "
+                "FROM lessons ORDER BY id DESC"
             )
-
             all_rows = cursor.fetchall()
-
             if not all_rows:
+                return []
 
+            active_rows = []
+            for lid, trig, err_act, corr_act, exp_at, superseded in all_rows:
+                if superseded:
+                    continue
+                if exp_at and str(exp_at) < now_iso:
+                    continue
+                t_key = (trig or "").strip().lower()
+                if t_key in seen_triggers:
+                    continue
+                seen_triggers.add(t_key)
+                active_rows.append((lid, trig, err_act, corr_act))
+
+            if not active_rows:
                 return []
 
             q_lower = clean_q.lower()
-
             q_tokens = set(re.findall(r"[a-z0-9]+", q_lower))
 
-            for lid, trig, err_act, corr_act in all_rows:
-
+            for lid, trig, err_act, corr_act in active_rows:
                 t_lower = (trig or "").lower()
-
                 t_tokens = set(re.findall(r"[a-z0-9]+", t_lower))
-
                 overlap = len(q_tokens & t_tokens) / max(len(t_tokens), 1) if t_tokens else 0.0
-
                 if t_lower and (t_lower == q_lower or t_lower in q_lower or q_lower in t_lower or overlap >= 0.6):
-
                     matched_lessons.append({
-
                         "id": lid,
-
                         "context_trigger": trig,
-
                         "error_action": err_act,
-
                         "corrected_action": corr_act,
-
                         "distance": 0.0,
-
                         "rule": f"[Rule: In past runs, the user corrected this action with: {corr_act} (avoid: {err_act})]"
-
                     })
-
                     seen_ids.add(lid)
 
             if matched_lessons:
-
                 return matched_lessons
 
-            # Only invoke vector KNN if query shares at least one content token with a stored lesson
-
             all_lesson_tokens = set()
-
-            for _, trig, err_act, _ in all_rows:
-
+            active_id_set = {r[0] for r in active_rows}
+            for _, trig, err_act, _ in active_rows:
                 all_lesson_tokens.update(re.findall(r"[a-z0-9]{3,}", f"{trig} {err_act}".lower()))
 
             if not (q_tokens & all_lesson_tokens):
-
                 return []
 
-            # 2. Vector KNN search against vec_lessons
-
             emb = self.embed_text(clean_q)
-
             if emb and any(emb):
-
                 sql = """
-
                     SELECT l.id, l.context_trigger, l.error_action, l.corrected_action, v.distance
-
                     FROM vec_lessons v
-
                     JOIN lessons l ON l.id = v.lesson_id
-
-                    WHERE v.embedding MATCH ? AND k = 3
-
+                    WHERE v.embedding MATCH ? AND k = 5
                     ORDER BY v.distance ASC
-
                 """
-
                 cursor.execute(sql, (sqlite_vec.serialize_float32(emb),))
-
                 for lid, trig, err_act, corr_act, dist in cursor.fetchall():
-
-                    if lid not in seen_ids and float(dist) <= threshold:
-
+                    if lid in active_id_set and lid not in seen_ids and float(dist) <= threshold:
                         matched_lessons.append({
-
                             "id": lid,
-
                             "context_trigger": trig,
-
                             "error_action": err_act,
-
                             "corrected_action": corr_act,
-
                             "distance": float(dist),
-
                             "rule": f"[Rule: In past runs, the user corrected this action with: {corr_act} (avoid: {err_act})]"
-
                         })
-
                         seen_ids.add(lid)
 
             return matched_lessons
-
         except Exception as e:
-
             print(f"[SemanticMemory Recall Lessons Error]: {e}")
-
             return matched_lessons
-
         finally:
-
             if self.db_path != ":memory:":
-
                 conn.close()
 
     def recall_applicable_lessons(self, query: str, threshold: float = 0.70) -> list[str]:
@@ -1877,7 +1894,11 @@ class SemanticMemory:
 
         category: str = "general",
 
-        pinned: bool = False
+        pinned: bool = False,
+
+        user_email: str = "",
+
+        role: str = "host"
 
     ) -> int:
 
@@ -1887,7 +1908,9 @@ class SemanticMemory:
 
         (entity, relation) -> value with confidence score, category, pinned state, and timestamp.
 
-        Syncs markdown representation to assets/vault/ if not actively syncing from disk.
+        Syncs markdown representation to assets/vault/ ONLY for Host users so a Tester cannot
+
+        write to the Host's Obsidian vault or overwrite Host semantic facts.
 
         """
 
@@ -1898,6 +1921,17 @@ class SemanticMemory:
         clean_v = (value or "").strip()
 
         clean_c = (category or "general").strip().lower()
+
+        clean_role = (role or "host").strip().lower()
+
+        clean_email = (user_email or "").strip().lower()
+
+        is_host_user = (clean_role == "host") and (not clean_email or clean_email in ("REDACTED", "REDACTED"))
+
+        if not is_host_user:
+            ns_prefix = f"user:{clean_email or clean_role}:"
+            if not clean_e.startswith("user:"):
+                clean_e = f"{ns_prefix}{clean_e}"
 
         pin_val = 1 if pinned else 0
 
@@ -1961,7 +1995,7 @@ class SemanticMemory:
 
                 conn.close()
 
-        if fact_id > 0 and not self._is_syncing_from_disk and self.db_path != ":memory:":
+        if fact_id > 0 and is_host_user and not self._is_syncing_from_disk and self.db_path != ":memory:":
 
             self.sync_fact_to_vault_markdown(fact_id)
 
@@ -4412,60 +4446,47 @@ class SemanticMemory:
 
     # -----------------------------------------------------------------------
 
-    def create_guest_token(self, label: str = "Guest", expires_in_days: Optional[int] = None) -> dict:
+    @staticmethod
+    def _hash_token(raw_token: str) -> str:
+        """Returns a salted/prefixed SHA-256 digest so raw invite tokens are never stored in plaintext."""
+        clean = (raw_token or "").strip()
+        if clean.startswith("sha256:"):
+            return clean
+        return "sha256:" + hashlib.sha256(clean.encode("utf-8")).hexdigest()
 
-        """Generates a secure guest access token for temporary or non-host sharing."""
-
+    def create_guest_token(self, label: str = "Guest", expires_in_days: Optional[int] = 7) -> dict:
+        """
+        Generates a secure expiring guest access token for temporary sharing.
+        Stores only the SHA-256 hash (`sha256:<hex>`) in SQLite; returns the raw token once to the caller.
+        Defaults to 7-day expiration if `expires_in_days` is None.
+        """
         import secrets, datetime
-
         raw_token = f"libra_guest_{secrets.token_hex(12)}"
-
-        exp_time = None
-
-        if expires_in_days and expires_in_days > 0:
-
-            exp_time = (datetime.datetime.utcnow() + datetime.timedelta(days=expires_in_days)).strftime("%Y-%m-%d %H:%M:%S")
+        hashed_token = self._hash_token(raw_token)
+        eff_days = 7 if expires_in_days is None else int(expires_in_days)
+        exp_time = (datetime.datetime.utcnow() + datetime.timedelta(days=eff_days)).strftime("%Y-%m-%d %H:%M:%S")
 
         conn = self._get_connection()
-
         cursor = conn.cursor()
-
         try:
-
             cursor.execute("""
-
                 INSERT INTO guest_tokens (token, label, created_at, expires_at, revoked, created_by)
-
                 VALUES (?, ?, CURRENT_TIMESTAMP, ?, 0, 'host')
-
-            """, (raw_token, label.strip() or "Guest", exp_time))
-
+            """, (hashed_token, label.strip() or "Guest", exp_time))
             conn.commit()
-
             return {
-
                 "token": raw_token,
-
+                "token_hash": hashed_token,
                 "label": label.strip() or "Guest",
-
                 "expires_at": exp_time,
-
                 "revoked": 0,
-
                 "role": "guest"
-
             }
-
         except Exception as e:
-
             print(f"[MemoryCore create_guest_token Error]: {e}")
-
             return {}
-
         finally:
-
             if self.db_path != ":memory:":
-
                 conn.close()
 
     def list_guest_tokens(self) -> list[dict]:
@@ -4525,56 +4546,37 @@ class SemanticMemory:
                 conn.close()
 
     def revoke_guest_token(self, token: str) -> bool:
-
-        """Revokes an existing guest access token."""
-
+        """Revokes an existing guest access token (matches either raw token or SHA-256 hash)."""
+        clean = (token or "").strip()
+        hashed = self._hash_token(clean)
         conn = self._get_connection()
-
         cursor = conn.cursor()
-
         try:
-
-            cursor.execute("UPDATE guest_tokens SET revoked = 1 WHERE token = ?", (token,))
-
+            cursor.execute("UPDATE guest_tokens SET revoked = 1 WHERE token IN (?, ?)", (hashed, clean))
             conn.commit()
-
             return cursor.rowcount > 0
-
         except Exception as e:
-
             print(f"[MemoryCore revoke_guest_token Error]: {e}")
-
             return False
-
         finally:
-
             if self.db_path != ":memory:":
-
                 conn.close()
 
     def validate_guest_token(self, token: str) -> Optional[dict]:
-
         """Validates if a token is an active, unrevoked, non-expired guest token."""
-
         if not token or not token.startswith("libra_guest_"):
-
             return None
 
+        clean = token.strip()
+        hashed = self._hash_token(clean)
         conn = self._get_connection()
-
         cursor = conn.cursor()
-
         try:
-
             cursor.execute("""
-
                 SELECT token, label, expires_at, revoked
-
                 FROM guest_tokens
-
-                WHERE token = ? AND revoked = 0
-
-            """, (token,))
+                WHERE token IN (?, ?) AND revoked = 0
+            """, (hashed, clean))
 
             row = cursor.fetchone()
 
@@ -5176,7 +5178,11 @@ class SemanticMemory:
 
                 }
 
-            # 2. Check guest tokens
+            # 2. Check guest tokens (hashed or legacy raw)
+
+            clean_tok = token.strip()
+
+            hashed_tok = self._hash_token(clean_tok)
 
             cursor.execute("""
 
@@ -5184,9 +5190,9 @@ class SemanticMemory:
 
                 FROM guest_tokens
 
-                WHERE token = ? AND revoked = 0
+                WHERE token IN (?, ?) AND revoked = 0
 
-            """, (token.strip(),))
+            """, (hashed_tok, clean_tok))
 
             grow = cursor.fetchone()
 
