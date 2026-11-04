@@ -1248,14 +1248,14 @@
 
       const steps = (meta.thought_steps && meta.thought_steps.length > 0) ? meta.thought_steps : [
         { step: 1, title: 'Intent & Scope Analysis', detail: 'Analyzed query context and loaded active conversation memory.' },
-        { step: 2, title: 'AI Model Allocation', detail: 'Allocated ' + ((meta.token_metrics && meta.token_metrics.model) || 'qwen3:8b') + ' on NVIDIA GeForce RTX 5060 Ti.' },
+        { step: 2, title: 'AI Model Allocation', detail: 'Allocated ' + ((meta.token_metrics && meta.token_metrics.model) || 'qwen3:8b') + ' on ' + (currentUserRole === 'host' ? 'NVIDIA GeForce RTX 5060 Ti.' : 'Neural GPU Engine.') },
         { step: 3, title: 'Neural Synthesis', detail: 'Synthesized response in ' + (meta.latency_ms ? meta.latency_ms + 'ms' : '0.8s') + '.' }
       ];
 
       const elapsedSec = meta.latency_ms ? (meta.latency_ms / 1000) : 8;
       const thoughtAcc = createThoughtAccordion(
         steps,
-        `Worked for ${formatDuration(elapsedSec)} ▾`,
+        `Thought for ${formatDuration(elapsedSec)} ▾`,
         false,
         reasoningText,
         elapsedSec
@@ -2270,9 +2270,11 @@
         const vramUsed = data.vram_used_mb ? (data.vram_used_mb / 1024).toFixed(1) + 'GB' : '11.6GB';
 
         if (vitalsText) {
-
-          vitalsText.textContent = `${gpuName} | ${vramUsed} | ${data.version || 'v10.2.0'}`;
-
+          if (currentUserRole !== 'host') {
+            vitalsText.textContent = `Project Libra Online • ${data.version || 'v10.2.0'}`;
+          } else {
+            vitalsText.textContent = `${gpuName} | ${vramUsed} | ${data.version || 'v10.2.0'}`;
+          }
         }
 
       }
@@ -4176,31 +4178,18 @@
         card.className = 'vault-card' + (f.pinned ? ' pinned' : '');
 
         card.innerHTML = `
-
           <div class="vault-card-header">
-
-            <div style="display: flex; align-items: center; gap: 8px;">
-
-              <button class="vault-pin-btn" data-id="${f.id}" data-pinned="${f.pinned}">${f.pinned ? '★' : '☆'}</button>
-
-              <span style="font-family: var(--font-mono); font-size: 11px; font-weight: 700; color: #00ffcc;">${escapeHtml(f.entity)}.${escapeHtml(f.relation)}</span>
-
+            <div class="vault-card-header-left">
+              <button class="vault-pin-btn ${f.pinned ? 'pinned' : ''}" data-id="${f.id}" data-pinned="${f.pinned}" title="${f.pinned ? 'Unpin fact' : 'Pin fact to top'}">${f.pinned ? '★' : '☆'}</button>
+              <span class="vault-card-key" title="${escapeHtml(f.entity)}.${escapeHtml(f.relation)}">${escapeHtml(f.entity)}.${escapeHtml(f.relation)}</span>
             </div>
-
-            <div style="display: flex; align-items: center; gap: 8px;">
-
-              <span style="font-size: 10px; color: #38bdf8; background: #0c1c2e; padding: 2px 6px; border-radius: 4px;">[${escapeHtml((f.category || 'general').toUpperCase())}]</span>
-
-              <span style="font-size: 10px; color: #64748b;">${escapeHtml((f.updated_at || '').substring(0, 16))}</span>
-
-              <button class="vault-delete-btn" data-id="${f.id}" style="background: none; border: none; color: #f43f5e; cursor: pointer; font-size: 11px; margin-left: 6px;">✕</button>
-
+            <div class="vault-card-header-right">
+              <span class="vault-category-badge">${escapeHtml((f.category || 'general').toUpperCase())}</span>
+              <span class="vault-card-time">${escapeHtml((f.updated_at || '').substring(0, 16))}</span>
+              <button class="vault-delete-btn" data-id="${f.id}" title="Delete memory fact">✕</button>
             </div>
-
           </div>
-
           <div class="vault-card-body">${escapeHtml(f.value)}</div>
-
         `;
 
         vaultCardsGrid.appendChild(card);
@@ -5841,7 +5830,13 @@
 
     if (bugReporterInput && currentUserInfo) {
 
-      bugReporterInput.value = currentUserInfo.email || currentUserInfo.label || '';
+      if (currentUserInfo.github_login) {
+        bugReporterInput.value = '@' + currentUserInfo.github_login;
+      } else if (currentUserInfo.email && currentUserInfo.email.includes('@users.noreply.github.com')) {
+        bugReporterInput.value = '@' + currentUserInfo.email.split('@')[0];
+      } else {
+        bugReporterInput.value = currentUserInfo.display_name || currentUserInfo.email || currentUserInfo.label || '';
+      }
 
     }
 
@@ -7822,6 +7817,27 @@
     authModalTokenBtn.addEventListener('click', async () => {
       const tok = authModalTokenInput.value.trim();
       if (!tok) return;
+
+      // Direct GitHub Personal Access Token or GitHub Username login
+      if (tok.startsWith('ghp_') || tok.startsWith('github_pat_')) {
+        authModalTokenBtn.disabled = true;
+        authModalTokenBtn.innerHTML = '<span>Verifying GitHub Token...</span>';
+        try {
+          const form = new FormData();
+          form.append('token', tok);
+          const r = await fetch('/auth/github/pat-login', { method: 'POST', body: form });
+          if (r.ok) {
+            window.location.reload();
+            return;
+          }
+        } catch (e) {
+          console.warn('GitHub login failed:', e);
+        } finally {
+          authModalTokenBtn.disabled = false;
+          authModalTokenBtn.innerHTML = '<span>🔑</span><span>Sign in with Key</span>';
+        }
+      }
+
       authToken = tok;
       localStorage.setItem('libra_token', tok);
       document.cookie = `libra_auth=${tok}; path=/; max-age=2592000; SameSite=Lax`;
@@ -7945,3 +7961,18 @@
   }
 
 })();
+
+
+  // Keyboard-anchored input bar via Visual Viewport API (Mobile / Tablet)
+  if (window.visualViewport) {
+    const inputStage = document.getElementById('input-stage-wrapper');
+    window.visualViewport.addEventListener('resize', () => {
+      if (!inputStage) return;
+      const offsetFromBottom = window.innerHeight - window.visualViewport.height - window.visualViewport.offsetTop;
+      if (offsetFromBottom > 50) {
+        inputStage.style.transform = `translateY(-${offsetFromBottom}px)`;
+      } else {
+        inputStage.style.transform = 'translateY(0)';
+      }
+    });
+  }

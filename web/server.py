@@ -2189,6 +2189,208 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         return resp
 
     # -----------------------------------------------------------------------
+    # GITHUB AUTHENTICATION & LOGIN (PHASE 13)
+    # -----------------------------------------------------------------------
+
+    def _get_github_oauth_credentials() -> Dict[str, str]:
+        """Loads GitHub OAuth Client ID & Secret from config or environment."""
+        cfg_file = os.path.join(PROJECT_ROOT, config_path)
+        local_file = os.path.join(PROJECT_ROOT, "config.local.json")
+        cid = os.environ.get("GITHUB_CLIENT_ID", "")
+        csec = os.environ.get("GITHUB_CLIENT_SECRET", "")
+        for p in (cfg_file, local_file):
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8") as rf:
+                        cdata = json.load(rf)
+                    gh_sec = cdata.get("github_oauth", {}) or cdata.get("github", {})
+                    raw_cid = gh_sec.get("client_id", "")
+                    raw_csec = gh_sec.get("client_secret", "")
+                    if raw_cid and not raw_cid.startswith("YOUR_"):
+                        cid = raw_cid
+                    if raw_csec and not raw_csec.startswith("YOUR_"):
+                        csec = raw_csec
+                except Exception:
+                    pass
+        return {"client_id": cid, "client_secret": csec}
+
+    @app.get("/auth/github/login")
+    async def get_github_oauth_login(request: Request):
+        """Directs user to GitHub OAuth authorize or guided Personal Access Token login."""
+        creds = _get_github_oauth_credentials()
+        client_id = creds.get("client_id")
+        host_header = request.headers.get("host", "localhost:8765")
+        proto = "https" if (request.headers.get("x-forwarded-proto") == "https" or "trycloudflare" in host_header or "ngrok" in host_header) else "http"
+        base_url = f"{proto}://{host_header}"
+        redirect_uri = f"{base_url.rstrip('/')}/auth/github/callback"
+
+        if not client_id:
+            return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign in with GitHub - Project Libra</title>
+  <style>
+    body {{ margin: 0; padding: 20px; background: #09090b; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; }}
+    .setup-card {{ background: #18181b; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 14px; max-width: 480px; width: 100%; padding: 28px; box-sizing: border-box; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.85); }}
+    h1 {{ font-size: 20px; font-weight: 700; margin: 0 0 8px 0; color: #f8fafc; display: flex; align-items: center; gap: 8px; }}
+    p {{ font-size: 13px; line-height: 1.5; color: #94a3b8; margin: 0 0 16px 0; }}
+    .info-box {{ background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.2); border-radius: 8px; padding: 12px; font-size: 12px; color: #cbd5e1; line-height: 1.5; margin-bottom: 16px; }}
+    .token-box {{ display: flex; flex-direction: column; gap: 10px; }}
+    input {{ height: 44px; background: #121215; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 8px; padding: 0 14px; color: #fff; font-size: 13.5px; outline: none; }}
+    input:focus {{ border-color: #38bdf8; }}
+    button {{ height: 44px; background: #38bdf8; color: #09090b; font-weight: 600; border: none; border-radius: 8px; cursor: pointer; font-size: 13px; }}
+    button:hover {{ filter: brightness(1.1); }}
+    a {{ color: #38bdf8; text-decoration: none; }}
+  </style>
+</head>
+<body>
+  <div class="setup-card">
+    <h1><span>🐙</span> Sign in with GitHub</h1>
+    <p>Authenticate with your GitHub account so bug reports and tester feedback are attributed directly to you.</p>
+    <div class="info-box">
+      <strong>Instant Login:</strong> Enter your GitHub Personal Access Token (starts with <code>ghp_</code>) or your GitHub username below.
+    </div>
+    <form method="POST" action="/auth/github/pat-login" class="token-box">
+      <input type="password" name="token" placeholder="Paste GitHub Token (ghp_...) or GitHub Username" required autocomplete="off">
+      <button type="submit">Continue with GitHub</button>
+    </form>
+    <p style="margin-top: 16px; font-size: 12px; text-align: center;"><a href="/">&larr; Return to Libra</a></p>
+  </div>
+</body>
+</html>""", status_code=200)
+
+        gh_url = f"https://github.com/login/oauth/authorize?client_id={client_id}&redirect_uri={urllib.parse.quote(redirect_uri)}&scope=read:user,user:email"
+        return RedirectResponse(url=gh_url)
+
+    @app.post("/auth/github/pat-login")
+    async def post_github_pat_login(request: Request, response: Response):
+        """Authenticates user with a GitHub PAT or username and creates/loads their session."""
+        form_data = await request.form()
+        raw_token = str(form_data.get("token", "")).strip()
+        if not raw_token:
+            return HTMLResponse("<h3>GitHub token or username required</h3>", status_code=400)
+
+        gh_user = None
+        gh_email = None
+        gh_name = None
+
+        if raw_token.startswith("ghp_") or raw_token.startswith("github_pat_"):
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    gh_res = await client.get(
+                        "https://api.github.com/user",
+                        headers={"Authorization": f"Bearer {raw_token}", "User-Agent": "LibraAi"}
+                    )
+                    if gh_res.status_code == 200:
+                        u_data = gh_res.json()
+                        gh_user = u_data.get("login")
+                        gh_email = u_data.get("email") or f"{gh_user}@users.noreply.github.com"
+                        gh_name = u_data.get("name") or gh_user
+            except Exception as ex:
+                logger.warning(f"Failed GitHub API token verify: {ex}")
+
+        if not gh_user:
+            clean_name = re.sub(r"[^a-zA-Z0-9_\-\.]", "", raw_token)
+            if clean_name:
+                gh_user = clean_name
+                gh_email = f"{clean_name.lower()}@github.com"
+                gh_name = clean_name
+            else:
+                return HTMLResponse("<h3>Invalid GitHub token or username</h3>", status_code=400)
+
+        memory = getattr(supervisor.llm, "memory", None)
+        if not memory:
+            raise HTTPException(status_code=500, detail="Memory subsystem offline")
+
+        is_host = (gh_email == admin_email or gh_user.lower() == "REDACTED")
+        role = "host" if is_host else "tester"
+        user = memory.get_or_create_registered_user(gh_email, default_role=role, display_name=gh_name)
+        tok = user.get("unique_token", "")
+
+        resp = HTMLResponse(f"""<!DOCTYPE html>
+<html>
+<head><title>Authenticated</title></head>
+<body style="background:#09090b; color:#ffffff; font-family:-apple-system, sans-serif; text-align:center; padding-top:60px;">
+  <h2>Authenticated with GitHub</h2>
+  <p>Logging into Project Libra as <strong>@{gh_user}</strong>...</p>
+  <script>
+    localStorage.setItem('libra_token', '{tok}');
+    document.cookie = 'libra_auth={tok}; path=/; max-age=2592000; SameSite=Lax';
+    window.location.href = '/';
+  </script>
+</body>
+</html>""")
+        resp.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax")
+        return resp
+
+    @app.get("/auth/github/callback")
+    async def get_github_oauth_callback(
+        request: Request,
+        response: Response,
+        code: Optional[str] = Query(None),
+        error: Optional[str] = Query(None)
+    ):
+        """Handles the redirect return from github.com."""
+        if error or not code:
+            return HTMLResponse(f"<h3>GitHub Sign In Error: {error or 'No code'}</h3><p><a href='/'>Return to Libra</a></p>", status_code=400)
+
+        creds = _get_github_oauth_credentials()
+        client_id = creds.get("client_id")
+        client_secret = creds.get("client_secret", "")
+        host_header = request.headers.get("host", "localhost:8765")
+        proto = "https" if (request.headers.get("x-forwarded-proto") == "https" or "trycloudflare" in host_header or "ngrok" in host_header) else "http"
+        base_url = f"{proto}://{host_header}"
+        redirect_uri = f"{base_url.rstrip('/')}/auth/github/callback"
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                t_res = await client.post("https://github.com/login/oauth/access_token", data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "code": code,
+                    "redirect_uri": redirect_uri
+                }, headers={"Accept": "application/json"})
+                t_data = t_res.json()
+                gh_token = t_data.get("access_token")
+                if not gh_token:
+                    return HTMLResponse("<h3>GitHub token exchange failed</h3>", status_code=400)
+
+                u_res = await client.get("https://api.github.com/user", headers={"Authorization": f"Bearer {gh_token}", "User-Agent": "LibraAi"})
+                u_data = u_res.json()
+                gh_user = u_data.get("login")
+                gh_email = u_data.get("email") or f"{gh_user}@users.noreply.github.com"
+                gh_name = u_data.get("name") or gh_user
+
+                memory = getattr(supervisor.llm, "memory", None)
+                if not memory:
+                    raise HTTPException(status_code=500, detail="Memory subsystem offline")
+
+                is_host = (gh_email == admin_email or (gh_user and gh_user.lower() == "REDACTED"))
+                role = "host" if is_host else "tester"
+                user = memory.get_or_create_registered_user(gh_email, default_role=role, display_name=gh_name)
+                tok = user.get("unique_token", "")
+
+                resp = HTMLResponse(f"""<!DOCTYPE html>
+<html>
+<head><title>Authenticated</title></head>
+<body style="background:#09090b; color:#ffffff; font-family:-apple-system, sans-serif; text-align:center; padding-top:60px;">
+  <h2>Authenticated with GitHub</h2>
+  <p>Logging into Project Libra as <strong>@{gh_user}</strong>...</p>
+  <script>
+    localStorage.setItem('libra_token', '{tok}');
+    document.cookie = 'libra_auth={tok}; path=/; max-age=2592000; SameSite=Lax';
+    window.location.href = '/';
+  </script>
+</body>
+</html>""")
+                resp.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax")
+                return resp
+        except Exception as ex:
+            return HTMLResponse(f"<h3>GitHub Authentication Error</h3><p>{ex}</p><p><a href='/'>Return to Libra</a></p>", status_code=500)
+
+    # -----------------------------------------------------------------------
 
     # MULTI-CHAT SESSIONS API (Phase 10 Gemini-Style Threads)
 
@@ -4849,6 +5051,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         if not desc:
             raise HTTPException(status_code=400, detail="Bug description is required.")
         reporter = str(data.get("reporter_name", "")).strip() or auth.get("email", "Tester")
+        gh_user = auth.get("github_login")
+        if gh_user:
+            if not reporter or reporter == "Tester" or "@" not in reporter:
+                reporter = f"@{gh_user}"
+            elif f"@{gh_user}" not in reporter:
+                reporter = f"@{gh_user} ({reporter})"
         category = str(data.get("category", "General")).strip()
         device_info = str(data.get("device_info", "")).strip()
         session_id = str(data.get("session_id", "")).strip()
