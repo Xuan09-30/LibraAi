@@ -5337,18 +5337,33 @@ def start_web_server_thread(
     # 1. Activate Public Tunnel (ngrok permanent domain if configured, else Cloudflare)
 
     ng_info = ensure_ngrok_tunnel(server_port)
+    active_tunnel_name = "none"
 
     if ng_info and ng_info.get("public_url"):
-
         cf_info = ng_info
-
+        active_tunnel_name = "ngrok"
     else:
-
-        cf_info = ensure_cloudflare_tunnel(server_port)
+        # Round 3 Item 3: Make Cloudflare Quick Tunnel fallback opt-in via config (default off)
+        fallback_enabled = bool(
+            cfg.get("cloudflare_quick_tunnel_fallback", False)
+            or cfg.get("cloudflare_tunnel", {}).get("fallback_enabled", False)
+        )
+        if fallback_enabled:
+            logger.info("ngrok tunnel not active; Cloudflare Quick Tunnel fallback enabled in config.")
+            cf_info = ensure_cloudflare_tunnel(server_port)
+            if cf_info and cf_info.get("public_url"):
+                active_tunnel_name = "cloudflare"
+        else:
+            logger.warning(
+                "ngrok tunnel is not active and Cloudflare Quick Tunnel fallback is off by default (opt-in via config). "
+                "Project Libra web server will NOT be exposed publicly."
+            )
+            cf_info = {"status": "disabled", "public_url": "", "error": "Quick tunnel fallback disabled"}
 
     # 2. Initialize FastAPI app attached to SupervisorHub
 
     app = create_app(hub=hub, config_path=config_path)
+    app.state.active_tunnel = active_tunnel_name
 
     # Note: log_config=None is required so Uvicorn does not crash when sys.stdout is hooked by StreamTee
 

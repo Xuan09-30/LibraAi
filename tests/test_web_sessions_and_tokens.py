@@ -284,5 +284,43 @@ class TestWebSessionsAndTokens(unittest.TestCase):
         self.assertIn("new-chat-btn", res_html.text)
 
 
+
+    def test_11_round3_item_3_cloudflare_fallback_opt_in(self):
+        """
+        Round 3 Item 3:
+        Make Cloudflare Quick Tunnel fallback opt-in via config (default off).
+        If ngrok fails and fallback is off, log it and do not expose the server.
+        """
+        from unittest.mock import patch
+        import web.server as srv
+
+        # Case A: Default configuration (fallback is OFF by default)
+        with patch.object(srv, "ensure_ngrok_tunnel", return_value={"status": "error", "public_url": ""}), \
+             patch.object(srv, "ensure_cloudflare_tunnel") as mock_cf, \
+             patch("uvicorn.Server.run"):
+            thread = srv.start_web_server_thread(
+                hub=self.hub,
+                port=8765,
+                config_path="config.json"
+            )
+            # Under Item 3, ensure_cloudflare_tunnel must NOT be called when fallback is off!
+            mock_cf.assert_not_called()
+            self.assertEqual(thread.cloudflare_info.get("public_url", ""), "")
+            self.assertEqual(thread.cloudflare_info.get("status"), "disabled")
+
+        # Case B: Explicitly opted in via config
+        custom_cfg = {"cloudflare_quick_tunnel_fallback": True}
+        with patch.object(srv, "load_web_config", return_value=custom_cfg), \
+             patch.object(srv, "ensure_ngrok_tunnel", return_value={"status": "error", "public_url": ""}), \
+             patch.object(srv, "ensure_cloudflare_tunnel", return_value={"status": "online", "public_url": "https://test.trycloudflare.com"}) as mock_cf_optin, \
+             patch("uvicorn.Server.run"):
+            thread_optin = srv.start_web_server_thread(
+                hub=self.hub,
+                port=8765,
+                config_path="config.json"
+            )
+            mock_cf_optin.assert_called_once()
+            self.assertEqual(thread_optin.cloudflare_info.get("public_url"), "https://test.trycloudflare.com")
+
 if __name__ == "__main__":
     unittest.main()
