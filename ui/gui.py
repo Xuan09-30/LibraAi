@@ -403,7 +403,7 @@ class VoiceAssistantWorker(QThread):
         if self.raw_chime_pcm:
             scaled = get_dynamic_chime_pcm(self.raw_chime_pcm, base_gain=0.25)
             play_chime_async(scaled)
-        self.notification_signal.emit("Project Libra Online", "Neural Core & Ambient Voice online. Say 'Hey Libra' anytime.")
+        self.notification_signal.emit("Libra Online", "Voice assistant ready. Say 'Hey Libra' anytime.")
 
         def speak_interruptible(text_or_stream):
             if self.mute_tts:
@@ -674,7 +674,7 @@ class VoiceAssistantWorker(QThread):
                             self.audio_ducker.restore_background_audio()
                     except Exception:
                         pass
-                    self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
+                    self.status_changed.emit("Ready")
                     self.visualizer_state.emit(False)
                     oww_model.reset()
                     ww_booster.reset()
@@ -884,10 +884,10 @@ class VoiceAssistantWorker(QThread):
                     if user_text is None:
                         if full_audio is None or len(full_audio) < 16000 * 0.3:
                             in_followup_mode = False
-                            self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
+                            self.status_changed.emit("Ready")
                             continue
 
-                        self.status_changed.emit("NEURAL TRANSCRIBING...")
+                        self.status_changed.emit("Transcribing...")
                         try:
                             with profiler.measure("STT_LATENCY"):
                                 user_text = stt.transcribe(full_audio)
@@ -901,7 +901,7 @@ class VoiceAssistantWorker(QThread):
             if not user_text or not user_text.strip():
                 ww_booster.clear_followup_window()
                 in_followup_mode = False
-                self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
+                self.status_changed.emit("Ready")
                 continue
 
             # Gaming Shield Post-STT Verification:
@@ -915,7 +915,7 @@ class VoiceAssistantWorker(QThread):
                     self.log_received.emit("SYSTEM", f"Gaming Shield: Suppressed in-game chatter '{user_text}'.")
                     ww_booster.clear_followup_window()
                     in_followup_mode = False
-                    self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
+                    self.status_changed.emit("Ready")
                     continue
 
             print(f"[Captured Input]: {user_text}")
@@ -1328,7 +1328,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
         header.addStretch()
 
-        self.vault_btn = QPushButton("◈ Memory Vault")
+        self.vault_btn = QPushButton("Memory")
         self.vault_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
         self.vault_btn.setStyleSheet("""
             QPushButton {
@@ -1337,7 +1337,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             }
             QPushButton:hover { background: #27272a; border-color: rgba(255, 255, 255, 0.16); }
         """)
-        self.vault_btn.setToolTip("Inspect and edit Memory Vault (Obsidian Markdown Sync at assets/vault/)")
+        self.vault_btn.setToolTip("Inspect and edit memory notes")
         self.vault_btn.clicked.connect(self.open_memory_vault)
         header.addWidget(self.vault_btn)
 
@@ -1845,7 +1845,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.setWindowIcon(icon)
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(icon)
-        self.tray_icon.setToolTip("Libra // Cybernetic Neural Assistant")
+        self.tray_icon.setToolTip("Libra")
 
         tray_menu = QMenu()
         show_action = QAction("Show Interface", self)

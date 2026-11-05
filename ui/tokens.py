@@ -40,28 +40,28 @@ def load_tokens() -> Dict[str, Any]:
 # Status banner harmonized tokens
 STATUS_THEMES = {
     "IDLE": {
-        "text": "Standby // Ready (Alt+Space)",
+        "text": "Ready (Alt+Space)",
         "color": "#94a3b8",
         "bg": "#121215",
-        "border": "rgba(255, 255, 255, 0.1)"
+        "border": "rgba(255, 255, 255, 0.08)"
     },
     "LISTENING": {
-        "text": "Listening // Neural Audio Stream...",
-        "color": "#38bdf8",
-        "bg": "rgba(56, 189, 248, 0.12)",
-        "border": "rgba(56, 189, 248, 0.35)"
+        "text": "Listening...",
+        "color": "#00d2ff",
+        "bg": "rgba(0, 210, 255, 0.1)",
+        "border": "rgba(0, 210, 255, 0.3)"
     },
     "THINKING": {
-        "text": "Cognitive Reasoning // Qwen3 Engine...",
-        "color": "#c084fc",
-        "bg": "rgba(192, 132, 252, 0.12)",
-        "border": "rgba(192, 132, 252, 0.35)"
+        "text": "Thinking...",
+        "color": "#00d2ff",
+        "bg": "rgba(0, 210, 255, 0.1)",
+        "border": "rgba(0, 210, 255, 0.3)"
     },
     "SPEAKING": {
-        "text": "Vocal Synthesis // Kokoro-82M TTS...",
-        "color": "#34d399",
-        "bg": "rgba(52, 211, 153, 0.12)",
-        "border": "rgba(52, 211, 153, 0.35)"
+        "text": "Speaking...",
+        "color": "#f8fafc",
+        "bg": "rgba(255, 255, 255, 0.08)",
+        "border": "rgba(255, 255, 255, 0.15)"
     }
 }
 
@@ -93,26 +93,26 @@ def get_shared_qss() -> str:
     }
 
     QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus {
-        border: 1px solid #38bdf8;
+        border: 1px solid #00d2ff;
         background-color: #151519;
     }
 
     /* Buttons */
     QPushButton {
         background-color: #18181b;
-        color: #cbd5e1;
+        color: #f8fafc;
         border: 1px solid rgba(255, 255, 255, 0.14);
         border-radius: 8px;
         padding: 8px 16px;
-        font-weight: 600;
+        font-weight: 500;
         font-size: 13px;
         min-height: 36px;
     }
 
     QPushButton:hover {
         background-color: #222226;
-        color: #f8fafc;
-        border-color: rgba(56, 189, 248, 0.45);
+        color: #ffffff;
+        border-color: rgba(255, 255, 255, 0.25);
     }
 
     QPushButton:pressed {
@@ -120,14 +120,27 @@ def get_shared_qss() -> str:
     }
 
     QPushButton#primary, QPushButton[accent="true"] {
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #38bdf8, stop:1 #0284c7);
-        color: #09090b;
-        font-weight: 700;
+        background-color: #00d2ff;
+        color: #090d16;
+        font-weight: 600;
         border: none;
+        border-radius: 8px;
     }
 
     QPushButton#primary:hover, QPushButton[accent="true"]:hover {
-        background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #7dd3fc, stop:1 #38bdf8);
+        background-color: #38bdf8;
+    }
+
+    QPushButton[flat="true"], QPushButton#tertiary {
+        background: transparent;
+        color: #94a3b8;
+        border: none;
+        padding: 4px 8px;
+        min-height: auto;
+    }
+
+    QPushButton[flat="true"]:hover, QPushButton#tertiary:hover {
+        color: #f8fafc;
     }
 
     /* Scrollbars */
@@ -145,7 +158,7 @@ def get_shared_qss() -> str:
     }
 
     QScrollBar::handle:vertical:hover {
-        background: #38bdf8;
+        background: #00d2ff;
     }
 
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {

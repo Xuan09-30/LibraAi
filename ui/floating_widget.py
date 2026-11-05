@@ -24,7 +24,7 @@ class MiniOrbIndicator(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedSize(22, 22)
-        self.orb_color = QColor("#00f2fe")
+        self.orb_color = QColor("#00d2ff")
 
     def set_color(self, hex_color: str):
         self.orb_color = QColor(hex_color)
@@ -73,7 +73,7 @@ class FloatingHUDPill(QWidget):
         container.setStyleSheet("""
             QWidget {
                 background-color: rgba(18, 22, 34, 0.96);
-                border: 1px solid rgba(0, 240, 255, 0.25);
+                border: 1px solid rgba(255, 255, 255, 0.14);
                 border-radius: 24px;
             }
         """)
@@ -85,7 +85,7 @@ class FloatingHUDPill(QWidget):
         self.orb_dot = MiniOrbIndicator(container)
         layout.addWidget(self.orb_dot)
 
-        badge = QLabel("✦ Libra")
+        badge = QLabel("Libra")
         badge.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         badge.setStyleSheet("color: #ffffff; border: none; background: transparent; letter-spacing: -0.2px;")
         layout.addWidget(badge)
@@ -114,7 +114,7 @@ class FloatingHUDPill(QWidget):
                 border: none;
             }
             QPushButton:hover {
-                color: #f43f5e;
+                color: #ffffff;
             }
         """)
         close_btn.clicked.connect(self.hide)
