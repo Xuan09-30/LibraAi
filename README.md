@@ -22,32 +22,33 @@ Project Libra features a unified cybernetic design system with dark-mode contras
 
 ---
 
-### Core Memory & Knowledge Vault
+### Memory & Preferences Vault
 
-The **Core Memory Vault** synchronizes user preferences, habits, and learned facts via bi-directional Obsidian Markdown files (`assets/vault/*.md`) and an SQLite FTS5 BM25 full-text index.
+The **Memory Vault** synchronizes user preferences, habits, and learned notes with instant search and clear hierarchy:
 
-| Mobile Vault (390px) | Desktop Vault (1280px) |
-| :---: | :---: |
-| ![Mobile Vault](docs/screenshots/web_vault_390px.png) | ![Desktop Vault](docs/screenshots/web_vault_1280px.png) |
+| Mobile (390px) | iPad / Tablet (820px) | Desktop (1280px) |
+| :---: | :---: | :---: |
+| ![Mobile Vault](docs/screenshots/web_vault_390px.png) | ![Tablet Vault](docs/screenshots/web_vault_820px.png) | ![Desktop Vault](docs/screenshots/web_vault_1280px.png) |
 
-- **Dedicated Cards**: Insulated `#171d28` card containers with subtle borders and hover elevation.
-- **Pinned Priorities**: Amber glowing status indicators (`★`) protected from Markovian eviction.
-- **Categorization**: Emerald and cyan monospace pills (`[GENERAL]`, `[PREFERENCE]`, `[SYSTEM]`).
+- **Restrained Cards**: Neutral `#141824` containers with subtle borders and clear typography.
+- **Pinned Priorities**: Amber status indicator (`★`) protected from eviction.
+- **Categorization**: Sentence-case category badges (`General`, `Preference`).
+- **Hierarchy**: Single primary cyan action button (`+ Add note`), outlined secondary inputs, subtle delete controls.
 
 ---
 
-### Authentication Gateway & Multi-User Bug Tracker
+### Authentication Gateway
 
 The **Authentication Gateway** provides secure role-based access control with native support for personal accounts:
 
-| Mobile Auth (390px) | Desktop Auth (1280px) |
-| :---: | :---: |
-| ![Mobile Auth](docs/screenshots/web_auth_390px.png) | ![Desktop Auth](docs/screenshots/web_auth_1280px.png) |
+| Mobile (390px) | iPad / Tablet (820px) | Desktop (1280px) |
+| :---: | :---: | :---: |
+| ![Mobile Auth](docs/screenshots/web_auth_390px.png) | ![Tablet Auth](docs/screenshots/web_auth_820px.png) | ![Desktop Auth](docs/screenshots/web_auth_1280px.png) |
 
 - **Google OAuth**: High-contrast, pure-white button (`#ffffff`) with official Google colored logo.
-- **GitHub Authentication**: Connect personal GitHub accounts via **OAuth** or **Personal Access Token (PAT)**.
-- **Multi-User Bug Attribution**: Bug reports and tester feedback auto-tag the submitting user (`@{github_username}`) on GitHub Issues.
-- **Access Keys & Guest Mode**: Direct Master Key login or isolated guest access.
+- **GitHub Authentication**: Outlined secondary tile with personal GitHub account support.
+- **Single Primary Action**: High-contrast cyan `Sign in` button with full-width mobile responsive stacking.
+- **Input Overflow Protection**: Ellipsis truncation and horizontal scroll prevention on token fields.
 
 ---
 
@@ -71,7 +72,7 @@ Project Libra shares identical design tokens between the Web/PWA interface (`web
 | Token Category | Values / Tokens | Usage |
 | :--- | :--- | :--- |
 | **Dark Palette** | `--bg-app: #09090b`<br>`--bg-surface: #121215`<br>`--bg-card: #18181b` | Base window, sidebar, and container surfaces |
-| **Accent Glows** | `--accent-cyan: #38bdf8`<br>`--accent-emerald: #34d399`<br>`--accent-purple: #c084fc` | Primary actions, status indicators, thinking states |
+| **Single Accent** | `--accent-cyan: #00d2ff` (`#38bdf8`) | Single primary action per screen and active states |
 | **Borders** | `--border-subtle: rgba(255, 255, 255, 0.08)`<br>`--border-medium: rgba(255, 255, 255, 0.14)` | Dividers, card frames, input outlines |
 | **Typography** | Sans: Inter / Segoe UI / System<br>Mono: SFMono / Consolas | High legibility on mobile and desktop |
 | **Tap Targets** | `min-height: 44px; min-width: 44px;` | Full touch-first compliance on phones and tablets |
