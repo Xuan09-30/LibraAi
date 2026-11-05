@@ -4153,7 +4153,7 @@
 
           opt.value = c;
 
-          opt.textContent = c.toUpperCase();
+          opt.textContent = c.charAt(0).toUpperCase() + c.slice(1).toLowerCase();
 
           vaultCategoryFilter.appendChild(opt);
 
@@ -4184,7 +4184,7 @@
               <span class="vault-card-key" title="${escapeHtml(f.entity)}.${escapeHtml(f.relation)}">${escapeHtml(f.entity)}.${escapeHtml(f.relation)}</span>
             </div>
             <div class="vault-card-header-right">
-              <span class="vault-category-badge">${escapeHtml((f.category || 'general').toUpperCase())}</span>
+              <span class="vault-category-badge">${escapeHtml((f.category || 'general').charAt(0).toUpperCase() + (f.category || 'general').slice(1).toLowerCase())}</span>
               <span class="vault-card-time">${escapeHtml((f.updated_at || '').substring(0, 16))}</span>
               <button class="vault-delete-btn" data-id="${f.id}" title="Delete memory fact">✕</button>
             </div>
