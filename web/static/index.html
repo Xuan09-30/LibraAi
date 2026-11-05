@@ -715,20 +715,20 @@
             <span>New Chat</span>
           </button>
           <span id="active-thread-title" class="active-thread-title">Main Chat</span>
-          <span class="scope-pill">ONLINE</span>
-          <span id="role-badge" class="role-badge guest" title="Access Role (Click to Sign In)" style="cursor: pointer;">🧪 GUEST</span>
+          <span class="scope-pill">Online</span>
+          <span id="role-badge" class="role-badge guest" title="Access Role (Click to Sign In)" style="cursor: pointer;">Guest</span>
         </div>
 
         <div class="header-right">
           <!-- BUG REPORT BUTTON (AVAILABLE TO ALL TESTERS & HOST) -->
           <button id="bug-nav-btn" class="header-action-btn" title="Report a Bug / Host Bug Reports">
-            <span>🐞 Bug</span>
+            <span>Report bug</span>
             <span id="bug-badge" class="nav-counter-badge" style="display: none;">0</span>
           </button>
 
           <!-- OPTIONS & SETTINGS BUTTON -->
           <button id="options-nav-btn" class="header-action-btn" title="System Options, Custom Instructions & Host Tools">
-            <span>⚙️ Options</span>
+            <span>Settings</span>
           </button>
 
           <!-- HIDDEN TELEMETRY ANCHOR (ACCESSIBLE VIA HOST DRAWER & OPTIONS MODAL) -->
@@ -744,7 +744,7 @@
             <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
               <rect x="5" y="5" width="14" height="14" rx="2"></rect>
             </svg>
-            <span>STOP VOICE</span>
+            <span>Stop voice</span>
           </button>
 
           <!-- HARDWARE VITALS (HOST ONLY) -->
@@ -928,7 +928,7 @@
     <div class="modal-content" style="max-width: 650px; width: 94%;">
       <div class="modal-header">
         <div class="modal-header-title">
-          <span style="color: var(--neon-cyan);">⚙️ OPTIONS &amp; CUSTOM INSTRUCTIONS</span>
+          <span style="color: #f8fafc; font-weight: 600; font-size: 16px;">Settings</span>
         </div>
         <button id="close-options-modal" class="modal-close-btn" title="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -940,10 +940,10 @@
 
       <!-- OPTIONS TAB NAVIGATION -->
       <div class="options-tab-bar">
-        <button class="options-tab-btn active" data-tab="tab-profile">👤 Profile &amp; Instructions</button>
-        <button class="options-tab-btn host-only-btn" data-tab="tab-invites" style="display: none;">🔑 Invites &amp; Tunnel</button>
-        <button class="options-tab-btn host-only-btn" data-tab="tab-github" style="display: none;">🐙 GitHub Sync</button>
-        <button class="options-tab-btn host-only-btn" id="options-open-users-btn" style="display: none;">👥 Users</button>
+        <button class="options-tab-btn active" data-tab="tab-profile">Profile & Instructions</button>
+        <button class="options-tab-btn host-only-btn" data-tab="tab-invites" style="display: none;">Invites & Tunnel</button>
+        <button class="options-tab-btn host-only-btn" data-tab="tab-github" style="display: none;">GitHub Sync</button>
+        <button class="options-tab-btn host-only-btn" id="options-open-users-btn" style="display: none;">Users & Roles</button>
       </div>
 
       <div class="modal-body" style="max-height: 440px; overflow-y: auto;">
@@ -952,7 +952,7 @@
           <!-- CARD A: VOICE OUTPUT SPEECH SETTING -->
           <div class="options-settings-card">
             <div class="options-card-left">
-              <span class="options-card-title">🔊 Voice Output (Speech Aloud)</span>
+              <span class="options-card-title">Voice output</span>
               <span class="options-card-desc">Choose if Libra speaks aloud with neural voice (Kokoro-82M) or replies silently with text.</span>
             </div>
             <div class="options-card-right">
@@ -963,11 +963,11 @@
             </div>
           </div>
           <div id="voice-status-note" class="voice-status-note">
-            🔊 <strong>Speaking Aloud:</strong> Libra speaks every answer using high-speed neural voice.
+            <strong>Speaking aloud:</strong> Libra speaks every answer using high-speed neural voice.
           </div>
 
           <!-- CARD B: PREFERENCES & IDENTITY -->
-          <div class="options-settings-section-title">👤 Personal Profile</div>
+          <div class="options-settings-section-title">Personal profile</div>
           <p style="font-size: 12px; color: #a1a1aa; margin-bottom: 12px; line-height: 1.5;">
             Personalize how Libra addresses you and customizes daily weather &amp; briefings.
           </p>
@@ -984,7 +984,7 @@
           </div>
 
           <!-- CARD C: CUSTOM INSTRUCTIONS -->
-          <div class="options-settings-section-title" style="margin-top: 16px;">✨ Custom Instructions</div>
+          <div class="options-settings-section-title" style="margin-top: 16px;">Custom instructions</div>
           <div style="margin-bottom: 12px;">
             <label class="options-input-label">What should Libra know about you to provide better responses?</label>
             <textarea id="prof-about-input" class="auth-input" rows="3" placeholder="e.g. Preferred languages, daily workflow, hobbies, or personal background." style="margin: 0; width: 100%; resize: vertical;"></textarea>
@@ -1001,8 +1001,8 @@
           </div>
 
           <div id="prof-status-msg" style="display: none; font-size: 12px; margin-bottom: 8px;"></div>
-          <button id="save-profile-btn" class="modal-btn primary" style="width: 100%;">💾 SAVE PREFERENCES &amp; INSTRUCTIONS</button>
-          <button id="options-token-telemetry-btn" type="button" class="modal-btn secondary" style="margin-top: 10px; width: 100%;">📊 View Real-Time GPU Token Telemetry</button>
+          <button id="save-profile-btn" class="modal-btn primary" style="width: 100%;">Save preferences</button>
+          <button id="options-token-telemetry-btn" type="button" class="modal-btn secondary" style="margin-top: 10px; width: 100%;">View token telemetry</button>
         </div>
 
         <!-- TAB 2: GUEST INVITES & CLOUDFLARE/NGROK TUNNEL -->
@@ -1058,8 +1058,8 @@
 
           <div id="options-gh-status-msg" style="display: none; font-size: 12px; margin-bottom: 8px;"></div>
           <div style="display: flex; gap: 8px;">
-            <button id="save-gh-config-btn" class="modal-btn primary" style="flex: 1;">💾 SAVE GITHUB TOKEN</button>
-            <button id="sync-pending-gh-btn" class="modal-btn" style="padding: 0 14px; font-size: 11px; background: rgba(168, 85, 247, 0.15); border: 1px solid rgba(168, 85, 247, 0.4); color: #c084fc;">🚀 Push Reports to GitHub</button>
+            <button id="save-gh-config-btn" class="modal-btn primary" style="flex: 1;">Save GitHub token</button>
+            <button id="sync-pending-gh-btn" class="modal-btn" style="padding: 0 14px; font-size: 11px; background: rgba(168, 85, 247, 0.15); border: 1px solid rgba(168, 85, 247, 0.4); color: #c084fc;">Push reports to GitHub</button>
           </div>
         </div>
 
@@ -1080,7 +1080,7 @@
             <polyline points="3 6 5 6 21 6"/>
             <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
           </svg>
-          <span>DELETE CONVERSATION</span>
+          <span>Delete conversation</span>
         </div>
         <button id="close-delete-modal" class="modal-close-btn" title="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1092,8 +1092,8 @@
       <div class="modal-body">
         <p id="delete-modal-prompt" class="modal-prompt-text">Are you sure you want to delete this thread?</p>
         <div class="modal-action-row">
-          <button id="cancel-delete-btn" class="modal-btn secondary">CANCEL</button>
-          <button id="confirm-delete-btn" class="modal-btn danger">DELETE</button>
+          <button id="cancel-delete-btn" class="modal-btn secondary">Cancel</button>
+          <button id="confirm-delete-btn" class="modal-btn danger">Delete</button>
         </div>
       </div>
     </div>
@@ -1110,7 +1110,7 @@
             <path d="M12 20h9"/>
             <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
           </svg>
-          <span>RENAME CONVERSATION</span>
+          <span>Rename conversation</span>
         </div>
         <button id="close-rename-modal" class="modal-close-btn" title="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1122,8 +1122,8 @@
       <div class="modal-body">
         <input type="text" id="rename-input" class="auth-input" placeholder="Enter thread title..." maxlength="60">
         <div class="modal-action-row">
-          <button id="cancel-rename-btn" class="modal-btn secondary">CANCEL</button>
-          <button id="confirm-rename-btn" class="modal-btn primary">SAVE</button>
+          <button id="cancel-rename-btn" class="modal-btn secondary">Cancel</button>
+          <button id="confirm-rename-btn" class="modal-btn primary">Save</button>
         </div>
       </div>
     </div>
@@ -1521,7 +1521,7 @@
     <div class="modal-content" style="max-width: 620px; width: 94%;">
       <div class="modal-header">
         <div class="modal-header-title">
-          <span style="color: #fb7185;">🐞 BUG REPORT &amp; TESTER FEEDBACK</span>
+          <span style="color: #f8fafc; font-weight: 600; font-size: 16px;">Report an issue</span>
         </div>
         <button id="close-bug-modal" class="modal-close-btn" title="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1534,7 +1534,7 @@
         <!-- HOST-ONLY BUG REPORT INBOX (TOP VIEW FOR HOST) -->
         <div id="host-bug-inbox-section" style="display: none; margin-bottom: 16px;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-            <div style="font-size: 13px; font-weight: 700; color: #f1f5f9;">📥 TESTER BUG INBOX <span id="host-bug-inbox-count" style="color: #fb7185; font-size: 11px;">(0 Reports)</span></div>
+            <div style="font-size: 13px; font-weight: 700; color: #f1f5f9;">Tester reports <span id="host-bug-inbox-count" style="color: #fb7185; font-size: 11px;">(0 Reports)</span></div>
             <button id="refresh-bugs-btn" class="modal-btn" style="padding: 3px 10px; font-size: 11px; background: rgba(0, 242, 254, 0.1); border: 1px solid rgba(0, 242, 254, 0.3); color: var(--neon-cyan); border-radius: 4px; cursor: pointer;">🔄 Refresh</button>
           </div>
 
@@ -1548,15 +1548,15 @@
 
           <!-- Bug Inbox Tabs -->
           <div class="bug-tab-bar" style="display: flex; gap: 6px; margin-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 6px;">
-            <button id="bug-tab-active-btn" type="button" style="padding: 4px 12px; font-size: 11px; background: rgba(251, 113, 133, 0.15); border: 1px solid rgba(251, 113, 133, 0.4); color: #fb7185; border-radius: 6px; cursor: pointer; font-weight: 600;">🔴 Active Reports (<span id="bug-tab-active-count">0</span>)</button>
-            <button id="bug-tab-resolved-btn" type="button" style="padding: 4px 12px; font-size: 11px; background: transparent; border: 1px solid rgba(255, 255, 255, 0.15); color: #94a3b8; border-radius: 6px; cursor: pointer; font-weight: 600;">🟢 Resolved History (<span id="bug-tab-resolved-count">0</span>)</button>
+            <button id="bug-tab-active-btn" type="button" style="padding: 4px 12px; font-size: 11px; background: rgba(251, 113, 133, 0.15); border: 1px solid rgba(251, 113, 133, 0.4); color: #fb7185; border-radius: 6px; cursor: pointer; font-weight: 600;">Active reports (<span id="bug-tab-active-count">0</span>)</button>
+            <button id="bug-tab-resolved-btn" type="button" style="padding: 4px 12px; font-size: 11px; background: transparent; border: 1px solid rgba(255, 255, 255, 0.15); color: #94a3b8; border-radius: 6px; cursor: pointer; font-weight: 600;">Resolved history (<span id="bug-tab-resolved-count">0</span>)</button>
           </div>
 
           <div id="bug-reports-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 270px; overflow-y: auto;"></div>
           <div id="bug-resolved-list" style="display: none; flex-direction: column; gap: 8px; max-height: 270px; overflow-y: auto;"></div>
           
           <div style="margin-top: 14px; text-align: center;">
-            <button id="toggle-host-submit-form" style="background: none; border: 1px dashed rgba(255, 255, 255, 0.2); color: #94a3b8; font-size: 11px; padding: 5px 12px; border-radius: 6px; cursor: pointer; transition: all 0.15s ease;">➕ File a New Bug / Feedback as Host</button>
+            <button id="toggle-host-submit-form" style="background: none; border: 1px dashed rgba(255, 255, 255, 0.2); color: #94a3b8; font-size: 11px; padding: 5px 12px; border-radius: 6px; cursor: pointer; transition: all 0.15s ease;">File a new report as host</button>
           </div>
         </div>
 
@@ -1587,7 +1587,7 @@
           </div>
 
           <div id="bug-submit-status" style="display: none; font-size: 12px; margin-bottom: 8px;"></div>
-          <button id="submit-bug-btn" class="modal-btn primary" style="width: 100%;">🚀 SUBMIT BUG REPORT &amp; SCREENSHOT</button>
+          <button id="submit-bug-btn" class="modal-btn primary" style="width: 100%;">Submit report</button>
         </div>
       </div>
     </div>

@@ -4778,7 +4778,7 @@
 
     if (info.role === 'host') {
 
-      badge.textContent = '👑 HOST';
+      badge.textContent = 'Host';
 
       badge.className = 'role-badge host';
 
@@ -4808,7 +4808,7 @@
 
     } else {
 
-      badge.textContent = `🧪 ${info.label || (info.role || 'TESTER').toUpperCase()}`;
+      badge.textContent = info.label ? (info.label.charAt(0).toUpperCase() + info.label.slice(1).toLowerCase()) : (info.role === 'guest' ? 'Guest' : 'Tester');
 
       badge.className = 'role-badge guest';
 
