@@ -800,6 +800,15 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         return HTMLResponse("<h1>Project Libra Web Agent Online</h1>", status_code=200)
 
+    @app.get("/api/health")
+    async def get_health():
+        return {
+            "status": "ok",
+            "app": "Libra",
+            "version": LIBRA_VERSION,
+            "timestamp": time.time()
+        }
+
     @app.get("/manifest.json")
 
     async def get_manifest():
@@ -5644,6 +5653,19 @@ def start_web_server_thread(
     print(banner)
 
     return thread
+
+
+_default_app = None
+
+
+def __getattr__(name: str):
+    if name == "app":
+        global _default_app
+        if _default_app is None:
+            _default_app = create_app()
+        return _default_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 if __name__ == "__main__":
 

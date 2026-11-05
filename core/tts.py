@@ -2,7 +2,10 @@ import os
 import wave
 import io
 import pyaudio
-from piper.voice import PiperVoice
+try:
+    from piper.voice import PiperVoice
+except ImportError:
+    PiperVoice = None
 
 class TextToSpeech:
     def __init__(self, model_rel_path="assets/voices/en_US-amy-medium.onnx"):

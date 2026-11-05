@@ -1,12 +1,12 @@
-from ui.tokens import get_shared_qss, STATUS_THEMES
 import os
 import sys
-
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 os.chdir(PROJECT_ROOT)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+from ui.tokens import get_shared_qss, STATUS_THEMES
 
 log_dir = os.path.join(PROJECT_ROOT, "logs")
 os.makedirs(log_dir, exist_ok=True)
@@ -399,7 +399,7 @@ class VoiceAssistantWorker(QThread):
                     print(f"[Chime Playback Error]: {ex}")
             threading.Thread(target=_stream_worker, daemon=True).start()
 
-        self.status_changed.emit("SYSTEM READY // AWAITING VOCAL PROMPT")
+        self.status_changed.emit("Ready")
         if self.raw_chime_pcm:
             scaled = get_dynamic_chime_pcm(self.raw_chime_pcm, base_gain=0.25)
             play_chime_async(scaled)
@@ -742,7 +742,7 @@ class VoiceAssistantWorker(QThread):
                                     )
                                     self.pa = test_pa
                                     self.input_stream = stream
-                                    self.status_changed.emit("SYSTEM READY // AWAITING VOCAL PROMPT")
+                                    self.status_changed.emit("Ready")
                                     self.telemetry_update.emit("AUDIO_STATUS", "MICROPHONE ACTIVE")
                                     self.notification_signal.emit("Microphone Connected", "Libra voice listening is now online! Say 'Hey Libra' anytime.")
                                     self.log_received.emit("SYSTEM", "Microphone connected successfully. Voice listening online.")
@@ -764,7 +764,7 @@ class VoiceAssistantWorker(QThread):
                                 except Exception:
                                     pass
                             self.input_stream = None
-                            self.status_changed.emit("MICROPHONE DISCONNECTED // TEXT MODE")
+                            self.status_changed.emit("Text mode (Microphone disconnected)")
                             self.telemetry_update.emit("AUDIO_STATUS", "NO MIC DETECTED [TEXT MODE ACTIVE]")
                             self.notification_signal.emit("Microphone Disconnected", "Microphone unplugged or lost. Switched to Text Mode.")
                             self.log_received.emit("SYSTEM", "Microphone disconnected. Waiting for microphone reconnection...")
@@ -815,9 +815,9 @@ class VoiceAssistantWorker(QThread):
 
                 if user_text is None:
                     if in_followup_mode:
-                        self.status_changed.emit("CONVERSATIONAL FOLLOW-UP ACTIVE...")
+                        self.status_changed.emit("Listening...")
                     else:
-                        self.status_changed.emit("RECORDING USER INPUT...")
+                        self.status_changed.emit("Listening...")
 
                     vad_detector.reset()
 
@@ -960,7 +960,7 @@ class VoiceAssistantWorker(QThread):
                 self.orb_state_signal.emit("idle")
                 ww_booster.clear_followup_window()
                 in_followup_mode = False
-                self.status_changed.emit("STANDBY // READY")
+                self.status_changed.emit("Ready")
                 continue
 
             if clean_cmd_stripped in HIDE_PHRASES or clean_cmd in HIDE_PHRASES:
@@ -974,11 +974,11 @@ class VoiceAssistantWorker(QThread):
                 self.orb_state_signal.emit("idle")
                 ww_booster.clear_followup_window()
                 in_followup_mode = False
-                self.status_changed.emit("STANDBY // READY")
+                self.status_changed.emit("Ready")
                 continue
 
             # STATE 4: REASON & EXECUTE VIA LLM CORE
-            self.status_changed.emit("PROCESSING REASONING...")
+            self.status_changed.emit("Thinking...")
             self.orb_state_signal.emit("reasoning")
             if hasattr(llm, "idle_daemon") and llm.idle_daemon:
                 llm.idle_daemon.record_user_activity()
