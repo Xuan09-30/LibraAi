@@ -2754,14 +2754,20 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                         github_username=gh_user,
                         other_provider=candidate["existing_provider"]
                     )
+                    pending_info = memory.get_pending_link(link_token) if hasattr(memory, "get_pending_link") else {}
+                    sess_tok = (pending_info or {}).get("session_token", "")
                     resp = _render_account_linking_screen(
                         link_token=link_token,
                         email=gh_email,
                         other_provider=candidate["existing_provider"],
                         new_provider="GitHub",
-                        new_username=gh_user
+                        new_username=gh_user,
+                        session_token=sess_tok
                     )
                     resp.delete_cookie(key="libra_gh_state", path="/")
+                    if sess_tok:
+                        resp.set_cookie(key="libra_auth", value=sess_tok, max_age=600, httponly=False, samesite="lax", path="/")
+                        resp.set_cookie(key="libra_token", value=sess_tok, max_age=600, httponly=False, samesite="lax", path="/")
                     return resp
 
                 # 3. Otherwise (unverified email or new user): Create separate canonical user & link identity
@@ -3020,7 +3026,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 </body>
 </html>""", status_code=200)
 
-    def _render_account_linking_screen(link_token: str, email: str, other_provider: str, new_provider: str = "GitHub", new_username: str = ""):
+    def _render_account_linking_screen(link_token: str, email: str, other_provider: str, new_provider: str = "GitHub", new_username: str = "", session_token: str = ""):
         """Renders the high-class responsive HTML confirmation screen for account linking."""
         other_disp = other_provider.title()
         new_disp = new_provider.title()
@@ -3192,6 +3198,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     </div>
     <form method="POST" action="/api/auth/link-account" class="button-stack" id="linking-form">
       <input type="hidden" name="link_token" value="{html.escape(link_token)}">
+      <input type="hidden" name="session_token" value="{html.escape(session_token)}">
       <button type="submit" name="action" value="link" class="btn btn-confirm-link" id="confirm-link-btn">Yes, Link Accounts</button>
       <button type="submit" name="action" value="separate" class="btn btn-decline-link" id="decline-link-btn">No, Keep Separate</button>
     </form>
@@ -3218,7 +3225,8 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             email=pending["email"],
             other_provider=pending.get("other_provider", "Google"),
             new_provider=pending.get("provider", "GitHub"),
-            new_username=pending.get("github_username", "")
+            new_username=pending.get("github_username", ""),
+            session_token=pending.get("session_token", "")
         )
 
     @app.post("/api/auth/link-account")
@@ -3226,13 +3234,14 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         request: Request,
         response: Response
     ):
-        """Confirms or declines account linking, supporting both JSON REST calls and HTML Form posts."""
+        """Confirms or declines account linking, requiring an authenticated session matching pending link provider_user_id."""
         memory = getattr(supervisor.llm, "memory", None)
         if not memory or not hasattr(memory, "confirm_account_link"):
             raise HTTPException(status_code=500, detail="Memory subsystem offline")
 
         link_token = ""
         action = "link"
+        client_session_token = ""
 
         try:
             ct = request.headers.get("content-type", "")
@@ -3241,19 +3250,60 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                 if isinstance(body, dict):
                     link_token = body.get("link_token", "")
                     action = body.get("action", "link")
+                    client_session_token = body.get("session_token", "")
             else:
                 form = await request.form()
                 link_token = form.get("link_token", "")
                 action = form.get("action", "link")
+                client_session_token = form.get("session_token", "")
         except Exception:
             pass
 
         if not link_token:
             raise HTTPException(status_code=400, detail="link_token is required.")
 
+        # 1. Identity Verification: Must provide an authenticated session token
+        tok = None
+        auth_hdr = request.headers.get("authorization", "")
+        if auth_hdr.startswith("Bearer "):
+            tok = auth_hdr.split("Bearer ", 1)[1].strip()
+        if not tok:
+            tok = request.headers.get("x-libra-token")
+        if not tok:
+            tok = request.cookies.get("libra_auth") or request.cookies.get("libra_token")
+        if not tok:
+            tok = client_session_token
+
+        if not tok:
+            raise HTTPException(status_code=401, detail="Authentication required: Confirming an account link requires an authenticated session.")
+
+        session_user = memory.validate_user_token(tok)
+        if not session_user:
+            raise HTTPException(status_code=401, detail="Invalid or expired session.")
+
+        # 2. Fetch pending link
+        pending = memory.get_pending_link(link_token)
+        if not pending:
+            raise HTTPException(status_code=400, detail="Invalid, expired, or already used account linking token.")
+
+        # 3. Verify session matches pending link's provider_user_id
+        session_p_uid = session_user.get("provider_user_id")
+        matches = False
+        if session_p_uid and str(session_p_uid).strip() == str(pending["provider_user_id"]).strip():
+            matches = True
+        elif session_user.get("unique_token") and session_user.get("unique_token") == pending.get("session_token"):
+            matches = True
+        elif hasattr(memory, "get_user_identities"):
+            identities = memory.get_user_identities(session_user.get("user_id"))
+            if any(str(i.get("provider_user_id")).strip() == str(pending["provider_user_id"]).strip() for i in identities):
+                matches = True
+
+        if not matches:
+            raise HTTPException(status_code=403, detail="Forbidden: Authenticated session does not match the pending link identity.")
+
         try:
-            result = memory.confirm_account_link(link_token, action)
-        except ValueError as ve:
+            result = memory.confirm_account_link(link_token, action, session_provider_user_id=pending["provider_user_id"])
+        except (ValueError, PermissionError) as ve:
             raise HTTPException(status_code=400, detail=str(ve))
 
         user = result.get("user") or {}

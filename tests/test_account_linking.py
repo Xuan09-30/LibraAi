@@ -407,6 +407,112 @@ class TestAccountLinkingSecurity(unittest.TestCase):
         self.assertIsNotNone(saved_bug)
         self.assertEqual(saved_bug.get("reporter"), "@carol_gh")
 
+    def test_06_confirm_account_link_requires_matching_session_and_rejects_attacker_session(self):
+        """
+        Security requirement: confirm_account_link MUST require the confirming request
+        to come from an authenticated session matching the pending link's provider_user_id.
+        A different session's token used to confirm someone else's pending link MUST be rejected.
+        An unauthenticated request MUST also be rejected.
+        """
+        shared_email = "danielle_target@example.com"
+        google_sub = "danielle_target@example.com"
+
+        # 1. Existing Google user
+        target_user = self.memory.create_canonical_user(
+            primary_email=shared_email,
+            display_name="Danielle Original",
+            role="user"
+        )
+        self.memory.link_identity(
+            user_id=target_user["user_id"],
+            provider="google",
+            provider_user_id=google_sub,
+            email=shared_email,
+            email_verified=True
+        )
+
+        # 2. Attacker Eve creates an account and has a valid session token
+        eve_user = self.memory.create_canonical_user(
+            primary_email="eve_attacker@example.com",
+            display_name="Eve Attacker",
+            role="user"
+        )
+        eve_token = eve_user["unique_token"]
+
+        # 3. Legitimate user Danielle signs in via GitHub
+        danielle_gh_login = "danielle_gh"
+        danielle_gh_uid = "99887766"
+
+        mock_token_resp = MagicMock()
+        mock_token_resp.status_code = 200
+        mock_token_resp.json.return_value = {"access_token": "gho_mock_token_danielle"}
+
+        mock_user_resp = MagicMock()
+        mock_user_resp.status_code = 200
+        mock_user_resp.json.return_value = {
+            "login": danielle_gh_login,
+            "id": danielle_gh_uid,
+            "email": shared_email,
+            "verified": True,
+            "name": "Danielle GH"
+        }
+
+        with patch("httpx.AsyncClient.post", return_value=mock_token_resp), \
+             patch("httpx.AsyncClient.get", return_value=mock_user_resp):
+            state = "csrf_state_danielle_test"
+            clean_client = TestClient(self.app)
+            clean_client.cookies.set("libra_gh_state", state)
+            res = clean_client.get(f"/auth/github/callback?code=code_danielle&state={state}")
+            self.assertEqual(res.status_code, 200)
+
+            m = re.search(r'name=["\']link_token["\']\s+value=["\']([^"\']+)["\']', res.text)
+            self.assertIsNotNone(m, "Link token must be in the confirmation screen form")
+            link_token = m.group(1)
+
+            # Legitimate session token issued for Danielle during the OAuth callback
+            danielle_session_cookie = res.cookies.get("libra_auth")
+
+        # 4. Attacker Eve attempts to confirm Danielle's pending link using Eve's authenticated session
+        eve_client = TestClient(self.app)
+        eve_attack_res = eve_client.post(
+            "/api/auth/link-account",
+            data={"link_token": link_token, "action": "link"},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Authorization": f"Bearer {eve_token}"
+            }
+        )
+        # Must be rejected with 403 Forbidden!
+        self.assertEqual(
+            eve_attack_res.status_code,
+            403,
+            f"A different user's session token MUST be rejected when attempting to confirm someone else's link! Received {eve_attack_res.status_code}: {eve_attack_res.text}"
+        )
+
+        # 5. Attacker attempts to confirm with NO session token (token-only confirmation)
+        anon_client = TestClient(self.app)
+        anon_attack_res = anon_client.post(
+            "/api/auth/link-account",
+            data={"link_token": link_token, "action": "link"},
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        # Must be rejected with 401 Unauthorized!
+        self.assertEqual(
+            anon_attack_res.status_code,
+            401,
+            f"Confirming a pending link without an authenticated session MUST be rejected with 401! Received {anon_attack_res.status_code}: {anon_attack_res.text}"
+        )
+
+        # 6. Legitimate Danielle confirms with her authenticated session matching provider_user_id
+        legit_res = clean_client.post(
+            "/api/auth/link-account",
+            data={"link_token": link_token, "action": "link"},
+            headers={"Content-Type": "application/x-www-form-urlencoded"}
+        )
+        self.assertEqual(legit_res.status_code, 200)
+        self.assertEqual(legit_res.json().get("status"), "success")
+
+
 
 if __name__ == "__main__":
     unittest.main()

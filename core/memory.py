@@ -1,4 +1,5 @@
 import os
+import time
 
 import re
 
@@ -804,6 +805,7 @@ class SemanticMemory:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS pending_account_links (
                 link_token TEXT PRIMARY KEY,
+                session_token TEXT DEFAULT '',
                 user_id TEXT NOT NULL,
                 provider TEXT NOT NULL,
                 provider_user_id TEXT NOT NULL,
@@ -815,6 +817,12 @@ class SemanticMemory:
                 expires_at REAL NOT NULL
             )
         """)
+        try:
+            pcols = [col[1] for col in cursor.execute("PRAGMA table_info(pending_account_links)").fetchall()]
+            if "session_token" not in pcols:
+                cursor.execute("ALTER TABLE pending_account_links ADD COLUMN session_token TEXT DEFAULT ''")
+        except Exception:
+            pass
 
         # 20. Manual Link Requests Table (Settings initiated)
         cursor.execute("""
@@ -5361,6 +5369,27 @@ class SemanticMemory:
 
                 }
 
+            # 2.5 Check pending account links session token
+            cursor.execute("""
+                SELECT session_token, user_id, provider, provider_user_id, email, display_name, github_username, expires_at
+                FROM pending_account_links
+                WHERE session_token = ? AND expires_at > ?
+            """, (token.strip(), time.time()))
+            prow = cursor.fetchone()
+            if prow:
+                return {
+                    "user_id": prow[1],
+                    "email": prow[4],
+                    "primary_email": prow[4],
+                    "display_name": prow[5] or "Pending User",
+                    "role": "guest",
+                    "unique_token": prow[0],
+                    "provider": prow[2],
+                    "provider_user_id": str(prow[3]),
+                    "github_username": prow[6] or "",
+                    "is_pending_link": True
+                }
+
             # 2. Check guest tokens (hashed or legacy raw)
 
             clean_tok = token.strip()
@@ -6160,22 +6189,24 @@ class SemanticMemory:
         email: str,
         display_name: str = "",
         github_username: str = "",
-        other_provider: str = "Google"
+        other_provider: str = "Google",
+        session_token: Optional[str] = None
     ) -> str:
-        """Creates a secure short-lived token for linking confirmation."""
+        """Creates a secure short-lived token and session for linking confirmation."""
         import secrets
         import time
 
         link_token = f"link_{secrets.token_hex(20)}"
+        sess_token = session_token or f"libra_link_sess_{secrets.token_hex(20)}"
         expires_at = time.time() + 600.0
 
         conn = self._get_connection()
         cursor = conn.cursor()
         try:
             cursor.execute("""
-                INSERT INTO pending_account_links (link_token, user_id, provider, provider_user_id, email, display_name, github_username, other_provider, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (link_token, user_id, provider.strip().lower(), str(provider_user_id).strip(), email.strip().lower(), display_name, github_username, other_provider, expires_at))
+                INSERT INTO pending_account_links (link_token, session_token, user_id, provider, provider_user_id, email, display_name, github_username, other_provider, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (link_token, sess_token, user_id, provider.strip().lower(), str(provider_user_id).strip(), email.strip().lower(), display_name, github_username, other_provider, expires_at))
             conn.commit()
             return link_token
         finally:
@@ -6192,7 +6223,7 @@ class SemanticMemory:
         cursor = conn.cursor()
         try:
             cursor.execute("""
-                SELECT link_token, user_id, provider, provider_user_id, email, display_name, github_username, other_provider, expires_at
+                SELECT link_token, session_token, user_id, provider, provider_user_id, email, display_name, github_username, other_provider, expires_at
                 FROM pending_account_links
                 WHERE link_token = ? AND expires_at > ?
             """, (link_token.strip(), now))
@@ -6200,21 +6231,22 @@ class SemanticMemory:
             if row:
                 return {
                     "link_token": row[0],
-                    "user_id": row[1],
-                    "provider": row[2],
-                    "provider_user_id": row[3],
-                    "email": row[4],
-                    "display_name": row[5],
-                    "github_username": row[6] or "",
-                    "other_provider": row[7],
-                    "expires_at": row[8]
+                    "session_token": row[1] or "",
+                    "user_id": row[2],
+                    "provider": row[3],
+                    "provider_user_id": row[4],
+                    "email": row[5],
+                    "display_name": row[6],
+                    "github_username": row[7] or "",
+                    "other_provider": row[8],
+                    "expires_at": row[9]
                 }
             return None
         finally:
             if self.db_path != ":memory:":
                 conn.close()
 
-    def confirm_account_link(self, link_token: str, action: str) -> dict:
+    def confirm_account_link(self, link_token: str, action: str, session_provider_user_id: Optional[str] = None) -> dict:
         """
         Processes user's confirmation decision on an account link:
         - action == 'link': Links identity to existing canonical user_id.
@@ -6223,6 +6255,10 @@ class SemanticMemory:
         pending = self.get_pending_link(link_token)
         if not pending:
             raise ValueError("Invalid, expired, or already used account linking token.")
+
+        if session_provider_user_id is not None:
+            if str(pending["provider_user_id"]).strip() != str(session_provider_user_id).strip():
+                raise PermissionError("Authenticated session does not match pending link provider_user_id.")
 
         conn = self._get_connection()
         cursor = conn.cursor()
