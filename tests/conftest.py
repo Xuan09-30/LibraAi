@@ -72,6 +72,9 @@ def isolate_test_environment(tmp_path_factory):
     test_uploads = str(test_sandbox / "uploads")
     os.makedirs(test_uploads, exist_ok=True)
 
+    test_assets = str(test_sandbox / "assets")
+    os.makedirs(test_assets, exist_ok=True)
+
     orig_vault = os.environ.get("LIBRA_VAULT_DIR")
     orig_db = os.environ.get("LIBRA_MEMORY_DB")
     orig_soul = os.environ.get("LIBRA_SOUL_PATH")
@@ -80,6 +83,7 @@ def isolate_test_environment(tmp_path_factory):
     orig_skills = os.environ.get("LIBRA_SKILLS_DIR")
     orig_plots = os.environ.get("LIBRA_PLOTS_DIR")
     orig_uploads = os.environ.get("LIBRA_UPLOADS_DIR")
+    orig_assets = os.environ.get("LIBRA_ASSETS_DIR")
 
     os.environ["LIBRA_VAULT_DIR"] = str(test_vault)
     os.environ["LIBRA_MEMORY_DB"] = test_db
@@ -89,6 +93,7 @@ def isolate_test_environment(tmp_path_factory):
     os.environ["LIBRA_SKILLS_DIR"] = test_skills
     os.environ["LIBRA_PLOTS_DIR"] = test_plots
     os.environ["LIBRA_UPLOADS_DIR"] = test_uploads
+    os.environ["LIBRA_ASSETS_DIR"] = test_assets
 
     yield
 
@@ -101,6 +106,7 @@ def isolate_test_environment(tmp_path_factory):
         ("LIBRA_SKILLS_DIR", orig_skills),
         ("LIBRA_PLOTS_DIR", orig_plots),
         ("LIBRA_UPLOADS_DIR", orig_uploads),
+        ("LIBRA_ASSETS_DIR", orig_assets),
     ]:
         if v is not None:
             os.environ[k] = v
