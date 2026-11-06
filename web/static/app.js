@@ -7492,7 +7492,87 @@
 
     optionsModal.style.display = 'flex';
 
+  async function loadConnectedAccounts() {
+    const container = document.getElementById('connected-accounts-container');
+    if (!container) return;
+    try {
+      const res = await fetch('/api/auth/linked-identities', { headers: getAuthHeaders() });
+      if (!res.ok) {
+        container.innerHTML = '<div style="font-size: 12px; color: #71717a;">Please log in to manage linked accounts.</div>';
+        return;
+      }
+      const data = await res.json();
+      const identities = data.identities || [];
+      const hasGoogle = data.has_google;
+      const hasGithub = data.has_github;
+
+      let html = '';
+
+      // Google Account Card / Link Option
+      if (hasGoogle) {
+        const gIdent = identities.find(i => i.provider === 'google') || {};
+        html += `
+          <div class="connected-account-row" style="display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 10px 14px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="font-size: 16px;">🌐</span>
+              <div>
+                <div style="font-size: 13px; font-weight: 600; color: #f8fafc;">Google Account</div>
+                <div style="font-size: 11px; color: #94a3b8;">${escapeHtml(gIdent.email || data.primary_email || 'Connected')}</div>
+              </div>
+            </div>
+            <span style="font-size: 11px; font-weight: 600; color: #10b981; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.25); border-radius: 9999px; padding: 3px 10px;">✓ Connected</span>
+          </div>`;
+      } else {
+        html += `
+          <div class="connected-account-row" style="display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 10px 14px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="font-size: 16px;">🌐</span>
+              <div>
+                <div style="font-size: 13px; font-weight: 600; color: #f8fafc;">Google Account</div>
+                <div style="font-size: 11px; color: #71717a;">Not currently linked</div>
+              </div>
+            </div>
+            <a href="/auth/link/start?provider=google" class="modal-btn" style="padding: 6px 14px; font-size: 12px; background: rgba(255,255,255,0.08); text-decoration: none; border-radius: 6px; color: #f8fafc; font-weight: 500;">Link Google Account</a>
+          </div>`;
+      }
+
+      // GitHub Account Card / Link Option
+      if (hasGithub) {
+        const ghIdent = identities.find(i => i.provider === 'github') || {};
+        const ghUser = data.github_username || ghIdent.github_username || ghIdent.email || 'Connected';
+        html += `
+          <div class="connected-account-row" style="display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08); border-radius: 8px; padding: 10px 14px; margin-top: 8px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="font-size: 16px;">🐙</span>
+              <div>
+                <div style="font-size: 13px; font-weight: 600; color: #f8fafc;">GitHub Account</div>
+                <div style="font-size: 11px; color: #94a3b8;">@${escapeHtml(ghUser)}</div>
+              </div>
+            </div>
+            <span style="font-size: 11px; font-weight: 600; color: #10b981; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.25); border-radius: 9999px; padding: 3px 10px;">✓ Connected</span>
+          </div>`;
+      } else {
+        html += `
+          <div class="connected-account-row" style="display: flex; align-items: center; justify-content: space-between; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 10px 14px; margin-top: 8px;">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <span style="font-size: 16px;">🐙</span>
+              <div>
+                <div style="font-size: 13px; font-weight: 600; color: #f8fafc;">GitHub Account</div>
+                <div style="font-size: 11px; color: #71717a;">Not currently linked</div>
+              </div>
+            </div>
+            <a href="/auth/link/start?provider=github" class="modal-btn" style="padding: 6px 14px; font-size: 12px; background: rgba(255,255,255,0.08); text-decoration: none; border-radius: 6px; color: #f8fafc; font-weight: 500;">Link GitHub Account</a>
+          </div>`;
+      }
+
+      container.innerHTML = html;
+    } catch (e) {
+      container.innerHTML = '<div style="font-size: 12px; color: #ef4444;">Unable to load account links.</div>';
+    }
+  }
+
     loadUserProfile();
+    loadConnectedAccounts();
 
     if (currentUserRole === 'host') {
 

@@ -2099,17 +2099,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         return RedirectResponse(url=google_auth_url, status_code=302)
 
     @app.get("/auth/google/callback")
-
     async def get_google_oauth_callback(
-
         request: Request,
-
         response: Response,
-
         code: Optional[str] = Query(None),
-
+        state: Optional[str] = Query(None),
         error: Optional[str] = Query(None)
-
     ):
 
         """
@@ -2205,14 +2200,75 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             return HTMLResponse(f"<h3>Google Authentication Error</h3><p>{ex}</p><p><a href='/'>Return to Libra</a></p>", status_code=500)
 
         if not clean_email or "@" not in clean_email:
-
             return HTMLResponse("<h3>Could not retrieve verified email from Google.</h3><p><a href='/'>Return to Libra</a></p>", status_code=400)
 
         memory = getattr(supervisor.llm, "memory", None)
-
         if not memory:
-
             raise HTTPException(status_code=500, detail="Memory subsystem offline")
+
+        # Check if this flow was initiated from Settings as a manual link
+        manual_link = memory.consume_manual_link_request(state) if (state and hasattr(memory, "consume_manual_link_request")) else None
+        if manual_link:
+            target_user_id = manual_link["user_id"]
+            target_user = memory.get_canonical_user_by_id(target_user_id) if hasattr(memory, "get_canonical_user_by_id") else None
+            if not target_user:
+                return HTMLResponse("<h3>Session Expired</h3><p>Target user session expired.</p><p><a href='/'>Return to Libra</a></p>", status_code=401)
+
+            existing_id = memory.get_identity("google", clean_email) if hasattr(memory, "get_identity") else None
+            existing_user = None
+            if existing_id:
+                existing_user = memory.get_canonical_user_by_id(existing_id["user_id"])
+            elif hasattr(memory, "get_canonical_user_by_email"):
+                existing_user = memory.get_canonical_user_by_email(clean_email)
+
+            if existing_user and existing_user["user_id"] == target_user_id:
+                tok = target_user["unique_token"]
+                resp = HTMLResponse("<h3>Already Linked</h3><p>This Google account is already linked to your profile.</p><script>window.location.href='/';</script>", status_code=200)
+                resp.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
+                return resp
+
+            if existing_user and existing_user["user_id"] != target_user_id:
+                merge_token = memory.create_pending_merge(
+                    surviving_user_id=target_user_id,
+                    secondary_user_id=existing_user["user_id"],
+                    provider="google",
+                    provider_user_id=clean_email,
+                    email=clean_email,
+                    display_name=display_name,
+                    github_username=""
+                )
+                return _render_account_merge_screen(
+                    merge_token=merge_token,
+                    surviving_user=target_user,
+                    secondary_user=existing_user,
+                    new_provider="Google"
+                )
+
+            # Direct link
+            memory.link_identity(
+                user_id=target_user_id,
+                provider="google",
+                provider_user_id=clean_email,
+                email=clean_email,
+                email_verified=True
+            )
+            tok = target_user["unique_token"]
+            resp = HTMLResponse(f"""<!DOCTYPE html>
+<html>
+<head><title>Account Linked</title></head>
+<body style="background:#09090b; color:#ffffff; font-family:-apple-system, sans-serif; text-align:center; padding-top:60px;">
+  <h2>Account Linked Successfully</h2>
+  <p>Linked Google account <strong>{html.escape(clean_email)}</strong> to your Libra profile.</p>
+  <script>
+    localStorage.setItem('libra_token', '{tok}');
+    document.cookie = 'libra_auth={tok}; path=/; max-age=2592000; SameSite=Lax';
+    window.location.href = '/';
+  </script>
+</body>
+</html>""", status_code=200)
+            resp.set_cookie(key="libra_token", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
+            resp.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
+            return resp
 
         is_host = (
 
@@ -2581,6 +2637,83 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                 if not memory:
                     raise HTTPException(status_code=500, detail="Memory subsystem offline")
 
+                # Check if this flow was initiated from Settings as a manual link
+                manual_link = memory.consume_manual_link_request(state) if (state and hasattr(memory, "consume_manual_link_request")) else None
+                if manual_link:
+                    target_user_id = manual_link["user_id"]
+                    target_user = memory.get_canonical_user_by_id(target_user_id) if hasattr(memory, "get_canonical_user_by_id") else None
+                    if not target_user:
+                        return HTMLResponse("<h3>Session Expired</h3><p>Target user session expired.</p><p><a href='/'>Return to Libra</a></p>", status_code=401)
+
+                    if not email_verified:
+                        return HTMLResponse(
+                            "<h3>Unverified GitHub Email</h3><p>Your GitHub email is unverified. Project Libra only links verified accounts.</p><p><a href='/'>Return to Libra</a></p>",
+                            status_code=400
+                        )
+
+                    existing_id = memory.get_identity("github", gh_uid) if hasattr(memory, "get_identity") else None
+                    existing_user = None
+                    if existing_id:
+                        existing_user = memory.get_canonical_user_by_id(existing_id["user_id"])
+                    elif hasattr(memory, "get_canonical_user_by_email"):
+                        existing_user = memory.get_canonical_user_by_email(gh_email)
+
+                    # Scenario A: Already linked to this exact user
+                    if existing_user and existing_user["user_id"] == target_user_id:
+                        tok = target_user["unique_token"]
+                        resp = HTMLResponse("<h3>Already Linked</h3><p>This GitHub account is already linked to your profile.</p><script>window.location.href='/';</script>", status_code=200)
+                        resp.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
+                        resp.delete_cookie(key="libra_gh_state", path="/")
+                        return resp
+
+                    # Scenario B: Identity is already linked to a DIFFERENT pre-existing user -> MERGE CONFIRMATION
+                    if existing_user and existing_user["user_id"] != target_user_id:
+                        merge_token = memory.create_pending_merge(
+                            surviving_user_id=target_user_id,
+                            secondary_user_id=existing_user["user_id"],
+                            provider="github",
+                            provider_user_id=gh_uid,
+                            email=gh_email,
+                            display_name=gh_name,
+                            github_username=gh_user
+                        )
+                        resp = _render_account_merge_screen(
+                            merge_token=merge_token,
+                            surviving_user=target_user,
+                            secondary_user=existing_user,
+                            new_provider="GitHub"
+                        )
+                        resp.delete_cookie(key="libra_gh_state", path="/")
+                        return resp
+
+                    # Scenario C: Identity is not linked to any account -> DIRECT LINK
+                    memory.link_identity(
+                        user_id=target_user_id,
+                        provider="github",
+                        provider_user_id=gh_uid,
+                        email=gh_email,
+                        email_verified=True,
+                        github_username=gh_user
+                    )
+                    tok = target_user["unique_token"]
+                    resp = HTMLResponse(f"""<!DOCTYPE html>
+<html>
+<head><title>Account Linked</title></head>
+<body style="background:#09090b; color:#ffffff; font-family:-apple-system, sans-serif; text-align:center; padding-top:60px;">
+  <h2>Account Linked Successfully</h2>
+  <p>Linked GitHub account <strong>@{html.escape(gh_user)}</strong> to your Libra profile.</p>
+  <script>
+    localStorage.setItem('libra_token', '{tok}');
+    document.cookie = 'libra_auth={tok}; path=/; max-age=2592000; SameSite=Lax';
+    window.location.href = '/';
+  </script>
+</body>
+</html>""", status_code=200)
+                    resp.set_cookie(key="libra_token", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
+                    resp.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
+                    resp.delete_cookie(key="libra_gh_state", path="/")
+                    return resp
+
                 # 1. Check if this exact GitHub identity is already linked
                 identity = memory.get_identity("github", gh_uid) if hasattr(memory, "get_identity") else None
                 if identity and hasattr(memory, "get_canonical_user_by_id"):
@@ -2683,6 +2816,209 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     # -----------------------------------------------------------------------
     # ACCOUNT LINKING CONFIRMATION & MANAGEMENT (Phase 14)
     # -----------------------------------------------------------------------
+
+    def _render_account_merge_screen(merge_token: str, surviving_user: dict, secondary_user: dict, new_provider: str = "GitHub"):
+        """Renders the high-class responsive HTML confirmation screen for merging two pre-existing accounts."""
+        surv_email = surviving_user.get("primary_email") or surviving_user.get("email", "")
+        sec_email = secondary_user.get("primary_email") or secondary_user.get("email", "")
+        new_disp = new_provider.title()
+        return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Combine Accounts - Project Libra</title>
+  <style>
+    :root {{
+      --bg-app: #09090b;
+      --bg-card: #121215;
+      --border-subtle: rgba(255, 255, 255, 0.1);
+      --border-focus: rgba(239, 68, 68, 0.4);
+      --text-primary: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent-primary: #10b981;
+      --accent-warning: #f59e0b;
+      --accent-danger: #ef4444;
+    }}
+    body {{
+      margin: 0;
+      padding: 20px;
+      background: var(--bg-app);
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-sizing: border-box;
+    }}
+    .merge-card {{
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 16px;
+      padding: 36px 32px;
+      max-width: 500px;
+      width: 100%;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+      text-align: center;
+      box-sizing: border-box;
+    }}
+    .badge-row {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      margin-bottom: 20px;
+    }}
+    .account-badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 12px;
+      border-radius: 9999px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      font-size: 12px;
+      font-weight: 500;
+      color: #e2e8f0;
+      max-width: 100%;
+      word-break: break-all;
+      font-size: 13px;
+      font-weight: 500;
+      color: #e2e8f0;
+    }}
+    .merge-arrow {{
+      color: #64748b;
+      font-size: 16px;
+    }}
+    h1 {{
+      font-size: 22px;
+      font-weight: 600;
+      margin: 0 0 12px 0;
+      letter-spacing: -0.02em;
+    }}
+    .prompt-box {{
+      background: rgba(245, 158, 11, 0.05);
+      border: 1px solid rgba(245, 158, 11, 0.2);
+      border-radius: 12px;
+      padding: 16px;
+      margin-bottom: 24px;
+      text-align: left;
+    }}
+    .prompt-text {{
+      font-size: 14px;
+      line-height: 1.6;
+      color: #f8fafc;
+      margin: 0 0 10px 0;
+    }}
+    .prompt-subtext {{
+      font-size: 12px;
+      line-height: 1.5;
+      color: var(--text-muted);
+      margin: 0;
+    }}
+    .details-box {{
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-radius: 10px;
+      padding: 12px 16px;
+      margin-bottom: 24px;
+      text-align: left;
+      font-size: 12px;
+      color: #cbd5e1;
+    }}
+    .details-box ul {{
+      margin: 6px 0 0 0;
+      padding-left: 20px;
+    }}
+    .details-box li {{
+      margin-bottom: 4px;
+    }}
+    .button-stack {{
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }}
+    .btn {{
+      width: 100%;
+      padding: 12px 18px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      box-sizing: border-box;
+      border: none;
+    }}
+    .btn-confirm-merge {{
+      background: #10b981;
+      color: #ffffff;
+    }}
+    .btn-confirm-merge:hover {{
+      background: #059669;
+    }}
+    .btn-cancel-merge {{
+      background: transparent;
+      color: #94a3b8;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+    }}
+    .btn-cancel-merge:hover {{
+      background: rgba(255, 255, 255, 0.05);
+      color: #f8fafc;
+    }}
+    .back-link {{
+      margin-top: 20px;
+      font-size: 12px;
+    }}
+    .back-link a {{
+      color: #64748b;
+      text-decoration: none;
+    }}
+    .back-link a:hover {{
+      color: #94a3b8;
+    }}
+  </style>
+</head>
+<body>
+  <div class="merge-card" id="account-merge-card">
+    <div class="badge-row">
+      <span class="account-badge">
+        <span>{html.escape(surv_email)}</span>
+      </span>
+      <span class="merge-arrow">&larr;&plus;&rarr;</span>
+      <span class="account-badge">
+        <span>{html.escape(sec_email)} ({html.escape(new_disp)})</span>
+      </span>
+    </div>
+    <h1>Combine Existing Accounts</h1>
+    <div class="prompt-box">
+      <p class="prompt-text" id="merge-prompt-message">
+        This will combine <strong>{html.escape(surv_email)}</strong> (Current Account) and <strong>{html.escape(sec_email)}</strong> ({html.escape(new_disp)}) into one account. This cannot be undone.
+      </p>
+      <p class="prompt-subtext">
+        Both logins will resolve to your current profile. The secondary account record will be safely archived and consolidated.
+      </p>
+    </div>
+    <div class="details-box">
+      <div style="font-weight:600; margin-bottom:4px; color:#f1f5f9;">What will be transferred:</div>
+      <ul>
+        <li>Bug reports and resolution history</li>
+        <li>Memory vault notes, preferences, and custom instructions</li>
+        <li>Conversation threads and active identities</li>
+      </ul>
+    </div>
+    <form method="POST" action="/api/auth/merge-accounts" class="button-stack" id="merge-form">
+      <input type="hidden" name="merge_token" value="{html.escape(merge_token)}">
+      <button type="submit" name="action" value="merge" class="btn btn-confirm-merge" id="confirm-merge-btn">Yes, Combine &amp; Merge Accounts</button>
+      <button type="submit" name="action" value="cancel" class="btn btn-cancel-merge" id="cancel-merge-btn">Cancel</button>
+    </form>
+    <div class="back-link">
+      <a href="/">&larr; Return to Libra</a>
+    </div>
+  </div>
+</body>
+</html>""", status_code=200)
 
     def _render_account_linking_screen(link_token: str, email: str, other_provider: str, new_provider: str = "GitHub", new_username: str = ""):
         """Renders the high-class responsive HTML confirmation screen for account linking."""
@@ -2951,6 +3287,172 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             "display_name": user.get("display_name", ""),
             "role": user.get("role", "tester"),
             "github_username": user.get("github_username", "")
+        }
+
+    @app.get("/api/auth/linked-identities")
+    async def get_linked_identities(request: Request):
+        """Returns linked identities for the currently authenticated user."""
+        memory = getattr(supervisor.llm, "memory", None)
+        if not memory or not hasattr(memory, "validate_user_token"):
+            raise HTTPException(status_code=500, detail="Memory subsystem offline")
+
+        tok = None
+        auth_hdr = request.headers.get("authorization", "")
+        if auth_hdr.startswith("Bearer "):
+            tok = auth_hdr.split("Bearer ", 1)[1].strip()
+        if not tok:
+            tok = request.cookies.get("libra_auth") or request.cookies.get("libra_token")
+
+        user = memory.validate_user_token(tok) if tok else None
+        if not user:
+            raise HTTPException(status_code=401, detail="Unauthorized: Not authenticated.")
+
+        user_id = user["user_id"]
+        identities = memory.get_user_identities(user_id) if hasattr(memory, "get_user_identities") else []
+        has_google = any(i.get("provider") == "google" for i in identities)
+        has_github = any(i.get("provider") == "github" for i in identities)
+
+        return {
+            "status": "success",
+            "user_id": user_id,
+            "primary_email": user.get("primary_email") or user.get("email", ""),
+            "display_name": user.get("display_name", ""),
+            "github_username": user.get("github_username", ""),
+            "identities": identities,
+            "has_google": has_google,
+            "has_github": has_github,
+            "can_link_google": not has_google,
+            "can_link_github": not has_github
+        }
+
+    @app.get("/auth/link/start")
+    async def get_manual_link_start(
+        request: Request,
+        provider: str = Query(...)
+    ):
+        """Initiates an OAuth linking flow for an authenticated user, tagging the state with their user_id."""
+        memory = getattr(supervisor.llm, "memory", None)
+        if not memory or not hasattr(memory, "validate_user_token"):
+            raise HTTPException(status_code=500, detail="Memory subsystem offline")
+
+        tok = None
+        auth_hdr = request.headers.get("authorization", "")
+        if auth_hdr.startswith("Bearer "):
+            tok = auth_hdr.split("Bearer ", 1)[1].strip()
+        if not tok:
+            tok = request.cookies.get("libra_auth") or request.cookies.get("libra_token")
+
+        user = memory.validate_user_token(tok) if tok else None
+        if not user:
+            return HTMLResponse("<h3>Authentication Required</h3><p>You must be logged in to link accounts.</p><p><a href='/'>Return to Libra</a></p>", status_code=401)
+
+        prov = provider.strip().lower()
+        if prov not in ("github", "google"):
+            raise HTTPException(status_code=400, detail="Invalid provider for manual linking. Must be 'github' or 'google'.")
+
+        state = memory.create_manual_link_request(user["user_id"], prov)
+        host_header = request.headers.get("host", "localhost:8765")
+        proto = "https" if (request.headers.get("x-forwarded-proto") == "https" or "trycloudflare" in host_header or "ngrok" in host_header) else "http"
+        base_url = f"{proto}://{host_header}"
+
+        if prov == "github":
+            creds = _get_github_oauth_credentials()
+            client_id = creds.get("client_id")
+            if not client_id or client_id.startswith("YOUR_"):
+                return HTMLResponse("<h3>GitHub OAuth Error</h3><p>GitHub OAuth is not configured.</p>", status_code=500)
+            redirect_uri = f"{base_url.rstrip('/')}/auth/github/callback"
+            gh_url = (
+                f"https://github.com/login/oauth/authorize?"
+                f"client_id={urllib.parse.quote(client_id)}&"
+                f"redirect_uri={urllib.parse.quote(redirect_uri)}&"
+                f"scope=read:user&"
+                f"state={urllib.parse.quote(state)}"
+            )
+            resp = RedirectResponse(url=gh_url, status_code=307)
+            resp.set_cookie(key="libra_gh_state", value=state, httponly=True, samesite="lax", secure=(proto == "https"), path="/")
+            return resp
+
+        elif prov == "google":
+            creds = _get_google_oauth_credentials()
+            client_id = creds.get("client_id")
+            if not client_id or client_id.startswith("YOUR_"):
+                return HTMLResponse("<h3>Google OAuth Error</h3><p>Google OAuth is not configured.</p>", status_code=500)
+            redirect_uri = f"{base_url.rstrip('/')}/auth/google/callback"
+            params = {
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "response_type": "code",
+                "scope": "openid email profile",
+                "access_type": "offline",
+                "prompt": "select_account",
+                "state": state
+            }
+            google_auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(params)}"
+            resp = RedirectResponse(url=google_auth_url, status_code=307)
+            resp.set_cookie(key="libra_google_state", value=state, httponly=True, samesite="lax", secure=(proto == "https"), path="/")
+            return resp
+
+    @app.post("/api/auth/merge-accounts")
+    async def post_confirm_account_merge(request: Request, response: Response):
+        """Confirms or cancels a merge of two pre-existing accounts."""
+        memory = getattr(supervisor.llm, "memory", None)
+        if not memory or not hasattr(memory, "execute_account_merge"):
+            raise HTTPException(status_code=500, detail="Memory subsystem offline")
+
+        merge_token = ""
+        action = "merge"
+        try:
+            ct = request.headers.get("content-type", "")
+            if "application/json" in ct:
+                body = await request.json()
+                if isinstance(body, dict):
+                    merge_token = body.get("merge_token", "")
+                    action = body.get("action", "merge")
+            else:
+                form = await request.form()
+                merge_token = form.get("merge_token", "")
+                action = form.get("action", "merge")
+        except Exception:
+            pass
+
+        if not merge_token:
+            raise HTTPException(status_code=400, detail="merge_token is required.")
+
+        try:
+            result = memory.execute_account_merge(merge_token, action)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+
+        if action != "merge":
+            return {"status": "cancelled"}
+
+        surviving_user = result.get("surviving_user") or {}
+        tok = surviving_user.get("unique_token", "")
+        response.set_cookie(key="libra_token", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
+        response.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
+
+        accept = request.headers.get("accept", "")
+        if "text/html" in accept and "application/json" not in accept:
+            return HTMLResponse(f"""<!DOCTYPE html>
+<html>
+<head><title>Accounts Combined</title></head>
+<body style="background:#09090b; color:#ffffff; font-family:-apple-system, sans-serif; text-align:center; padding-top:60px;">
+  <h2>Accounts Combined Successfully</h2>
+  <p>Logging into Project Libra as <strong>{html.escape(surviving_user.get('display_name', 'User'))}</strong>...</p>
+  <script>
+    localStorage.setItem('libra_token', '{tok}');
+    document.cookie = 'libra_auth={tok}; path=/; max-age=2592000; SameSite=Lax';
+    window.location.href = '/';
+  </script>
+</body>
+</html>""", status_code=200)
+
+        return {
+            "status": "success",
+            "action": "merge",
+            "surviving_user": surviving_user,
+            "token": tok,
+            "backup_id": result.get("backup_id", "")
         }
 
     # MULTI-CHAT SESSIONS API (Phase 10 Gemini-Style Threads)

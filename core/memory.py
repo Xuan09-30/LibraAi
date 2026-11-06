@@ -816,6 +816,44 @@ class SemanticMemory:
             )
         """)
 
+        # 20. Manual Link Requests Table (Settings initiated)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS manual_link_requests (
+                state TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL
+            )
+        """)
+
+        # 21. Pending Account Merges Table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_account_merges (
+                merge_token TEXT PRIMARY KEY,
+                surviving_user_id TEXT NOT NULL,
+                secondary_user_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                provider_user_id TEXT NOT NULL,
+                email TEXT NOT NULL,
+                display_name TEXT,
+                github_username TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at REAL NOT NULL
+            )
+        """)
+
+        # 22. Account Merge Backups Table (Pre-deletion recovery snapshots)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS account_merge_backups (
+                backup_id TEXT PRIMARY KEY,
+                surviving_user_id TEXT NOT NULL,
+                secondary_user_id TEXT NOT NULL,
+                backup_json TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         try:
             cols = [col[1] for col in cursor.execute("PRAGMA table_info(registered_users)").fetchall()]
             if "user_id" not in cols:
@@ -6227,6 +6265,367 @@ class SemanticMemory:
 
         else:
             raise ValueError(f"Invalid account linking action: {action}. Must be 'link' or 'separate'.")
+
+    # -------------------------------------------------------------------------
+    # MANUAL ACCOUNT LINKING & PRE-EXISTING ACCOUNT MERGES (Phase 14 Extended)
+    # -------------------------------------------------------------------------
+
+    def create_manual_link_request(self, user_id: str, provider: str) -> str:
+        """Creates a secure, single-use state token tagging an OAuth flow as a manual link to user_id."""
+        import secrets
+        import time
+
+        state = f"ml_{secrets.token_urlsafe(32)}"
+        now = time.time()
+        expires_at = now + 600.0
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO manual_link_requests (state, user_id, provider, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (state, user_id.strip(), provider.strip().lower(), now, expires_at))
+            conn.commit()
+            return state
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def get_manual_link_request(self, state: str) -> Optional[dict]:
+        """Checks if state matches an unexpired manual link request without consuming it."""
+        if not state:
+            return None
+        import time
+        now = time.time()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT state, user_id, provider, expires_at
+                FROM manual_link_requests
+                WHERE state = ? AND expires_at > ?
+            """, (state.strip(), now))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "state": row[0],
+                    "user_id": row[1],
+                    "provider": row[2],
+                    "expires_at": row[3]
+                }
+            return None
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def consume_manual_link_request(self, state: str) -> Optional[dict]:
+        """Retrieves and deletes a manual link request (single-use)."""
+        req = self.get_manual_link_request(state)
+        if not req:
+            return None
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM manual_link_requests WHERE state = ?", (state.strip(),))
+            conn.commit()
+            return req
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def create_pending_merge(
+        self,
+        surviving_user_id: str,
+        secondary_user_id: str,
+        provider: str,
+        provider_user_id: str,
+        email: str,
+        display_name: str = "",
+        github_username: str = ""
+    ) -> str:
+        """Creates a short-lived token for explicit confirmation of combining two existing accounts."""
+        import secrets
+        import time
+
+        merge_token = f"merge_{secrets.token_hex(20)}"
+        expires_at = time.time() + 600.0
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO pending_account_merges (merge_token, surviving_user_id, secondary_user_id, provider, provider_user_id, email, display_name, github_username, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (merge_token, surviving_user_id.strip(), secondary_user_id.strip(), provider.strip().lower(), str(provider_user_id).strip(), email.strip().lower(), display_name, github_username, expires_at))
+            conn.commit()
+            return merge_token
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def get_pending_merge(self, merge_token: str) -> Optional[dict]:
+        """Retrieves an active, unexpired pending merge record."""
+        if not merge_token:
+            return None
+        import time
+        now = time.time()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT merge_token, surviving_user_id, secondary_user_id, provider, provider_user_id, email, display_name, github_username, expires_at
+                FROM pending_account_merges
+                WHERE merge_token = ? AND expires_at > ?
+            """, (merge_token.strip(), now))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "merge_token": row[0],
+                    "surviving_user_id": row[1],
+                    "secondary_user_id": row[2],
+                    "provider": row[3],
+                    "provider_user_id": row[4],
+                    "email": row[5],
+                    "display_name": row[6],
+                    "github_username": row[7] or "",
+                    "expires_at": row[8]
+                }
+            return None
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def get_merge_backup(self, secondary_user_id: str) -> Optional[dict]:
+        """Retrieves pre-deletion backup snapshot for a secondary user."""
+        if not secondary_user_id:
+            return None
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT backup_id, surviving_user_id, secondary_user_id, backup_json, created_at
+                FROM account_merge_backups
+                WHERE secondary_user_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+            """, (secondary_user_id.strip(),))
+            row = cursor.fetchone()
+            if row:
+                import json
+                try:
+                    data = json.loads(row[3])
+                except Exception:
+                    data = {}
+                return {
+                    "backup_id": row[0],
+                    "surviving_user_id": row[1],
+                    "secondary_user_id": row[2],
+                    "data": data,
+                    "created_at": row[4]
+                }
+            return None
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def execute_account_merge(self, merge_token: str, action: str = "merge") -> dict:
+        """
+        Executes a confirmed merge of two pre-existing accounts:
+        1. Backs up secondary account data before deleting/deactivating.
+        2. Transfers bug reports, memory/vault notes, preferences, and chat sessions to surviving account.
+        3. Moves secondary identity row(s) onto surviving user_id.
+        4. Invalidates secondary account tokens/sessions so it cannot log in standalone.
+        """
+        pending = self.get_pending_merge(merge_token)
+        if not pending:
+            raise ValueError("Invalid, expired, or already used account merge token.")
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM pending_account_merges WHERE merge_token = ?", (merge_token,))
+            conn.commit()
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+        act = action.strip().lower()
+        if act != "merge":
+            return {"status": "cancelled", "action": act}
+
+        surviving_uid = pending["surviving_user_id"]
+        secondary_uid = pending["secondary_user_id"]
+
+        surviving_user = self.get_canonical_user_by_id(surviving_uid)
+        secondary_user = self.get_canonical_user_by_id(secondary_uid)
+        if not surviving_user or not secondary_user:
+            raise ValueError("One or both accounts scheduled for merge do not exist.")
+
+        surv_email = surviving_user["primary_email"].strip().lower()
+        sec_email = secondary_user["primary_email"].strip().lower()
+        sec_gh = secondary_user.get("github_username") or ""
+        surv_gh = surviving_user.get("github_username") or sec_gh or ""
+        sec_token = secondary_user.get("unique_token", "")
+
+        # --- STEP 1: PRE-DELETION BACKUP ---
+        import json
+        import secrets
+        backup_id = f"bak_{secrets.token_hex(12)}"
+
+        backup_payload = {
+            "surviving_user_id": surviving_uid,
+            "secondary_user_id": secondary_uid,
+            "secondary_user_record": secondary_user,
+            "secondary_identities": self.get_user_identities(secondary_uid),
+            "secondary_profile": self.get_user_profile(sec_email),
+            "secondary_facts": [],
+            "secondary_chat_sessions": []
+        }
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            # Collect facts
+            cursor.execute("SELECT id, content, category, created_at FROM facts WHERE LOWER(user_email) = ?", (sec_email,))
+            backup_payload["secondary_facts"] = [
+                {"id": r[0], "content": r[1], "category": r[2], "created_at": r[3]}
+                for r in cursor.fetchall()
+            ]
+
+            # Collect chat sessions
+            cursor.execute("SELECT session_id, title, client_scope, created_at FROM chat_sessions WHERE LOWER(user_email) = ?", (sec_email,))
+            backup_payload["secondary_chat_sessions"] = [
+                {"session_id": r[0], "title": r[1], "client_scope": r[2], "created_at": r[3]}
+                for r in cursor.fetchall()
+            ]
+
+            # Store in DB
+            cursor.execute("""
+                INSERT INTO account_merge_backups (backup_id, surviving_user_id, secondary_user_id, backup_json, created_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (backup_id, surviving_uid, secondary_uid, json.dumps(backup_payload, ensure_ascii=False)))
+            conn.commit()
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+        # Also write backup file to disk in logs/merge_backups/
+        try:
+            import os
+            root = getattr(self, "project_root", None) or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            backup_dir = os.path.join(root, "logs", "merge_backups")
+            os.makedirs(backup_dir, exist_ok=True)
+            with open(os.path.join(backup_dir, f"{backup_id}.json"), "w", encoding="utf-8") as bf:
+                json.dump(backup_payload, bf, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+        # --- STEP 2: DATA MIGRATION ---
+
+        # 2A. Bug reports migration
+        try:
+            import os
+            root = getattr(self, "project_root", None) or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            for fname in ("bug_reports.json", "bug_history.json"):
+                fpath = os.path.join(root, "logs", fname)
+                if os.path.exists(fpath):
+                    try:
+                        with open(fpath, "r", encoding="utf-8") as rf:
+                            bugs = json.load(rf)
+                        modified = False
+                        target_reporter = f"@{surv_gh}" if surv_gh else surv_email
+                        for b in bugs:
+                            cur_rep = str(b.get("reporter", "")).strip().lower()
+                            if cur_rep in (sec_email, f"@{sec_gh.lower()}", secondary_uid.lower(), sec_gh.lower()):
+                                b["reporter"] = target_reporter
+                                modified = True
+                        if modified:
+                            with open(fpath, "w", encoding="utf-8") as wf:
+                                json.dump(bugs, wf, indent=2, ensure_ascii=False)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # 2B. Memory / Vault facts migration
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            # Transfer facts to surviving email
+            cursor.execute("UPDATE facts SET user_email = ? WHERE LOWER(user_email) = ?", (surv_email, sec_email))
+
+            # Update category namespaces e.g. user:sec_email:* -> user:surv_email:*
+            cursor.execute("""
+                SELECT id, category FROM facts
+                WHERE category LIKE ?
+            """, (f"user:{sec_email}:%",))
+            rows = cursor.fetchall()
+            for fid, cat in rows:
+                new_cat = cat.replace(f"user:{sec_email}:", f"user:{surv_email}:")
+                cursor.execute("UPDATE facts SET category = ? WHERE id = ?", (new_cat, fid))
+
+            # 2C. User profile preferences migration (backfill missing fields on surviving)
+            sec_prof = self.get_user_profile(sec_email) or {}
+            surv_prof = self.get_user_profile(surv_email) or {}
+            merged_about = surv_prof.get("about_user") or sec_prof.get("about_user") or ""
+            merged_inst = surv_prof.get("custom_instructions") or sec_prof.get("custom_instructions") or ""
+            merged_int = surv_prof.get("interests") or sec_prof.get("interests") or ""
+            merged_loc = surv_prof.get("location") or sec_prof.get("location") or "Kuala Lumpur"
+            self.save_user_profile(
+                email=surv_email,
+                data={
+                    "display_name": surviving_user.get("display_name") or surv_email.split("@")[0],
+                    "location": merged_loc,
+                    "about_user": merged_about,
+                    "custom_instructions": merged_inst,
+                    "interests": merged_int
+                }
+            )
+
+            # 2D. Chat sessions migration
+            cursor.execute("UPDATE chat_sessions SET user_email = ? WHERE LOWER(user_email) = ?", (surv_email, sec_email))
+
+            # 2E. Identities migration
+            cursor.execute("UPDATE identities SET user_id = ? WHERE user_id = ?", (surviving_uid, secondary_uid))
+
+            # Update surviving user's github_username if needed
+            if surv_gh:
+                cursor.execute("UPDATE users SET github_username = ? WHERE user_id = ?", (surv_gh, surviving_uid))
+                cursor.execute("UPDATE registered_users SET github_username = ? WHERE user_id = ? OR LOWER(email) = ?", (surv_gh, surviving_uid, surv_email))
+
+            # 2F. Deactivate & invalidate secondary account
+            # Clear unique_token so secondary account cannot authenticate or validate
+            cursor.execute("""
+                UPDATE users
+                SET role = 'merged_deactivated', unique_token = '', last_login = CURRENT_TIMESTAMP
+                WHERE user_id = ?
+            """, (secondary_uid,))
+            cursor.execute("""
+                UPDATE registered_users
+                SET role = 'merged_deactivated', unique_token = ''
+                WHERE user_id = ? OR LOWER(email) = ?
+            """, (secondary_uid, sec_email))
+
+            conn.commit()
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+        # Evict token cache
+        if hasattr(self, "_user_cache"):
+            try:
+                self._user_cache.clear()
+            except Exception:
+                pass
+
+        refreshed_surviving = self.get_canonical_user_by_id(surviving_uid)
+        return {
+            "status": "merged",
+            "action": "merge",
+            "surviving_user": refreshed_surviving,
+            "backup_id": backup_id
+        }
 
 # Backward compatibility alias
 
