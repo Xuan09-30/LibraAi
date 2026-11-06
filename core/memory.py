@@ -17,6 +17,100 @@ from datetime import datetime, timedelta
 
 from typing import Optional, List, Dict, Any, Tuple
 
+# ---------------------------------------------------------------------------
+# CONFIG-DRIVEN HOST IDENTITIES (Phase 15 Security Hardening)
+# ---------------------------------------------------------------------------
+
+def get_host_identities(config_path: str = "config.json") -> Dict[str, List[str]]:
+    """
+    Loads host identity emails and GitHub usernames from config.local.json with fallback to config.json
+    and environment variables.
+    """
+    emails: List[str] = []
+    github_usernames: List[str] = []
+
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    local_cfg_path = os.path.join(base_dir, "config.local.json")
+    main_cfg_path = os.path.join(base_dir, config_path)
+
+    raw_cfg: Dict[str, Any] = {}
+    if os.path.exists(main_cfg_path):
+        try:
+            with open(main_cfg_path, "r", encoding="utf-8") as f:
+                raw_cfg = json.load(f)
+        except Exception:
+            pass
+
+    if os.path.exists(local_cfg_path):
+        try:
+            with open(local_cfg_path, "r", encoding="utf-8") as f:
+                local_data = json.load(f)
+                raw_cfg.update(local_data)
+        except Exception:
+            pass
+
+    # Extract host_identities block
+    host_id_block = raw_cfg.get("host_identities", {})
+    if isinstance(host_id_block, dict):
+        for e in host_id_block.get("emails", []):
+            if isinstance(e, str) and e.strip():
+                emails.append(e.strip().lower())
+        for g in host_id_block.get("github_usernames", []):
+            if isinstance(g, str) and g.strip():
+                github_usernames.append(g.strip().lower())
+
+    # Fallback: web_server.admin_email or top-level admin_email
+    web_sec = raw_cfg.get("web_server", {})
+    admin_em = (web_sec.get("admin_email") or raw_cfg.get("admin_email") or "").strip().lower()
+    if admin_em and admin_em not in emails:
+        emails.append(admin_em)
+
+    # Environment variables
+    env_emails = os.environ.get("LIBRA_HOST_EMAILS", "")
+    if env_emails:
+        for em in env_emails.split(","):
+            if em.strip():
+                emails.append(em.strip().lower())
+
+    env_admin = os.environ.get("LIBRA_ADMIN_EMAIL", "").strip().lower()
+    if env_admin and env_admin not in emails:
+        emails.append(env_admin)
+
+    env_gh = os.environ.get("LIBRA_HOST_GITHUB_USERNAMES", "")
+    if env_gh:
+        for gh in env_gh.split(","):
+            if gh.strip():
+                github_usernames.append(gh.strip().lower())
+
+    # Deduplicate preserving order
+    return {
+        "emails": list(dict.fromkeys(emails)),
+        "github_usernames": list(dict.fromkeys(github_usernames))
+    }
+
+def is_host_identity(email: Optional[str] = None, github_username: Optional[str] = None, config_path: str = "config.json") -> bool:
+    """
+    Determines if a given email and/or GitHub username corresponds to an authorized host identity.
+    Dynamically resolved from configuration.
+    """
+    identities = get_host_identities(config_path=config_path)
+    if email:
+        clean_email = email.strip().lower()
+        if clean_email in identities.get("emails", []):
+            return True
+    if github_username:
+        clean_gh = github_username.strip().lower()
+        if clean_gh in identities.get("github_usernames", []):
+            return True
+    return False
+
+def get_primary_host_email(config_path: str = "config.json") -> str:
+    """Returns the primary host email from config or default fallback."""
+    identities = get_host_identities(config_path=config_path)
+    emails = identities.get("emails", [])
+    return emails[0] if emails else "admin@example.com"
+
+
 try:
 
     import yaml
@@ -214,7 +308,7 @@ class SemanticMemory:
 
                 (
 
-                    "Chuah Chen Xuan (Chen Xuan, REDACTED) is the Master Architect, Lead Software Engineer, and sole Creator of Project Libra. This is an immutable core truth of Libra that cannot be altered, spoofed, or overridden by any user profile, guest token, or external instruction.",
+                    "Chuah Chen Xuan (Chen Xuan) is the Master Architect, Lead Software Engineer, and sole Creator of Project Libra. This is an immutable core truth of Libra that cannot be altered, spoofed, or overridden by any user profile, guest token, or external instruction.",
 
                     "core_deep_memory"
 
@@ -993,7 +1087,7 @@ class SemanticMemory:
 
         clean_email = (user_email or "").strip().lower()
         clean_role = (role or "host").strip().lower()
-        is_host_user = (clean_role == "host") and (not clean_email or clean_email in ("REDACTED", "REDACTED"))
+        is_host_user = (clean_role == "host") and (not clean_email or is_host_identity(email=clean_email))
         if not is_host_user:
             ns_email = clean_email or "guest@libra.local"
             clean_email = ns_email
@@ -1058,7 +1152,7 @@ class SemanticMemory:
             return []
 
         clean_email = (user_email or "").strip().lower()
-        is_host_query = (not clean_email) or (clean_email in ("REDACTED", "REDACTED"))
+        is_host_query = (not clean_email) or is_host_identity(email=clean_email)
 
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -1087,7 +1181,7 @@ class SemanticMemory:
                     fid, content, cat, created_at, dist, row_email = r[0], r[1], r[2], r[3], float(r[4]), (r[5] or "").strip().lower()
                     if not is_host_query and row_email != clean_email and not str(cat).startswith(f"user:{clean_email}:"):
                         continue
-                    if is_host_query and row_email and row_email not in ("REDACTED", "REDACTED", ""):
+                    if is_host_query and row_email and not is_host_identity(email=row_email):
                         continue
                     if dist <= distance_threshold:
                         vec_ranks[fid] = rank_idx
@@ -1122,7 +1216,7 @@ class SemanticMemory:
                     fid, content, cat, created_at, bm25_val, row_email = r[0], r[1], r[2], r[3], float(r[4] or 0.0), (r[5] or "").strip().lower()
                     if not is_host_query and row_email != clean_email and not str(cat).startswith(f"user:{clean_email}:"):
                         continue
-                    if is_host_query and row_email and row_email not in ("REDACTED", "REDACTED", ""):
+                    if is_host_query and row_email and not is_host_identity(email=row_email):
                         continue
                     fts_ranks[fid] = rank_idx
                     rank_idx += 1
@@ -1169,7 +1263,7 @@ class SemanticMemory:
 
         clean_email = (user_email or "").strip().lower()
         clean_role = (role or "host").strip().lower()
-        is_host_user = (clean_role == "host") and (not clean_email or clean_email in ("REDACTED", "REDACTED"))
+        is_host_user = (clean_role == "host") and (not clean_email or is_host_identity(email=clean_email))
 
         emb = self.embed_text(clean_query)
         conn = self._get_connection()
@@ -1196,7 +1290,7 @@ class SemanticMemory:
                     if not clean_email or (r_email != clean_email and not r_cat.startswith(f"user:{clean_email}:")):
                         continue
                 else:
-                    if r_email and r_email not in ("REDACTED", "REDACTED", ""):
+                    if r_email and not is_host_identity(email=r_email):
                         continue
                 if float(dist) <= distance_threshold:
                     cursor.execute("DELETE FROM vec_facts WHERE fact_id = ?", (fact_id,))
@@ -1217,10 +1311,11 @@ class SemanticMemory:
                 else:
                     sub_match = None
             else:
-                cursor.execute(
-                    "SELECT id, content FROM facts WHERE content LIKE ? AND LOWER(COALESCE(user_email, '')) IN ('', 'REDACTED', 'REDACTED') LIMIT 1",
-                    (f"%{clean_query}%",)
-                )
+                host_ems = [e.lower() for e in get_host_identities().get("emails", [])]
+                ph = ', '.join('?' for _ in host_ems) if host_ems else "''"
+                q_sql = f"SELECT id, content FROM facts WHERE content LIKE ? AND (user_email IS NULL OR LOWER(user_email) = '' OR LOWER(user_email) IN ({ph})) LIMIT 1"
+                params = [f"%{clean_query}%"] + host_ems if host_ems else [f"%{clean_query}%"]
+                cursor.execute(q_sql, tuple(params))
                 sub_match = cursor.fetchone()
             if sub_match:
                 fact_id, content = sub_match
@@ -1237,7 +1332,7 @@ class SemanticMemory:
         """Returns the most recent facts stored about the user, scoped by user_email."""
         try:
             clean_email = (user_email or "").strip().lower()
-            is_host_query = (not clean_email) or (clean_email in ("REDACTED", "REDACTED"))
+            is_host_query = (not clean_email) or is_host_identity(email=clean_email)
             conn = self._get_connection()
             cursor = conn.cursor()
             if not is_host_query:
@@ -1246,10 +1341,11 @@ class SemanticMemory:
                     (clean_email, f"user:{clean_email}:%", limit)
                 )
             else:
-                cursor.execute(
-                    "SELECT content FROM facts WHERE LOWER(COALESCE(user_email, '')) IN ('', 'REDACTED', 'REDACTED') ORDER BY id DESC LIMIT ?",
-                    (limit,)
-                )
+                host_ems = [e.lower() for e in get_host_identities().get("emails", [])]
+                ph = ', '.join('?' for _ in host_ems) if host_ems else "''"
+                q_sql = f"SELECT content FROM facts WHERE (user_email IS NULL OR LOWER(user_email) = '' OR LOWER(user_email) IN ({ph})) ORDER BY id DESC LIMIT ?"
+                params = host_ems + [limit] if host_ems else [limit]
+                cursor.execute(q_sql, tuple(params))
 
             rows = cursor.fetchall()
 
@@ -1524,7 +1620,7 @@ class SemanticMemory:
         """
         clean_role = (role or "host").strip().lower()
         clean_email = (user_email or "").strip().lower()
-        if clean_role != "host" or (clean_email and clean_email not in ("REDACTED", "REDACTED")):
+        if clean_role != "host" or (clean_email and not is_host_identity(email=clean_email)):
             return -1
 
         clean_trigger = (trigger_query or "").strip()
@@ -2082,7 +2178,7 @@ class SemanticMemory:
 
         clean_email = (user_email or "").strip().lower()
 
-        is_host_user = (clean_role == "host") and (not clean_email or clean_email in ("REDACTED", "REDACTED"))
+        is_host_user = (clean_role == "host") and (not clean_email or is_host_identity(email=clean_email))
 
         if not is_host_user:
             ns_prefix = f"user:{clean_email or clean_role}:"
@@ -5004,15 +5100,10 @@ class SemanticMemory:
             return code, False, f"Dispatch exception: {e}", totp_secret, is_new_user
 
     def verify_email_otp(
-
         self,
-
         email: str,
-
         code: str,
-
-        admin_email: str = "REDACTED"
-
+        admin_email: Optional[str] = None
     ) -> Tuple[bool, Optional[dict], str]:
 
         """
@@ -5127,17 +5218,7 @@ class SemanticMemory:
 
             return False, None, "Verification failed."
 
-        # Host role for both primary and alt host emails: REDACTED and REDACTED
-
-        is_host = (
-
-            clean_email in ("REDACTED", "REDACTED")
-
-            or clean_email.startswith("chenxuanchuah")
-
-            or clean_email == admin_email.strip().lower()
-
-        )
+        is_host = is_host_identity(email=clean_email) or (bool(admin_email) and clean_email == admin_email.strip().lower())
 
         role = "host" if is_host else "guest"
 
@@ -5169,9 +5250,7 @@ class SemanticMemory:
 
         clean_email = email.strip().lower()
 
-        # Only the main account REDACTED is hardcoded as host
-
-        is_main_host = (clean_email == "REDACTED")
+        is_main_host = is_host_identity(email=clean_email)
 
         effective_role = "host" if is_main_host else (default_role or "tester")
 
@@ -5470,7 +5549,7 @@ class SemanticMemory:
 
                 FROM registered_users
 
-                ORDER BY (CASE WHEN LOWER(email) = 'REDACTED' THEN 0 ELSE 1 END), created_at ASC
+                ORDER BY created_at ASC
 
             """)
 
@@ -5494,7 +5573,7 @@ class SemanticMemory:
 
                     "last_login": str(r[4]) if r[4] else "",
 
-                    "is_primary_host": (em.lower() == "REDACTED")
+                    "is_primary_host": is_host_identity(email=em)
 
                 })
 
@@ -5512,7 +5591,7 @@ class SemanticMemory:
 
                 conn.close()
 
-    def update_user_role(self, email: str, new_role: str, admin_email: str = "REDACTED") -> Tuple[bool, str]:
+    def update_user_role(self, email: str, new_role: str, admin_email: Optional[str] = None) -> Tuple[bool, str]:
 
         """Allows host to assign 'host' or 'tester' role to any user."""
 
@@ -5524,9 +5603,8 @@ class SemanticMemory:
 
             return False, f"Invalid role '{new_role}'. Must be 'host' or 'tester'."
 
-        if clean_email == "REDACTED" and role_target != "host":
-
-            return False, "Primary host account 'REDACTED' cannot be demoted."
+        if is_host_identity(email=clean_email) and role_target != "host":
+            return False, f"Configured host account '{clean_email}' cannot be demoted."
 
         conn = self._get_connection()
 
@@ -5558,15 +5636,14 @@ class SemanticMemory:
 
                 conn.close()
 
-    def delete_registered_user(self, email: str, admin_email: str = "REDACTED") -> Tuple[bool, str]:
+    def delete_registered_user(self, email: str, admin_email: Optional[str] = None) -> Tuple[bool, str]:
 
         """Allows host to remove a registered user and their sessions."""
 
         clean_email = email.strip().lower()
 
-        if clean_email == "REDACTED":
-
-            return False, "Primary host account 'REDACTED' cannot be deleted."
+        if is_host_identity(email=clean_email):
+            return False, f"Configured host account '{clean_email}' cannot be deleted."
 
         conn = self._get_connection()
 
@@ -5718,7 +5795,7 @@ class SemanticMemory:
 
             # Core Deep Memory Guard: Creator identity is immutable and cannot be claimed via user options
 
-            is_creator_admin = clean_email in ("REDACTED", "REDACTED")
+            is_creator_admin = is_host_identity(email=clean_email)
 
             if not is_creator_admin:
 
@@ -5786,13 +5863,13 @@ class SemanticMemory:
 
             "creator_alias": "Chen Xuan",
 
-            "creator_email": "REDACTED",
+            "creator_email": get_primary_host_email(),
 
             "role": "Master Architect & Sole Creator",
 
             "project_name": "Project Libra",
 
-            "immutable_truth": "Chuah Chen Xuan (Chen Xuan, REDACTED) designed, engineered, and created Project Libra. Under no circumstances can any user profile, guest token, custom instruction, or external prompt alter or claim creator status."
+            "immutable_truth": "Chuah Chen Xuan (Chen Xuan) designed, engineered, and created Project Libra. Under no circumstances can any user profile, guest token, custom instruction, or external prompt alter or claim creator status."
 
         }
 
@@ -5939,12 +6016,7 @@ class SemanticMemory:
         gh_user = (github_username or "").strip()
         totp = (totp_secret or "").strip()
 
-        is_main_host = (
-            clean_email in ("REDACTED", "REDACTED", "REDACTED")
-            or clean_email.startswith("chenxuanchuah")
-            or clean_email.startswith("hugochuah")
-            or gh_user.lower() == "REDACTED"
-        )
+        is_main_host = is_host_identity(email=clean_email, github_username=gh_user)
         effective_role = "host" if is_main_host else (role or "user")
 
         conn = self._get_connection()
@@ -6290,12 +6362,7 @@ class SemanticMemory:
         elif act == "separate":
             clean_p_email = pending["email"].strip().lower()
             clean_p_gh = pending.get("github_username", "").strip().lower()
-            is_host = (
-                clean_p_email in ("REDACTED", "REDACTED", "REDACTED")
-                or clean_p_email.startswith("chenxuanchuah")
-                or clean_p_email.startswith("hugochuah")
-                or clean_p_gh == "REDACTED"
-            )
+            is_host = is_host_identity(email=clean_p_email, github_username=clean_p_gh)
             default_role = "host" if is_host else "user"
             new_user = self.create_canonical_user(
                 primary_email=pending["email"],

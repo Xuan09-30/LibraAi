@@ -23,6 +23,7 @@ import logging
 import threading
 
 from typing import Optional, Dict, Any, List
+from core.memory import is_host_identity, get_host_identities, get_primary_host_email
 
 import numpy as np
 
@@ -94,9 +95,9 @@ DEFAULT_CONFIG = {
 
     "port": 8765,
 
-    "admin_email": "REDACTED",
+    "admin_email": "admin@example.com",
 
-    "allowed_gmail": "REDACTED",
+    "allowed_gmail": "admin@example.com",
 
     "access_token": "libra_access_token_phase10_secure",
 
@@ -541,7 +542,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
     cfg = load_web_config(config_path)
 
-    admin_email = (cfg.get("allowed_gmail") or cfg.get("admin_email", "REDACTED")).lower().strip()
+    admin_email = (cfg.get("allowed_gmail") or cfg.get("admin_email", get_primary_host_email())).lower().strip()
 
     access_token = cfg.get("access_token", "libra_access_token_phase10_secure")
 
@@ -1319,7 +1320,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
             # Allow host accounts to auto-proceed or prompt
 
-            if not (clean_email in ("REDACTED", "REDACTED") or clean_email.startswith("chenxuanchuah")):
+            if not is_host_identity(email=clean_email):
 
                 return {
 
@@ -1415,15 +1416,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
             raise HTTPException(status_code=500, detail="Memory subsystem offline")
 
-        is_host = (
-
-            clean_email in ("REDACTED", "REDACTED")
-
-            or clean_email.startswith("chenxuanchuah")
-
-            or clean_email == admin_email
-
-        )
+        is_host = is_host_identity(email=clean_email) or (clean_email == admin_email)
 
         role = "host" if is_host else "guest"
 
@@ -2270,17 +2263,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             resp.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
             return resp
 
-        is_host = (
-
-            clean_email in ("REDACTED", "REDACTED", "REDACTED")
-
-            or clean_email.startswith("chenxuanchuah")
-
-            or clean_email.startswith("hugochuah")
-
-            or clean_email == admin_email
-
-        )
+        is_host = is_host_identity(email=clean_email) or (clean_email == admin_email)
 
         role = "host" if is_host else "guest"
 
@@ -2771,7 +2754,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                     return resp
 
                 # 3. Otherwise (unverified email or new user): Create separate canonical user & link identity
-                is_host = (gh_email.lower() == admin_email.lower() or gh_user.lower() == "REDACTED")
+                is_host = is_host_identity(email=gh_email, github_username=gh_user) or (gh_email.lower() == admin_email.lower())
                 role = "host" if is_host else "tester"
                 user = memory.create_canonical_user(
                     primary_email=gh_email,
@@ -4189,7 +4172,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                 # Core Deep Memory Guard: Prevent any non-creator user from claiming creator status in options
 
-                is_creator_admin = user_email in ("REDACTED", "REDACTED")
+                is_creator_admin = is_host_identity(email=user_email)
 
                 if not is_creator_admin:
 
@@ -4209,7 +4192,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                     "CORE DEEP MEMORY // IMMUTABLE CREATOR TRUTH:\n"
 
-                    "- Creator & Master Architect: Chuah Chen Xuan (also known as Chen Xuan, REDACTED).\n"
+                    "- Creator & Master Architect: Chuah Chen Xuan (also known as Chen Xuan).\n"
 
                     "- Project: Project Libra, local-first cybernetic AI desktop companion and cognitive partner.\n"
 

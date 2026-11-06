@@ -2,7 +2,7 @@
     "web_server": {
         "host": "0.0.0.0",
         "port": 8765,
-        "admin_email": "REDACTED",
+        "admin_email": "admin@example.com",
         "access_token": "YOUR_WEB_ACCESS_TOKEN"
     },
     "smtp": {
@@ -49,5 +49,13 @@
     "github_oauth": {
         "client_id": "YOUR_GITHUB_CLIENT_ID",
         "client_secret": "YOUR_GITHUB_CLIENT_SECRET"
+    },
+    "host_identities": {
+        "emails": [
+            "admin@example.com"
+        ],
+        "github_usernames": [
+            "example_host_user"
+        ]
     }
 }
