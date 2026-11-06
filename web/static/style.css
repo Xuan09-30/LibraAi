@@ -4574,3 +4574,695 @@ header {
   padding: 4px 8px;
   margin-top: 4px;
 }
+
+/* ==========================================================================
+   REDESIGNED CORE MEMORY VAULT & AUTHENTICATION MODALS (DESIGN PASS)
+   ========================================================================== */
+
+/* --- AUTH MODAL REFINEMENT (LINEAR / RESTRAINED STYLE) --- */
+.auth-modal-clean {
+  max-width: 400px;
+  width: 92%;
+  padding: 24px;
+  background: #11141c;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.7);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  box-sizing: border-box;
+  color: #f8fafc;
+}
+
+.auth-header-title-clean {
+  font-size: 15px;
+  font-weight: 600;
+  color: #f8fafc;
+  letter-spacing: normal;
+}
+
+.auth-clean-header {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  gap: 6px;
+  margin-bottom: 2px;
+}
+
+.auth-clean-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: #f8fafc;
+  margin: 0;
+  letter-spacing: -0.2px;
+}
+
+.auth-clean-subtitle {
+  font-size: 13px;
+  color: #94a3b8;
+  margin: 0;
+  line-height: 1.5;
+  max-width: 100%;
+}
+
+.oauth-buttons-column {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  margin-top: 4px;
+}
+
+.google-sign-in-clean-btn,
+.github-sign-in-clean-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  height: 42px;
+  min-height: 42px;
+  background: #171b26;
+  color: #f8fafc !important;
+  font-size: 13.5px;
+  font-weight: 500;
+  border-radius: 8px;
+  text-decoration: none !important;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: none;
+  cursor: pointer;
+  box-sizing: border-box;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.google-sign-in-clean-btn:hover,
+.github-sign-in-clean-btn:hover {
+  background: #1f2533;
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.google-sign-in-clean-btn span,
+.github-sign-in-clean-btn span {
+  color: #f8fafc !important;
+  font-weight: 500;
+}
+
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  margin: 6px 0;
+}
+
+.auth-divider-line {
+  flex: 1;
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.auth-divider-text {
+  font-size: 12px;
+  color: #64748b;
+  text-transform: none;
+  letter-spacing: normal;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.auth-token-box {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+}
+
+.auth-token-input {
+  display: block;
+  width: 100%;
+  height: 42px;
+  min-height: 42px;
+  box-sizing: border-box;
+  background: #141722;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  padding: 0 12px;
+  color: #f8fafc;
+  font-size: 13.5px;
+  font-family: inherit;
+  outline: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: border-color 0.15s ease;
+}
+
+.auth-token-input:focus {
+  border-color: #00d2ff;
+  box-shadow: 0 0 0 2px rgba(0, 210, 255, 0.18);
+}
+
+.auth-token-input::placeholder {
+  color: #64748b;
+  text-overflow: ellipsis;
+}
+
+.auth-actions-row {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+
+.auth-btn-primary {
+  flex: 1;
+  height: 42px;
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: #00d2ff;
+  color: #090d16;
+  font-weight: 600;
+  font-size: 13.5px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  box-shadow: none;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+
+.auth-btn-primary:hover {
+  background: #38bdf8;
+  opacity: 0.95;
+  transform: none;
+  box-shadow: none;
+}
+
+.auth-btn-secondary {
+  flex: 1;
+  height: 42px;
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: transparent;
+  color: #f1f5f9;
+  font-weight: 500;
+  font-size: 13.5px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 8px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.auth-btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.25);
+  color: #ffffff;
+}
+
+@media (max-width: 480px) {
+  .auth-modal-clean {
+    padding: 20px 16px;
+    width: 95%;
+  }
+  .auth-actions-row {
+    flex-direction: column;
+    gap: 8px;
+  }
+  .auth-btn-primary,
+  .auth-btn-secondary {
+    width: 100%;
+    flex: unset;
+  }
+}
+
+/* --- CORE MEMORY VAULT MODAL (LINEAR / RESTRAINED STYLE) --- */
+.vault-modal-content {
+  max-width: 820px;
+  width: 92%;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  background: #0f121a;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.75);
+  overflow: hidden;
+  box-sizing: border-box;
+  color: #f8fafc;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+.vault-header-text {
+  font-size: 16px;
+  font-weight: 600;
+  color: #f8fafc;
+  letter-spacing: normal;
+}
+
+.vault-header-sub {
+  font-size: 12px;
+  font-weight: 400;
+  color: #94a3b8;
+  margin-left: 10px;
+}
+
+.vault-modal-controls {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 18px;
+  background: #131722;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  box-sizing: border-box;
+}
+
+.vault-search-wrapper {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.vault-search-icon {
+  position: absolute;
+  left: 11px;
+  color: #64748b;
+  pointer-events: none;
+}
+
+.vault-search-input {
+  height: 38px;
+  width: 100%;
+  padding-left: 34px;
+  padding-right: 12px;
+  background: #0d1017;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  color: #f8fafc;
+  font-size: 13px;
+  outline: none;
+  box-sizing: border-box;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: border-color 0.15s ease;
+}
+
+.vault-search-input:focus {
+  border-color: #00d2ff;
+  box-shadow: 0 0 0 2px rgba(0, 210, 255, 0.18);
+}
+
+.vault-search-input::placeholder {
+  color: #64748b;
+  text-overflow: ellipsis;
+}
+
+.vault-filter-wrapper {
+  min-width: 140px;
+}
+
+.vault-category-select {
+  height: 38px;
+  width: 100%;
+  padding: 0 10px;
+  background: #0d1017;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 8px;
+  color: #f8fafc;
+  font-size: 13px;
+  outline: none;
+  cursor: pointer;
+  box-sizing: border-box;
+  transition: border-color 0.15s ease;
+}
+
+.vault-category-select:focus {
+  border-color: #00d2ff;
+}
+
+.vault-add-btn {
+  height: 38px;
+  min-height: 38px;
+  padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: #00d2ff;
+  color: #090d16;
+  font-weight: 600;
+  font-size: 13px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  box-shadow: none;
+  transition: background 0.15s ease, opacity 0.15s ease;
+}
+
+.vault-add-btn:hover {
+  background: #38bdf8;
+  opacity: 0.95;
+  box-shadow: none;
+  transform: none;
+}
+
+.vault-cards-grid {
+  padding: 16px 18px;
+  overflow-y: auto;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 12px;
+  max-height: 520px;
+  box-sizing: border-box;
+}
+
+.vault-card {
+  background: #141824;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  box-sizing: border-box;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.vault-card:hover {
+  border-color: rgba(255, 255, 255, 0.18);
+  background: #181d2a;
+  transform: none;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+
+.vault-card.pinned {
+  border-color: rgba(245, 158, 11, 0.3);
+  background: #171b26;
+}
+
+.vault-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.vault-card-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.vault-card-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.vault-pin-btn {
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: #64748b;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0;
+  transition: color 0.15s ease;
+}
+
+.vault-pin-btn:hover,
+.vault-pin-btn.pinned {
+  color: #f59e0b;
+}
+
+.vault-card-key {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  color: #94a3b8;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 2px 7px;
+  border-radius: 4px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vault-category-badge {
+  font-size: 11px;
+  font-weight: 500;
+  color: #cbd5e1;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  padding: 2px 8px;
+  border-radius: 4px;
+  letter-spacing: normal;
+  text-transform: none;
+}
+
+.vault-card-time {
+  font-size: 11px;
+  color: #64748b;
+}
+
+.vault-delete-btn {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: #64748b;
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0;
+  transition: color 0.15s ease;
+}
+
+.vault-delete-btn:hover {
+  color: #ef4444;
+}
+
+.vault-card-body {
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: #f1f5f9;
+  word-break: break-word;
+}
+
+@media (max-width: 640px) {
+  .vault-modal-content {
+    width: 95%;
+    max-height: 90vh;
+  }
+  .vault-modal-controls {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 12px 14px;
+  }
+  .vault-filter-wrapper {
+    min-width: unset;
+    width: 100%;
+  }
+  .vault-add-btn {
+    width: 100%;
+    justify-content: center;
+  }
+  .vault-cards-grid {
+    grid-template-columns: 1fr;
+    padding: 12px 14px;
+  }
+  .vault-card-key {
+    max-width: 160px;
+  }
+  .vault-card-time {
+    display: none;
+  }
+}
+
+/* ==========================================================================
+   UI / DESIGN-SYSTEM: RESPONSIVE, 44PX TAP TARGETS & MOBILE-FIRST ENHANCEMENTS
+   ========================================================================== */
+
+/* Prevent horizontal scroll anywhere on page */
+html, body {
+  overflow-x: hidden !important;
+  max-width: 100vw !important;
+  width: 100% !important;
+  height: 100dvh !important;
+  max-height: 100dvh !important;
+  margin: 0 !important;
+  padding: 0 !important;
+}
+
+#app-wrapper, #main-viewport {
+  height: 100dvh !important;
+  max-height: 100dvh !important;
+  overflow: hidden !important;
+  display: flex !important;
+}
+
+/* Ensure 44px minimum tap targets on all interactive controls */
+.header-action-btn,
+.header-new-chat-btn,
+.drawer-toggle-btn,
+.modal-close-btn,
+#send-btn,
+#mic-btn,
+#attach-btn,
+#scroll-bottom-btn,
+.thought-duration-btn,
+.vault-pin-btn,
+.vault-delete-btn,
+.replay-audio-btn {
+  min-height: 44px !important;
+  min-width: 44px !important;
+  box-sizing: border-box !important;
+}
+
+#send-btn, #mic-btn, #attach-btn {
+  width: 44px !important;
+  height: 44px !important;
+}
+
+/* Input stage keyboard-anchored with safe-area insets */
+#input-stage-wrapper {
+  position: sticky !important;
+  bottom: 0 !important;
+  z-index: 90 !important;
+  width: 100% !important;
+  padding-bottom: max(14px, env(safe-area-inset-bottom)) !important;
+  padding-left: max(16px, env(safe-area-inset-left)) !important;
+  padding-right: max(16px, env(safe-area-inset-right)) !important;
+}
+
+/* Chat container safe scrolling */
+#chat-container {
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  -webkit-overflow-scrolling: touch !important;
+  scroll-behavior: smooth !important;
+  padding-bottom: 24px !important;
+}
+
+/* NO HOVER-ONLY CONTROLS: ensure action icons are always visible on touch/mobile */
+.replay-audio-btn,
+.thought-duration-btn,
+.thought-action-btn,
+.vault-pin-btn,
+.vault-delete-btn {
+  opacity: 1 !important;
+  pointer-events: auto !important;
+  visibility: visible !important;
+}
+
+/* THINKING TRACE PILL: Collapsed 'Thought for Ns' pill */
+.thought-accordion {
+  margin: 8px 0 14px 0 !important;
+}
+
+.thought-duration-btn {
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 8px !important;
+  background: rgba(255, 255, 255, 0.04) !important;
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: var(--radius-pill, 9999px) !important;
+  padding: 6px 14px !important;
+  color: var(--text-secondary, #94a3b8) !important;
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  cursor: pointer !important;
+  transition: all var(--motion-fast, 0.15s ease) !important;
+}
+
+.thought-duration-btn:hover, .thought-duration-btn:active {
+  background: rgba(0, 240, 255, 0.08) !important;
+  border-color: rgba(0, 240, 255, 0.3) !important;
+  color: var(--accent-cyan, #00f0ff) !important;
+}
+
+.thought-pulse-dot {
+  width: 8px !important;
+  height: 8px !important;
+  border-radius: 50% !important;
+  background: var(--accent-cyan, #00f0ff) !important;
+  box-shadow: 0 0 8px var(--accent-cyan, #00f0ff) !important;
+  animation: pulse-dot 1.4s infinite !important;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.3; transform: scale(0.85); }
+}
+
+/* TABLET / IPAD RESPONSIVE GRID (768px to 1024px) */
+@media (min-width: 768px) and (max-width: 1024px) {
+  .vault-cards-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+    gap: 14px !important;
+  }
+  .options-modal-content, .vault-modal-content {
+    width: 90% !important;
+    max-width: 780px !important;
+  }
+  #chat-messages {
+    max-width: 760px !important;
+    margin: 0 auto !important;
+  }
+  .starter-chips-grid {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
+}
+
+/* MOBILE RESPONSIVE TWEAKS (<= 640px) */
+@media (max-width: 640px) {
+  header {
+    padding: 0 12px !important;
+    height: 52px !important;
+  }
+  .active-thread-title {
+    max-width: 110px !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
+  }
+  .scope-pill {
+    display: none !important;
+  }
+  .msg-user {
+    max-width: 92% !important;
+    padding: 10px 14px !important;
+    font-size: 14px !important;
+  }
+  .msg-libra {
+    font-size: 14px !important;
+  }
+  #prompt-input-container {
+    padding: 6px 10px !important;
+  }
+}

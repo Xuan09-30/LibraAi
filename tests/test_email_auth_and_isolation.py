@@ -1,4 +1,4 @@
-"""
+﻿"""
 =============================================================================
 TEST SUITE: SECURE EMAIL AUTHENTICATION, OTP VERIFICATION & CHAT ISOLATION
 Target: tests/test_email_auth_and_isolation.py
@@ -18,6 +18,7 @@ import os
 import sys
 import unittest
 import json
+import time
 from fastapi.testclient import TestClient
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -284,6 +285,684 @@ class TestEmailAuthAndIsolation(unittest.TestCase):
         self.assertEqual(res_del.status_code, 200)
         self.assertIsNone(self.memory.get_registered_user_by_email(invite_email))
 
+    def test_10_server_side_client_scope_and_403_on_local_desktop_spoof(self):
+        """
+        Tier 1 Security: Derive client_scope server-side from the auth token, never from the request body.
+        Sending 'client_scope': 'local_desktop' as a remote user must return HTTP 403.
+        """
+        # Authenticate as a remote tester user
+        res_tester = self.client.post(
+            "/api/auth/google-login",
+            json={"email": "spoof_tester@example.com", "display_name": "Spoof Tester"}
+        )
+        self.assertEqual(res_tester.status_code, 200)
+        tester_tok = res_tester.json()["token"]
+        tester_headers = {"Authorization": f"Bearer {tester_tok}"}
+
+        # 1. Remote user sends client_scope='local_desktop' to /api/chat -> must return 403
+        res_chat_spoof = self.client.post(
+            "/api/chat",
+            json={"prompt": "open notepad", "client_scope": "local_desktop", "synthesize_audio": False},
+            headers=tester_headers
+        )
+        self.assertEqual(res_chat_spoof.status_code, 403)
+
+        # 2. Remote user sends client_scope='local_desktop' to /api/chat?stream=true -> must return 403
+        res_stream_spoof = self.client.post(
+            "/api/chat?stream=true",
+            json={"prompt": "open notepad", "client_scope": "local_desktop", "stream": True, "synthesize_audio": False},
+            headers=tester_headers
+        )
+        self.assertEqual(res_stream_spoof.status_code, 403)
+
+        # 3. Remote user sends client_scope='local_desktop' to /api/sessions/new -> must return 403
+        res_sess_spoof = self.client.post(
+            "/api/sessions/new",
+            json={"title": "Spoof Session", "client_scope": "local_desktop"},
+            headers=tester_headers
+        )
+        self.assertEqual(res_sess_spoof.status_code, 403)
+
+    def test_11_tool_layer_sandbox_and_docker_code_execution_guard(self):
+        """
+        Tier 1 Security:
+        1. remote_web sessions never get OS-control or terminal tools registered.
+        2. Prompts that bypass regex (e.g. 'fire up Roblox', 'create a python file called pwned.py')
+           are blocked at the tool layer BEFORE any OS tool function is invoked.
+        3. SkillForge and PersistentDataREPL execute LLM-generated code only via Docker sandbox.
+        """
+        # 1. Verify OS/terminal tools are never registered for remote_web
+        remote_tools = self.hub.get_registered_tools("remote_web")
+        for forbidden in ("open_app", "close_app", "create_file", "create_folder", "gui_action", "computer_use_agent", "shutdown", "create_skill"):
+            self.assertNotIn(forbidden, remote_tools)
+
+        # 2. Spy on underlying OS tools and verify regex-bypassing prompts NEVER invoke them in remote_web
+        invoked_os_tools = []
+        orig_launch = self.hub.llm.dispatcher.launch_app
+        orig_create_file = self.hub.llm.file_mgr.create_file
+        self.hub.llm.dispatcher.launch_app = lambda *a, **kw: (invoked_os_tools.append(("launch_app", a, kw)) or (True, "Launched"))
+        self.hub.llm.file_mgr.create_file = lambda *a, **kw: (invoked_os_tools.append(("create_file", a, kw)) or (True, "Created", "pwned.py"))
+        try:
+            for bypass_prompt in (
+                "fire up Roblox",
+                "create a python file called pwned.py",
+            ):
+                res = self.hub.process_command(bypass_prompt, client_scope="remote_web", dry_run=False)
+                self.assertEqual(res.get("action"), "sandboxed_blocked", f"Bypass prompt '{bypass_prompt}' was not blocked at tool layer!")
+                self.assertEqual(len(invoked_os_tools), 0, f"Underlying OS tool was invoked before blocking for '{bypass_prompt}'!")
+        finally:
+            self.hub.llm.dispatcher.launch_app = orig_launch
+            self.hub.llm.file_mgr.create_file = orig_create_file
+
+        # 3. Verify PersistentDataREPL and SkillForge require Docker sandbox for untrusted generated code
+        repl = self.hub.data_scientist.repl
+        res_repl = repl.run_code("import os; print(os.getcwd())", require_docker_sandbox=True, _force_docker_unavailable=True)
+        self.assertEqual(res_repl.get("status"), "sandbox_error")
+        self.assertIn("Docker sandbox", res_repl.get("error", ""))
+
+        sf = self.hub.llm.skill_forge
+        res_sf = sf.execute_in_docker_sandbox("print('hello')", _force_docker_unavailable=True)
+        self.assertEqual(res_sf.get("status"), "sandbox_error")
+        self.assertIn("Docker sandbox", res_sf.get("error", ""))
+
+
+
+    def test_12_memory_isolation_tester_cannot_write_host_vault_or_lessons(self):
+        """
+        Tier 1 Security:
+        Isolate memory per user so a Tester cannot write to the Host's vault (assets/vault/)
+        or LESSONS.md, nor overwrite Host semantic facts.
+        """
+        tester = self.memory.get_or_create_registered_user("tester_mem@example.com")
+        tester_headers = {"Authorization": f"Bearer {tester['unique_token']}"}
+
+        # 1. Tester attempting to POST/PUT/DELETE on /api/vault is rejected with 403
+        r_post = self.client.post(
+            "/api/vault",
+            json={"entity": "host_pc", "relation": "owner", "value": "tester_spoof"},
+            headers=tester_headers
+        )
+        self.assertEqual(r_post.status_code, 403)
+
+        # 2. Direct memory calls with non-host role must not write to Host LESSONS.md or Host vault
+        lid = self.memory.record_correction(
+            "open browser",
+            "opened edge",
+            "open chrome",
+            user_email="tester_mem@example.com",
+            role="tester"
+        )
+        self.assertEqual(lid, -1, "Tester should not be permitted to write operational rules to Host LESSONS.md!")
+
+        fid = self.memory.upsert_semantic_fact(
+            "user",
+            "favorite_drink",
+            "matcha",
+            user_email="tester_mem@example.com",
+            role="tester"
+        )
+        # Host semantic facts for entity='user' must not be polluted by tester
+        host_facts = self.memory.get_semantic_facts(entity="user")
+        self.assertFalse(any(f.get("value") == "matcha" for f in host_facts))
+
+    def test_13_hashed_expiring_invite_tokens_and_rate_limiting(self):
+        """
+        Tier 1 Security:
+        1. Guest/invite tokens are stored hashed (SHA-256) in SQLite, never in plaintext,
+           and enforce expiration by default.
+        2. Rate limiting returns HTTP 429 when request burst exceeds limit.
+        """
+        # 1. Create guest token and inspect raw SQLite table to verify hashed storage & default expiry
+        created = self.memory.create_guest_token(label="TempEvaluator")
+        raw_tok = created["token"]
+        self.assertTrue(raw_tok.startswith("libra_guest_"))
+        self.assertIsNotNone(created.get("expires_at"), "Guest token must have an expiration timestamp by default!")
+
+        conn = self.memory._get_connection()
+        rows = conn.execute("SELECT token FROM guest_tokens WHERE label = 'TempEvaluator' ORDER BY rowid DESC").fetchall()
+        if self.memory.db_path != ":memory:":
+            conn.close()
+        self.assertGreaterEqual(len(rows), 1)
+        stored_tok = rows[0][0]
+        self.assertNotEqual(stored_tok, raw_tok, "Plaintext guest token must not be stored in SQLite!")
+        self.assertTrue(stored_tok.startswith("sha256:"))
+
+        # Validation still works with raw token
+        valid = self.memory.validate_guest_token(raw_tok)
+        self.assertIsNotNone(valid)
+        self.assertEqual(valid["label"], "TempEvaluator")
+
+        # Expired token is rejected
+        expired = self.memory.create_guest_token(label="ExpiredEval", expires_in_days=-1)
+        self.assertIsNone(self.memory.validate_guest_token(expired["token"]))
+
+        # 2. Rate limiting check on /api/chat
+        tester = self.memory.get_or_create_registered_user("ratelimit_user@example.com")
+        headers = {"Authorization": f"Bearer {tester['unique_token']}"}
+        self.app.state.rate_limit_max_requests = 3
+        try:
+            statuses = []
+            for i in range(5):
+                r = self.client.post("/api/chat", json={"prompt": "what time is it"}, headers=headers)
+                statuses.append(r.status_code)
+            self.assertIn(429, statuses, f"Expected HTTP 429 rate limit in statuses, got {statuses}")
+        finally:
+            self.app.state.rate_limit_max_requests = 60
+
+
+    def test_14_round2_item_a_remote_scope_restrictions(self):
+        """
+        Round 2 Item A: Remote scope audit and restrictions:
+        A.2: remote_host must NOT get OS-control or terminal tools (open_app, close_app, create_file,
+             create_folder, gui_action, computer_use_agent, shutdown, create_skill) over the tunnel.
+             Make them local_desktop-only. Test: a remote_host session cannot call any of them.
+        A.3: remote_web: confirm forget_memory, recall_memory, remember_fact only touch that user's
+             namespace (user:<email>:*), never the host's facts.
+        A.4: document_rag in remote scopes: restrict to files uploaded by that user. Reject arbitrary
+             paths and path traversal (..). Test both.
+        A.5: daily_briefing and hardware vitals must not be returned to remote_web (Tester/Guest).
+             Remove from their registered tools or redact host details.
+        """
+        local_tools = self.hub.get_registered_tools("local_desktop")
+        remote_host_tools = self.hub.get_registered_tools("remote_host")
+        remote_web_tools = self.hub.get_registered_tools("remote_web")
+
+        # A.2: OS-control and terminal tools must be local_desktop-only (not in remote_host or remote_web)
+        forbidden_os_tools = (
+            "open_app", "close_app", "create_file", "create_folder",
+            "gui_action", "computer_use_agent", "shutdown", "create_skill"
+        )
+        for tool_name in forbidden_os_tools:
+            self.assertIn(tool_name, local_tools)
+            self.assertNotIn(tool_name, remote_host_tools, f"OS tool '{tool_name}' must NOT be registered for remote_host!")
+            self.assertNotIn(tool_name, remote_web_tools, f"OS tool '{tool_name}' must NOT be registered for remote_web!")
+
+        # Test that a remote_host session cannot call any of them
+        os_test_prompts = [
+            "open calculator",
+            "close chrome",
+            "create file test_remote_host.txt",
+            "create folder test_remote_host_dir",
+            "click the start button",
+            "open chrome and go to youtube.com and search for cats",
+            "shutdown my computer",
+            "create a skill to check disk usage",
+        ]
+        for p in os_test_prompts:
+            res = self.hub.process_command(p, client_scope="remote_host", dry_run=False)
+            self.assertEqual(res.get("action"), "sandboxed_blocked", f"Prompt '{p}' was not blocked in remote_host: {res}")
+
+        # Also test /api/chat as remote host over tunnel (with x-forwarded-for proxy header)
+        host_user = self.memory.get_or_create_registered_user("REDACTED", default_role="host")
+        host_headers = {
+            "Authorization": f"Bearer {host_user['unique_token']}",
+            "X-Forwarded-For": "203.0.113.42"
+        }
+        res_chat_host = self.client.post(
+            "/api/chat",
+            json={"prompt": "open notepad", "synthesize_audio": False},
+            headers=host_headers
+        )
+        self.assertEqual(res_chat_host.status_code, 200)
+        self.assertIn(res_chat_host.json().get("action"), ("sandboxed_blocked", "remote_sandbox_blocked"))
+
+        # A.3: remote_web forget_memory, recall_memory, remember_fact only touch user:<email>:* namespace
+        for mem_tool in ("forget_memory", "recall_memory", "remember_fact"):
+            self.assertIn(mem_tool, remote_web_tools, f"'{mem_tool}' must be registered for remote_web!")
+
+        # Seed a host fact
+        self.memory.remember_fact("My secret host project codename is Project Apollo", user_email="REDACTED", role="host")
+
+        # Authenticate as remote_web tester
+        tester_email = "alice_tester@example.com"
+        self.hub.llm.active_user_email = tester_email
+        self.hub.llm.active_user_role = "tester"
+
+        # 1. Tester remembers a fact -> stored under user:alice_tester@example.com:*
+        res_rem = self.hub.process_command("Remember that my favorite color is turquoise", client_scope="remote_web", dry_run=False)
+        self.assertEqual(res_rem.get("action"), "remember_fact")
+
+        # Verify category in DB has user:<email>: prefix
+        conn = self.memory._get_connection()
+        rows_alice = conn.execute(
+            "SELECT category, content FROM facts WHERE LOWER(user_email) = ?",
+            (tester_email,)
+        ).fetchall()
+        if self.memory.db_path != ":memory:":
+            conn.close()
+        self.assertTrue(any(r[0].startswith(f"user:{tester_email}:") and "turquoise" in r[1] for r in rows_alice))
+
+        # 2. Tester tries to recall host's secret codename -> must NOT return host fact
+        recalled_by_alice = self.memory.recall_relevant("Project Apollo", user_email=tester_email)
+        self.assertEqual(len(recalled_by_alice), 0, "Tester must not recall host facts!")
+
+        # 3. Tester tries to forget host's secret codename -> must NOT delete host fact
+        res_forget_host = self.hub.process_command("Forget about Project Apollo", client_scope="remote_web", dry_run=False)
+        self.assertEqual(res_forget_host.get("action"), "forget_memory")
+        host_recalled = self.memory.recall_relevant("Project Apollo", user_email="REDACTED")
+        self.assertGreaterEqual(len(host_recalled), 1, "Host fact was deleted by remote_web tester!")
+
+        # 4. Tester forgets their own fact -> succeeds
+        res_forget_own = self.hub.process_command("Forget about turquoise", client_scope="remote_web", dry_run=False)
+        self.assertEqual(res_forget_own.get("action"), "forget_memory")
+        self.assertEqual(len(self.memory.recall_relevant("turquoise", user_email=tester_email)), 0)
+
+        # A.4: document_rag in remote scopes restricted to files uploaded by that user; reject arbitrary paths and ..
+        # 1. Arbitrary path in remote_web -> rejected
+        rag_arb = self.hub.llm.document_rag.query_document(
+            "README.md",
+            "Summarize this file",
+            dry_run=True,
+            client_scope="remote_web",
+            user_email=tester_email
+        )
+        self.assertEqual(rag_arb.get("status"), "forbidden", f"Expected arbitrary path to be forbidden in remote_web, got {rag_arb}")
+
+        # 2. Path traversal (..) in remote_web and remote_host -> rejected
+        for trav_path in ("../config.json", "..\\config.local.json", "assets/uploads/../../README.md"):
+            rag_trav = self.hub.llm.document_rag.query_document(
+                trav_path,
+                "What is inside?",
+                dry_run=True,
+                client_scope="remote_host",
+                user_email="REDACTED"
+            )
+            self.assertEqual(rag_trav.get("status"), "forbidden", f"Expected path traversal '{trav_path}' to be forbidden, got {rag_trav}")
+
+        # 3. File uploaded by that user succeeds in remote_web, but another user cannot read it
+        tester_user = self.memory.get_or_create_registered_user(tester_email, default_role="tester")
+        tester_headers = {"Authorization": f"Bearer {tester_user['unique_token']}"}
+        up_res = self.client.post(
+            "/api/upload",
+            files={"file": ("alice_notes.txt", b"Alice private research notes about quantum computing.", "text/plain")},
+            headers=tester_headers
+        )
+        self.assertEqual(up_res.status_code, 200)
+        alice_file_path = up_res.json()["file_path"]
+
+        # Alice can query her own uploaded file in remote_web
+        rag_own = self.hub.llm.document_rag.query_document(
+            alice_file_path,
+            "What are the notes about?",
+            dry_run=True,
+            client_scope="remote_web",
+            user_email=tester_email
+        )
+        self.assertEqual(rag_own.get("status"), "success", f"Expected Alice's own upload to succeed, got {rag_own}")
+
+        # Bob (another remote_web user) cannot query Alice's uploaded file
+        rag_other = self.hub.llm.document_rag.query_document(
+            alice_file_path,
+            "What are the notes about?",
+            dry_run=True,
+            client_scope="remote_web",
+            user_email="bob_tester@example.com"
+        )
+        self.assertEqual(rag_other.get("status"), "forbidden", f"Expected Bob to be forbidden from reading Alice's upload, got {rag_other}")
+
+        # A.5: daily_briefing and hardware vitals (system_status) must not be returned to remote_web
+        self.assertNotIn("daily_briefing", remote_web_tools)
+        self.assertNotIn("system_status", remote_web_tools)
+
+        res_brief = self.hub.process_command("give me my daily briefing", client_scope="remote_web", dry_run=False)
+        self.assertEqual(res_brief.get("action"), "sandboxed_blocked")
+
+        res_vitals_cmd = self.hub.process_command("check system status and cpu usage", client_scope="remote_web", dry_run=False)
+        self.assertEqual(res_vitals_cmd.get("action"), "sandboxed_blocked")
+
+        # HTTP /api/vitals must not return host hardware details to remote_web (Tester/Guest)
+        res_vitals_http = self.client.get("/api/vitals", headers=tester_headers)
+        self.assertEqual(res_vitals_http.status_code, 403)
+
+
+
+    def test_15_round2_item_d_docker_sandbox_hardening(self):
+        """
+        Round 2 Item D: Docker sandbox hardening:
+        1. Add to the docker run flags: --cap-drop ALL, --security-opt no-new-privileges,
+           --pids-limit 128, run as a non-root user (--user 65534:65534 or --user nobody),
+           and --tmpfs /tmp so --read-only doesn't break scripts.
+        2. Confirm no host folder is mounted writable.
+        3. Done when: a test runs a normal analysis script successfully inside the hardened
+           container, and a test confirms the container cannot write outside /tmp or reach the network.
+        """
+        repl = self.hub.data_scientist.repl
+        sf = self.hub.llm.skill_forge
+
+        # 1. Inspect the exact docker run command flags for both PersistentDataREPL and SkillForge
+        repl_cmd = repl.build_docker_sandbox_command("print(1+1)")
+        sf_cmd = sf.build_docker_sandbox_command("print(1+1)")
+
+        for label, cmd in (("PersistentDataREPL", repl_cmd), ("SkillForge", sf_cmd)):
+            cmd_str = " ".join(cmd)
+            self.assertIn("--cap-drop", cmd, f"{label} missing --cap-drop")
+            self.assertEqual(cmd[cmd.index("--cap-drop") + 1], "ALL")
+            self.assertIn("--security-opt", cmd, f"{label} missing --security-opt")
+            self.assertEqual(cmd[cmd.index("--security-opt") + 1], "no-new-privileges")
+            self.assertIn("--pids-limit", cmd, f"{label} missing --pids-limit")
+            self.assertEqual(cmd[cmd.index("--pids-limit") + 1], "128")
+            self.assertIn("--user", cmd, f"{label} missing --user")
+            self.assertIn(cmd[cmd.index("--user") + 1], ("65534:65534", "nobody"))
+            self.assertIn("--tmpfs", cmd, f"{label} missing --tmpfs")
+            self.assertTrue(cmd[cmd.index("--tmpfs") + 1].startswith("/tmp"))
+            self.assertIn("--read-only", cmd)
+            self.assertIn("--network", cmd)
+            self.assertEqual(cmd[cmd.index("--network") + 1], "none")
+            # Confirm no host folder is mounted (-v or --volume or --mount)
+            self.assertNotIn("-v", cmd, f"{label} must not mount any host folder")
+            self.assertNotIn("--volume", cmd, f"{label} must not mount any host folder")
+            self.assertNotIn("--mount", cmd, f"{label} must not mount any host folder")
+
+        # 2. Run a normal analysis script inside the hardened container (uses /tmp for temporary files)
+        normal_analysis_code = (
+            "import tempfile, os, json\n"
+            "with open('/tmp/analysis_scratch.json', 'w') as f:\n"
+            "    json.dump({'values': [10, 20, 30, 40], 'mean': 25.0}, f)\n"
+            "with open('/tmp/analysis_scratch.json', 'r') as f:\n"
+            "    data = json.load(f)\n"
+            "print(f\"MEAN={data['mean']}\")\n"
+        )
+        res_ok = repl.run_in_docker_sandbox(normal_analysis_code, _simulate_if_no_daemon=True)
+        self.assertEqual(res_ok.get("status"), "success", f"Expected normal analysis script to succeed in hardened container: {res_ok}")
+        self.assertIn("MEAN=25.0", res_ok.get("stdout", ""))
+
+        # 3. Confirm the container CANNOT write outside /tmp (read-only rootfs & non-root user 65534:65534)
+        write_outside_tmp_code = (
+            "with open('/etc/pwned.txt', 'w') as f:\n"
+            "    f.write('escape')\n"
+        )
+        res_ro = repl.run_in_docker_sandbox(write_outside_tmp_code, _simulate_if_no_daemon=True)
+        self.assertEqual(res_ro.get("status"), "error", "Writing outside /tmp must fail inside read-only container!")
+        self.assertTrue(
+            any(k in (res_ro.get("error") or "").lower() for k in ("read-only", "permission", "read only", "oserror", "permissionerror")),
+            f"Expected read-only or permission error, got: {res_ro}"
+        )
+
+        # 4. Confirm the container CANNOT reach the network (--network none)
+        network_attempt_code = (
+            "import socket\n"
+            "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            "s.settimeout(1.0)\n"
+            "s.connect(('8.8.8.8', 53))\n"
+        )
+        res_net = repl.run_in_docker_sandbox(network_attempt_code, _simulate_if_no_daemon=True)
+        self.assertEqual(res_net.get("status"), "error", "Outbound network access must fail inside --network none container!")
+        self.assertTrue(
+            any(k in (res_net.get("error") or "").lower() for k in ("network", "unreachable", "blocked", "oserror", "permission")),
+            f"Expected network error, got: {res_net}"
+        )
+
+
+    def test_16_round2_item_e_hmac_and_trusted_proxy_rate_limit(self):
+        """
+        Round 2 Item E: Auth and rate limiting:
+        1. Compare tokens with hmac.compare_digest.
+        2. Behind the ngrok/Cloudflare tunnel, rate limiting must use the real client IP
+           (from the proxy header) but ONLY trust that header when the request comes from
+           the tunnel/proxy, so clients can't spoof it.
+        """
+        import inspect
+        import web.server as srv_mod
+        import core.memory as mem_mod
+
+        # 1. Verify hmac.compare_digest is used in web/server.py and core/memory.py for token comparisons
+        srv_src = inspect.getsource(srv_mod.create_app)
+        self.assertIn("hmac.compare_digest", srv_src, "web/server.py must use hmac.compare_digest for token comparison!")
+        mem_src = inspect.getsource(mem_mod.MemoryCore.validate_user_token) + inspect.getsource(mem_mod.MemoryCore.validate_guest_token)
+        self.assertIn("hmac.compare_digest", mem_src, "core/memory.py must use hmac.compare_digest for token comparison!")
+
+        # 2. Verify trusted-proxy rate limiting:
+        # (a) When request arrives from trusted local tunnel/proxy (testclient / 127.0.0.1),
+        #     X-Forwarded-For / Cf-Connecting-IP is trusted: two different tunnel client IPs
+        #     get independent rate-limit buckets.
+        resolve_ip = getattr(self.app.state, "resolve_client_ip", None)
+        self.assertTrue(callable(resolve_ip), "app.state.resolve_client_ip helper must be exposed for proxy IP resolution!")
+
+        class DummyClient:
+            def __init__(self, host):
+                self.host = host
+        class DummyReq:
+            def __init__(self, socket_host, headers):
+                self.client = DummyClient(socket_host)
+                self.headers = headers
+
+        # Trusted proxy socket (127.0.0.1) -> uses tunnel-specific header for active tunnel
+        self.app.state.active_tunnel = "ngrok"
+        req_tunnel_a = DummyReq("127.0.0.1", {"x-forwarded-for": "198.51.100.10, 127.0.0.1"})
+        self.assertEqual(resolve_ip(req_tunnel_a), "198.51.100.10")
+
+        self.app.state.active_tunnel = "cloudflare"
+        req_tunnel_b = DummyReq("127.0.0.1", {"cf-connecting-ip": "198.51.100.20"})
+        self.assertEqual(resolve_ip(req_tunnel_b), "198.51.100.20")
+        self.app.state.active_tunnel = "none"
+
+        # Untrusted direct remote socket (e.g. 203.0.113.99) spoofing X-Forwarded-For / Cf-Connecting-IP
+        # -> MUST ignore spoofed proxy header and return the real socket IP 203.0.113.99!
+        req_spoof_1 = DummyReq("203.0.113.99", {"x-forwarded-for": "10.0.0.1"})
+        req_spoof_2 = DummyReq("203.0.113.99", {"cf-connecting-ip": "10.0.0.2"})
+        self.assertEqual(resolve_ip(req_spoof_1), "203.0.113.99")
+        self.assertEqual(resolve_ip(req_spoof_2), "203.0.113.99")
+
+        # End-to-end rate limit check with spoofed X-Forwarded-For from an untrusted peer IP:
+        # Rotating X-Forwarded-For on every request must NOT bypass the rate limit when peer is untrusted.
+        self.app.state.rate_limit_max_requests = 3
+        self.app.state.rate_limit_buckets.clear()
+        self.app.state.trusted_proxy_ips = {"127.0.0.1", "::1"}  # exclude 'testclient' to simulate direct untrusted peer
+        try:
+            tester = self.memory.get_or_create_registered_user("spoof_test@example.com")
+            statuses = []
+            for i in range(5):
+                headers = {
+                    "Authorization": f"Bearer {tester['unique_token']}",
+                    "X-Forwarded-For": f"192.0.2.{i + 1}",
+                }
+                r = self.client.post("/api/chat", json={"prompt": "what time is it"}, headers=headers)
+                statuses.append(r.status_code)
+            self.assertIn(429, statuses, f"Spoofed X-Forwarded-For from untrusted peer bypassed rate limit! Got {statuses}")
+        finally:
+            self.app.state.rate_limit_max_requests = 60
+            self.app.state.trusted_proxy_ips = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+    def test_17_round3_item_1_identity_headers_and_jwt(self):
+        """
+        Round 3 Item 1:
+        authenticate_request must NOT trust Cf-Access-Authenticated-User-Email,
+        Tailscale-User-Login, or X-User-Email unless the matching proxy is explicitly enabled in config.
+        For Cloudflare Access, verify the Cf-Access-Jwt-Assertion JWT.
+        Test: a forged identity header with no token returns 401 on ngrok/quick-tunnel setups.
+        """
+        import jwt
+
+        # Clear any session cookies from previous test runs on the shared client
+        self.client.cookies.clear()
+
+        # Scenario 1: Default configuration (ngrok / quick-tunnel, no Cloudflare Access or Tailscale configured)
+        # Forged Cloudflare header without token must return 401 Unauthorized
+        res_cf_forged = self.client.get("/api/vitals", headers={"Cf-Access-Authenticated-User-Email": self.admin_email})
+        self.assertEqual(res_cf_forged.status_code, 401, "Forged Cf-Access-Authenticated-User-Email without proxy enabled must return 401!")
+
+        # Forged Tailscale header without token must return 401 Unauthorized
+        res_ts_forged = self.client.get("/api/vitals", headers={"Tailscale-User-Login": self.admin_email})
+        self.assertEqual(res_ts_forged.status_code, 401, "Forged Tailscale-User-Login without proxy enabled must return 401!")
+
+        # Forged X-User-Email header without token must return 401 Unauthorized
+        res_x_forged = self.client.get("/api/vitals", headers={"X-User-Email": self.admin_email})
+        self.assertEqual(res_x_forged.status_code, 401, "Forged X-User-Email without allow_custom_user_email_header must return 401!")
+
+        # Scenario 2: Cloudflare Access is explicitly enabled in app config
+        cf_app = create_app(hub=self.hub, config_path="config.json")
+        cf_secret = "test-cf-secret-key-32-bytes-long!!"
+        cf_app.state.cloudflare_access_enabled = True
+        cf_app.state.cloudflare_access_audience = "test-cf-aud"
+        cf_app.state.cloudflare_access_secret = cf_secret
+        cf_client = TestClient(cf_app)
+
+        # 2a: Enabled but missing Cf-Access-Jwt-Assertion header -> 401
+        res_missing_jwt = cf_client.get(
+            "/api/vitals",
+            headers={"Cf-Access-Authenticated-User-Email": self.admin_email}
+        )
+        self.assertEqual(res_missing_jwt.status_code, 401, "Missing Cf-Access-Jwt-Assertion when proxy is enabled must return 401!")
+
+        # 2b: Enabled but invalid / forged JWT assertion -> 401
+        res_invalid_jwt = cf_client.get(
+            "/api/vitals",
+            headers={
+                "Cf-Access-Authenticated-User-Email": self.admin_email,
+                "Cf-Access-Jwt-Assertion": "invalid.jwt.token"
+            }
+        )
+        self.assertEqual(res_invalid_jwt.status_code, 401, "Invalid Cf-Access-Jwt-Assertion must return 401!")
+
+        # 2c: Round 4 Item 3 - HS256 and alg=none tokens must be rejected with 401
+        hs_jwt = jwt.encode(
+            {"email": self.admin_email, "aud": "test-cf-aud", "exp": time.time() + 300},
+            "some-symmetric-secret",
+            algorithm="HS256"
+        )
+        res_hs = cf_client.get(
+            "/api/vitals",
+            headers={
+                "Cf-Access-Authenticated-User-Email": self.admin_email,
+                "Cf-Access-Jwt-Assertion": hs_jwt
+            }
+        )
+        self.assertEqual(res_hs.status_code, 401, "HS256 token must be strictly rejected with 401!")
+
+        none_jwt = jwt.encode(
+            {"email": self.admin_email, "aud": "test-cf-aud", "exp": time.time() + 300},
+            key="",
+            algorithm="none"
+        )
+        res_none = cf_client.get(
+            "/api/vitals",
+            headers={
+                "Cf-Access-Authenticated-User-Email": self.admin_email,
+                "Cf-Access-Jwt-Assertion": none_jwt
+            }
+        )
+        self.assertEqual(res_none.status_code, 401, "alg=none token must be strictly rejected with 401!")
+
+        # 2d: Valid RS256 token signed by RSA private key verified via JWKS -> 200
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+        priv_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        priv_pem = priv_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        pub_pem = priv_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+
+        class MockJWKS:
+            def get_signing_key_from_jwt(self, token):
+                class Key:
+                    def __init__(self, k): self.key = k
+                return Key(pub_pem)
+
+        cf_app.state.cloudflare_access_jwks_client = MockJWKS()
+        cf_app.state.cloudflare_access_team_domain = "test"
+        valid_payload = {
+            "email": self.admin_email,
+            "aud": "test-cf-aud",
+            "iss": "https://test.cloudflareaccess.com",
+            "exp": time.time() + 300
+        }
+        valid_jwt = jwt.encode(valid_payload, priv_pem, algorithm="RS256")
+        res_valid_jwt = cf_client.get(
+            "/api/vitals",
+            headers={
+                "Cf-Access-Authenticated-User-Email": self.admin_email,
+                "Cf-Access-Jwt-Assertion": valid_jwt
+            }
+        )
+        self.assertEqual(res_valid_jwt.status_code, 200, "Valid signed RS256 Cf-Access-Jwt-Assertion must authenticate successfully!")
+
+
+    def test_18_round3_item_2_tunnel_specific_client_ip(self):
+        """
+        Round 3 Item 2:
+        _resolve_client_ip: only trust the header belonging to the active tunnel
+        (ngrok: X-Forwarded-For, last hop from the proxy; Cloudflare: Cf-Connecting-IP).
+        Test a spoofed header for the other tunnel.
+        """
+        resolve_ip = getattr(self.app.state, "resolve_client_ip", None)
+        self.assertTrue(callable(resolve_ip))
+
+        class DummyClient:
+            def __init__(self, host):
+                self.host = host
+
+        class DummyReq:
+            def __init__(self, socket_host, headers):
+                self.client = DummyClient(socket_host)
+                self.headers = headers
+
+        # Case A: Active tunnel is "ngrok"
+        self.app.state.active_tunnel = "ngrok"
+
+        # A1: Request has both ngrok X-Forwarded-For and spoofed Cf-Connecting-IP
+        req_ngrok_with_spoofed_cf = DummyReq(
+            "127.0.0.1",
+            {
+                "x-forwarded-for": "1.2.3.4, 203.0.113.10",
+                "cf-connecting-ip": "198.51.100.99"
+            }
+        )
+        # Must resolve to the last hop of X-Forwarded-For (203.0.113.10), ignoring cf-connecting-ip!
+        self.assertEqual(
+            resolve_ip(req_ngrok_with_spoofed_cf),
+            "203.0.113.10",
+            "Under ngrok tunnel, resolve_ip must use X-Forwarded-For last hop and ignore spoofed Cf-Connecting-IP!"
+        )
+
+        # A2: Request on ngrok tunnel with only spoofed Cf-Connecting-IP (no XFF) -> must return socket peer IP
+        req_ngrok_only_spoofed_cf = DummyReq(
+            "127.0.0.1",
+            {"cf-connecting-ip": "198.51.100.99"}
+        )
+        self.assertEqual(
+            resolve_ip(req_ngrok_only_spoofed_cf),
+            "127.0.0.1",
+            "Under ngrok tunnel, spoofed Cf-Connecting-IP without XFF must be ignored and fallback to socket peer IP!"
+        )
+
+        # Case B: Active tunnel is "cloudflare"
+        self.app.state.active_tunnel = "cloudflare"
+
+        # B1: Request has valid Cf-Connecting-IP and spoofed X-Forwarded-For
+        req_cf_with_spoofed_xff = DummyReq(
+            "127.0.0.1",
+            {
+                "cf-connecting-ip": "198.51.100.25",
+                "x-forwarded-for": "10.0.0.99, 10.0.0.1"
+            }
+        )
+        self.assertEqual(
+            resolve_ip(req_cf_with_spoofed_xff),
+            "198.51.100.25",
+            "Under cloudflare tunnel, resolve_ip must use Cf-Connecting-IP and ignore spoofed X-Forwarded-For!"
+        )
+
+        # B2: Request on Cloudflare tunnel with only spoofed XFF (no Cf-Connecting-IP) -> must return socket peer IP
+        req_cf_only_spoofed_xff = DummyReq(
+            "127.0.0.1",
+            {"x-forwarded-for": "10.0.0.99"}
+        )
+        self.assertEqual(
+            resolve_ip(req_cf_only_spoofed_xff),
+            "127.0.0.1",
+            "Under cloudflare tunnel, spoofed X-Forwarded-For without Cf-Connecting-IP must be ignored and fallback to socket peer IP!"
+        )
+
+        # Restore default active_tunnel
+        self.app.state.active_tunnel = "none"
 
 if __name__ == "__main__":
     unittest.main()
+
+

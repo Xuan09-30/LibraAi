@@ -144,6 +144,9 @@ def run_benchmark(force_mic: bool = False, force_simulate: bool = False, mic_tim
 
 
 
+import pytest
+
+@pytest.mark.slow
 def test_suite():
     run_benchmark(force_simulate=True)
 

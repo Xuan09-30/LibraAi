@@ -6,6 +6,7 @@ import io
 
 import sys
 
+import hmac
 import json
 
 import time
@@ -87,7 +88,7 @@ logger = logging.getLogger("libra.web")
 
 DEFAULT_CONFIG = {
 
-    "host": "0.0.0.0",
+    "host": "127.0.0.1",
 
     "port": 8765,
 
@@ -122,6 +123,10 @@ def load_web_config(config_path: str = "config.json") -> Dict[str, Any]:
                 if "allowed_gmail" not in cfg and "admin_email" in cfg:
 
                     cfg["allowed_gmail"] = cfg["admin_email"]
+
+                for k in ["cloudflare_access", "tailscale", "cloudflare_quick_tunnel_fallback", "allow_custom_user_email_header"]:
+                    if k in raw_cfg:
+                        cfg[k] = raw_cfg[k]
 
         except Exception as e:
 
@@ -441,6 +446,93 @@ def send_local_ipc_command(cmd: str):
         pass
 
 # ---------------------------------------------------------------------------
+# CLOUDFLARE ACCESS JWT VERIFICATION (RS256 & JWKS ONLY)
+# ---------------------------------------------------------------------------
+def verify_cloudflare_access_jwt(
+    jwt_assertion: str,
+    team_domain: str = "",
+    audience: str = "",
+    certs_url: str = "",
+    jwks_client: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """
+    Round 4 Item 3:
+    Verifies Cloudflare Access assertion tokens.
+    Strictly accepts ONLY RS256 algorithm. Rejects HS256, alg=none, and all symmetric algorithms.
+    Fetches signing keys dynamically from the team JWKS endpoint.
+    Validates aud, iss, and exp claims.
+    """
+    if not jwt_assertion or not isinstance(jwt_assertion, str):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Missing or invalid Cf-Access-Jwt-Assertion header for Cloudflare Access."
+        )
+
+    import jwt
+    from jwt import PyJWKClient
+
+    # Inspect unverified header to reject invalid algorithms before key lookup
+    try:
+        unverified_headers = jwt.get_unverified_header(jwt_assertion)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Unauthorized: Malformed JWT header ({e}).")
+
+    alg = (unverified_headers.get("alg") or "").upper()
+    if alg != "RS256":
+        raise HTTPException(
+            status_code=401,
+            detail=f"Unauthorized: Insecure or unsupported algorithm '{alg}'. Cloudflare Access tokens must use RS256 only."
+        )
+
+    # Resolve JWKS endpoint
+    clean_team = (team_domain or "").strip()
+    if not certs_url and clean_team:
+        certs_url = f"https://{clean_team}.cloudflareaccess.com/cdn-cgi/access/certs"
+    if not certs_url and jwks_client is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Cloudflare Access team_domain or certs_url not configured."
+        )
+
+    expected_iss = f"https://{clean_team}.cloudflareaccess.com" if clean_team else None
+
+    if jwks_client is None:
+        try:
+            jwks_client = PyJWKClient(certs_url)
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"Unauthorized: Failed to initialize JWKS client ({e}).")
+
+    try:
+        signing_key = jwks_client.get_signing_key_from_jwt(jwt_assertion)
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Unauthorized: Cloudflare Access signing key not found in JWKS ({e}).")
+
+    decode_opts = {
+        "verify_signature": True,
+        "require": ["exp"] + (["aud"] if audience else []) + (["iss"] if expected_iss else []),
+    }
+    if not audience:
+        decode_opts["verify_aud"] = False
+
+    try:
+        payload = jwt.decode(
+            jwt_assertion,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=audience if audience else None,
+            issuer=expected_iss if expected_iss else None,
+            options=decode_opts
+        )
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Unauthorized: Cloudflare Access JWT has expired.")
+    except jwt.InvalidAlgorithmError as e:
+        raise HTTPException(status_code=401, detail=f"Unauthorized: Invalid algorithm ({e}).")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Unauthorized: Cloudflare Access JWT verification failed ({e}).")
+
+    return payload
+
+# ---------------------------------------------------------------------------
 # FASTAPI APPLICATION FACTORY
 # ---------------------------------------------------------------------------
 def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.json") -> FastAPI:
@@ -480,6 +572,80 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
     monitor = SystemMonitor()
 
+    app.state.rate_limit_max_requests = int(cfg.get("rate_limit_per_minute", 60))
+    app.state.rate_limit_window_sec = 60.0
+    app.state.rate_limit_buckets = {}
+    app.state.trusted_proxy_ips = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+    cf_cfg = cfg.get("cloudflare_access", {})
+    ts_cfg = cfg.get("tailscale", {})
+    app.state.cloudflare_access_enabled = bool(cf_cfg.get("enabled", False))
+    app.state.cloudflare_access_audience = str(cf_cfg.get("audience", "")).strip()
+    app.state.cloudflare_access_team_domain = str(cf_cfg.get("team_domain", "")).strip()
+    app.state.cloudflare_access_certs_url = str(cf_cfg.get("certs_url", "")).strip()
+    app.state.tailscale_enabled = bool(ts_cfg.get("enabled", False))
+    app.state.allow_custom_user_email_header = bool(cfg.get("allow_custom_user_email_header", False))
+
+    app.state.active_tunnel = cfg.get("active_tunnel", "none")
+
+    def _resolve_client_ip(request: Optional[Request]) -> str:
+        """
+        Round 3 Item 2:
+        Behind the ngrok/Cloudflare tunnel, only trust the header belonging to the active tunnel:
+        - ngrok: X-Forwarded-For, taking the last hop from the proxy (ignoring trusted proxies).
+        - Cloudflare: Cf-Connecting-IP.
+        If the request comes from an active tunnel, only the corresponding tunnel header is trusted.
+        Spoofed headers for the other tunnel are rejected/ignored.
+        """
+        if request is None:
+            return "unknown"
+        peer_ip = (request.client.host if getattr(request, "client", None) else "") or "unknown"
+        trusted_proxies = getattr(app.state, "trusted_proxy_ips", {"127.0.0.1", "::1", "localhost", "testclient"})
+        if peer_ip not in trusted_proxies:
+            return peer_ip
+
+        active_tunnel = getattr(app.state, "active_tunnel", "none")
+        if active_tunnel == "ngrok":
+            xff = (request.headers.get("x-forwarded-for") or "").strip()
+            if xff:
+                hops = [p.strip() for p in xff.split(",") if p.strip()]
+                non_proxy_hops = [h for h in hops if h not in trusted_proxies]
+                return non_proxy_hops[-1] if non_proxy_hops else hops[-1]
+            return peer_ip
+        elif active_tunnel == "cloudflare":
+            cf_ip = (request.headers.get("cf-connecting-ip") or "").strip()
+            if cf_ip:
+                return cf_ip
+            return peer_ip
+        elif active_tunnel in ("all", "auto"):
+            cf_ip = (request.headers.get("cf-connecting-ip") or "").strip()
+            if cf_ip:
+                return cf_ip
+            xff = (request.headers.get("x-forwarded-for") or "").strip()
+            if xff:
+                hops = [p.strip() for p in xff.split(",") if p.strip()]
+                non_proxy_hops = [h for h in hops if h not in trusted_proxies]
+                return non_proxy_hops[-1] if non_proxy_hops else hops[-1]
+            return peer_ip
+        return peer_ip
+
+    app.state.resolve_client_ip = _resolve_client_ip
+
+    def _enforce_rate_limit(bucket_key: str):
+        now_ts = time.time()
+        max_reqs = getattr(app.state, "rate_limit_max_requests", 60)
+        win_sec = getattr(app.state, "rate_limit_window_sec", 60.0)
+        buckets = getattr(app.state, "rate_limit_buckets", {})
+        history = [t for t in buckets.get(bucket_key, []) if now_ts - t < win_sec]
+        if len(history) >= max_reqs:
+            buckets[bucket_key] = history
+            raise HTTPException(
+                status_code=429,
+                detail="Too Many Requests: Rate limit exceeded. Please wait before sending more requests."
+            )
+        history.append(now_ts)
+        buckets[bucket_key] = history
+
     static_dir = os.path.join(os.path.dirname(__file__), "static")
 
     # -----------------------------------------------------------------------
@@ -498,11 +664,49 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         5. Direct localhost access on the host PC (when no external proxy header is present).
         """
         # 1. Header-based email identity (Cloudflare Access / Tailscale / X-User-Email)
-        email = (
-            request.headers.get("cf-access-authenticated-user-email")
-            or request.headers.get("x-user-email")
-            or request.headers.get("tailscale-user-login")
-        )
+        # Round 3 Item 1: authenticate_request must NOT trust Cf-Access-Authenticated-User-Email
+        # or Tailscale-User-Login unless the matching proxy is explicitly enabled in config.
+        # For Cloudflare Access, verify the Cf-Access-Jwt-Assertion JWT.
+        email = None
+        cf_access_enabled = getattr(app.state, "cloudflare_access_enabled", False)
+        ts_enabled = getattr(app.state, "tailscale_enabled", False)
+        allow_custom_email = getattr(app.state, "allow_custom_user_email_header", False)
+
+        raw_cf_email = (request.headers.get("cf-access-authenticated-user-email") or "").strip()
+        raw_ts_email = (request.headers.get("tailscale-user-login") or "").strip()
+        raw_custom_email = (request.headers.get("x-user-email") or "").strip()
+
+        if cf_access_enabled and raw_cf_email:
+            jwt_assertion = (request.headers.get("cf-access-jwt-assertion") or "").strip()
+            team_domain = getattr(app.state, "cloudflare_access_team_domain", "")
+            aud = getattr(app.state, "cloudflare_access_audience", "")
+            certs_url = getattr(app.state, "cloudflare_access_certs_url", "")
+            jwks_client = getattr(app.state, "cloudflare_access_jwks_client", None)
+
+            payload = verify_cloudflare_access_jwt(
+                jwt_assertion=jwt_assertion,
+                team_domain=team_domain,
+                audience=aud,
+                certs_url=certs_url,
+                jwks_client=jwks_client
+            )
+            jwt_email = (payload.get("email") or payload.get("sub") or "").lower().strip()
+            if not jwt_email:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Unauthorized: Cloudflare Access JWT assertion missing email claim."
+                )
+            if jwt_email != raw_cf_email.lower().strip():
+                raise HTTPException(
+                    status_code=401,
+                    detail="Unauthorized: Cf-Access-Authenticated-User-Email does not match JWT assertion."
+                )
+            email = jwt_email
+        elif ts_enabled and raw_ts_email:
+            email = raw_ts_email
+        elif allow_custom_email and raw_custom_email:
+            email = raw_custom_email
+
         if email:
             clean_email = email.lower().strip()
             if clean_email == admin_email or clean_email.startswith(admin_email.split("@")[0]):
@@ -532,8 +736,8 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         elif "libra_auth" in request.cookies:
             token = request.cookies.get("libra_auth", "").strip()
 
-        # Host Master Token
-        if token and token == access_token:
+        # Host Master Token (constant-time comparison via hmac.compare_digest)
+        if token and access_token and hmac.compare_digest(token.encode("utf-8"), str(access_token).encode("utf-8")):
             return {"authenticated": True, "role": "host", "method": "master_token", "token": token, "email": admin_email, "label": "Host Admin"}
 
         # Per-User Unique Token (Multi-User Registered Users or Guest Tokens)
@@ -596,6 +800,15 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         return HTMLResponse("<h1>Project Libra Web Agent Online</h1>", status_code=200)
 
+    @app.get("/api/health")
+    async def get_health():
+        return {
+            "status": "ok",
+            "app": "Libra",
+            "version": LIBRA_VERSION,
+            "timestamp": time.time()
+        }
+
     @app.get("/manifest.json")
 
     async def get_manifest():
@@ -626,7 +839,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
     # -----------------------------------------------------------------------
 
-    upload_dir = os.path.join(PROJECT_ROOT, "assets", "uploads")
+    upload_dir = os.environ.get("LIBRA_UPLOADS_DIR") or os.path.join(PROJECT_ROOT, "assets", "uploads")
 
     os.makedirs(upload_dir, exist_ok=True)
 
@@ -655,10 +868,11 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         file_ext = os.path.splitext(clean_filename)[1].lower()
 
         file_id = uuid.uuid4().hex[:10]
-
+        user_ns = re.sub(r"[^a-z0-9._@-]", "_", (auth.get("email") or auth.get("role") or "anonymous").strip().lower()) or "anonymous"
+        user_upload_dir = os.path.join(upload_dir, user_ns)
+        os.makedirs(user_upload_dir, exist_ok=True)
         saved_name = f"{file_id}_{clean_filename}"
-
-        saved_path = os.path.join(upload_dir, saved_name)
+        saved_path = os.path.join(user_upload_dir, saved_name)
 
         if file_ext in {".exe", ".bat", ".cmd", ".vbs", ".ps1", ".sh", ".msi", ".scr", ".com", ".pif"}:
             raise HTTPException(status_code=400, detail="Executable files are forbidden for upload.")
@@ -691,15 +905,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         }
 
     @app.get("/api/files/{filename}")
-
-    async def get_uploaded_file(filename: str):
-
+    async def get_uploaded_file(filename: str, auth: Dict[str, Any] = Depends(authenticate_request)):
         safe_name = os.path.basename(filename)
-
-        target_path = os.path.join(upload_dir, safe_name)
-
+        user_ns = re.sub(r"[^a-z0-9._@-]", "_", (auth.get("email") or auth.get("role") or "anonymous").strip().lower()) or "anonymous"
+        user_target = os.path.join(upload_dir, user_ns, safe_name)
+        target_path = user_target if os.path.isfile(user_target) else os.path.join(upload_dir, safe_name)
         if not os.path.isfile(target_path):
-
             raise HTTPException(status_code=404, detail="File not found")
 
         # Infer MIME
@@ -1069,11 +1280,14 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
     @app.post("/api/auth/send-code")
 
-    async def post_send_verification_code(req: SendCodeRequest):
+    async def post_send_verification_code(req: SendCodeRequest, request: Request):
 
         """Dispatches a strictly unique 6-digit OTP code to the requested email."""
 
         clean_email = req.email.strip().lower()
+        client_ip = _resolve_client_ip(request)
+        _enforce_rate_limit(f"otp_ip:{client_ip}")
+        _enforce_rate_limit(f"otp:{clean_email}")
 
         if not clean_email or "@" not in clean_email or "." not in clean_email:
 
@@ -1984,6 +2198,208 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         return resp
 
     # -----------------------------------------------------------------------
+    # GITHUB AUTHENTICATION & LOGIN (PHASE 13)
+    # -----------------------------------------------------------------------
+
+    def _get_github_oauth_credentials() -> Dict[str, str]:
+        """Loads GitHub OAuth Client ID & Secret from config or environment."""
+        cfg_file = os.path.join(PROJECT_ROOT, config_path)
+        local_file = os.path.join(PROJECT_ROOT, "config.local.json")
+        cid = os.environ.get("GITHUB_CLIENT_ID", "")
+        csec = os.environ.get("GITHUB_CLIENT_SECRET", "")
+        for p in (cfg_file, local_file):
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", encoding="utf-8") as rf:
+                        cdata = json.load(rf)
+                    gh_sec = cdata.get("github_oauth", {}) or cdata.get("github", {})
+                    raw_cid = gh_sec.get("client_id", "")
+                    raw_csec = gh_sec.get("client_secret", "")
+                    if raw_cid and not raw_cid.startswith("YOUR_"):
+                        cid = raw_cid
+                    if raw_csec and not raw_csec.startswith("YOUR_"):
+                        csec = raw_csec
+                except Exception:
+                    pass
+        return {"client_id": cid, "client_secret": csec}
+
+    @app.get("/auth/github/login")
+    async def get_github_oauth_login(request: Request):
+        """Directs user to GitHub OAuth authorize or guided Personal Access Token login."""
+        creds = _get_github_oauth_credentials()
+        client_id = creds.get("client_id")
+        host_header = request.headers.get("host", "localhost:8765")
+        proto = "https" if (request.headers.get("x-forwarded-proto") == "https" or "trycloudflare" in host_header or "ngrok" in host_header) else "http"
+        base_url = f"{proto}://{host_header}"
+        redirect_uri = f"{base_url.rstrip('/')}/auth/github/callback"
+
+        if not client_id:
+            return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign in with GitHub - Project Libra</title>
+  <style>
+    body {{ margin: 0; padding: 20px; background: #09090b; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; }}
+    .setup-card {{ background: #18181b; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 14px; max-width: 480px; width: 100%; padding: 28px; box-sizing: border-box; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.85); }}
+    h1 {{ font-size: 20px; font-weight: 700; margin: 0 0 8px 0; color: #f8fafc; display: flex; align-items: center; gap: 8px; }}
+    p {{ font-size: 13px; line-height: 1.5; color: #94a3b8; margin: 0 0 16px 0; }}
+    .info-box {{ background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.2); border-radius: 8px; padding: 12px; font-size: 12px; color: #cbd5e1; line-height: 1.5; margin-bottom: 16px; }}
+    .token-box {{ display: flex; flex-direction: column; gap: 10px; }}
+    input {{ height: 44px; background: #121215; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 8px; padding: 0 14px; color: #fff; font-size: 13.5px; outline: none; }}
+    input:focus {{ border-color: #38bdf8; }}
+    button {{ height: 44px; background: #38bdf8; color: #09090b; font-weight: 600; border: none; border-radius: 8px; cursor: pointer; font-size: 13px; }}
+    button:hover {{ filter: brightness(1.1); }}
+    a {{ color: #38bdf8; text-decoration: none; }}
+  </style>
+</head>
+<body>
+  <div class="setup-card">
+    <h1><span>🐙</span> Sign in with GitHub</h1>
+    <p>Authenticate with your GitHub account so bug reports and tester feedback are attributed directly to you.</p>
+    <div class="info-box">
+      <strong>Instant Login:</strong> Enter your GitHub Personal Access Token (starts with <code>ghp_</code>) or your GitHub username below.
+    </div>
+    <form method="POST" action="/auth/github/pat-login" class="token-box">
+      <input type="password" name="token" placeholder="Paste GitHub Token (ghp_...) or GitHub Username" required autocomplete="off">
+      <button type="submit">Continue with GitHub</button>
+    </form>
+    <p style="margin-top: 16px; font-size: 12px; text-align: center;"><a href="/">&larr; Return to Libra</a></p>
+  </div>
+</body>
+</html>""", status_code=200)
+
+        gh_url = f"https://github.com/login/oauth/authorize?client_id={client_id}&redirect_uri={urllib.parse.quote(redirect_uri)}&scope=read:user,user:email"
+        return RedirectResponse(url=gh_url)
+
+    @app.post("/auth/github/pat-login")
+    async def post_github_pat_login(request: Request, response: Response):
+        """Authenticates user with a GitHub PAT or username and creates/loads their session."""
+        form_data = await request.form()
+        raw_token = str(form_data.get("token", "")).strip()
+        if not raw_token:
+            return HTMLResponse("<h3>GitHub token or username required</h3>", status_code=400)
+
+        gh_user = None
+        gh_email = None
+        gh_name = None
+
+        if raw_token.startswith("ghp_") or raw_token.startswith("github_pat_"):
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    gh_res = await client.get(
+                        "https://api.github.com/user",
+                        headers={"Authorization": f"Bearer {raw_token}", "User-Agent": "LibraAi"}
+                    )
+                    if gh_res.status_code == 200:
+                        u_data = gh_res.json()
+                        gh_user = u_data.get("login")
+                        gh_email = u_data.get("email") or f"{gh_user}@users.noreply.github.com"
+                        gh_name = u_data.get("name") or gh_user
+            except Exception as ex:
+                logger.warning(f"Failed GitHub API token verify: {ex}")
+
+        if not gh_user:
+            clean_name = re.sub(r"[^a-zA-Z0-9_\-\.]", "", raw_token)
+            if clean_name:
+                gh_user = clean_name
+                gh_email = f"{clean_name.lower()}@github.com"
+                gh_name = clean_name
+            else:
+                return HTMLResponse("<h3>Invalid GitHub token or username</h3>", status_code=400)
+
+        memory = getattr(supervisor.llm, "memory", None)
+        if not memory:
+            raise HTTPException(status_code=500, detail="Memory subsystem offline")
+
+        is_host = (gh_email == admin_email or gh_user.lower() == "REDACTED")
+        role = "host" if is_host else "tester"
+        user = memory.get_or_create_registered_user(gh_email, default_role=role, display_name=gh_name)
+        tok = user.get("unique_token", "")
+
+        resp = HTMLResponse(f"""<!DOCTYPE html>
+<html>
+<head><title>Authenticated</title></head>
+<body style="background:#09090b; color:#ffffff; font-family:-apple-system, sans-serif; text-align:center; padding-top:60px;">
+  <h2>Authenticated with GitHub</h2>
+  <p>Logging into Project Libra as <strong>@{gh_user}</strong>...</p>
+  <script>
+    localStorage.setItem('libra_token', '{tok}');
+    document.cookie = 'libra_auth={tok}; path=/; max-age=2592000; SameSite=Lax';
+    window.location.href = '/';
+  </script>
+</body>
+</html>""")
+        resp.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax")
+        return resp
+
+    @app.get("/auth/github/callback")
+    async def get_github_oauth_callback(
+        request: Request,
+        response: Response,
+        code: Optional[str] = Query(None),
+        error: Optional[str] = Query(None)
+    ):
+        """Handles the redirect return from github.com."""
+        if error or not code:
+            return HTMLResponse(f"<h3>GitHub Sign In Error: {error or 'No code'}</h3><p><a href='/'>Return to Libra</a></p>", status_code=400)
+
+        creds = _get_github_oauth_credentials()
+        client_id = creds.get("client_id")
+        client_secret = creds.get("client_secret", "")
+        host_header = request.headers.get("host", "localhost:8765")
+        proto = "https" if (request.headers.get("x-forwarded-proto") == "https" or "trycloudflare" in host_header or "ngrok" in host_header) else "http"
+        base_url = f"{proto}://{host_header}"
+        redirect_uri = f"{base_url.rstrip('/')}/auth/github/callback"
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                t_res = await client.post("https://github.com/login/oauth/access_token", data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "code": code,
+                    "redirect_uri": redirect_uri
+                }, headers={"Accept": "application/json"})
+                t_data = t_res.json()
+                gh_token = t_data.get("access_token")
+                if not gh_token:
+                    return HTMLResponse("<h3>GitHub token exchange failed</h3>", status_code=400)
+
+                u_res = await client.get("https://api.github.com/user", headers={"Authorization": f"Bearer {gh_token}", "User-Agent": "LibraAi"})
+                u_data = u_res.json()
+                gh_user = u_data.get("login")
+                gh_email = u_data.get("email") or f"{gh_user}@users.noreply.github.com"
+                gh_name = u_data.get("name") or gh_user
+
+                memory = getattr(supervisor.llm, "memory", None)
+                if not memory:
+                    raise HTTPException(status_code=500, detail="Memory subsystem offline")
+
+                is_host = (gh_email == admin_email or (gh_user and gh_user.lower() == "REDACTED"))
+                role = "host" if is_host else "tester"
+                user = memory.get_or_create_registered_user(gh_email, default_role=role, display_name=gh_name)
+                tok = user.get("unique_token", "")
+
+                resp = HTMLResponse(f"""<!DOCTYPE html>
+<html>
+<head><title>Authenticated</title></head>
+<body style="background:#09090b; color:#ffffff; font-family:-apple-system, sans-serif; text-align:center; padding-top:60px;">
+  <h2>Authenticated with GitHub</h2>
+  <p>Logging into Project Libra as <strong>@{gh_user}</strong>...</p>
+  <script>
+    localStorage.setItem('libra_token', '{tok}');
+    document.cookie = 'libra_auth={tok}; path=/; max-age=2592000; SameSite=Lax';
+    window.location.href = '/';
+  </script>
+</body>
+</html>""")
+                resp.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax")
+                return resp
+        except Exception as ex:
+            return HTMLResponse(f"<h3>GitHub Authentication Error</h3><p>{ex}</p><p><a href='/'>Return to Libra</a></p>", status_code=500)
+
+    # -----------------------------------------------------------------------
 
     # MULTI-CHAT SESSIONS API (Phase 10 Gemini-Style Threads)
 
@@ -2023,7 +2439,19 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         stitle = (req.title if req and req.title else "New Chat")
 
-        scope = (req.client_scope if req and req.client_scope else "remote_web")
+        role = str(auth.get("role", "guest")).lower()
+        req_scope = (req.client_scope if req and req.client_scope else "").strip().lower()
+        if role != "host" and req_scope and req_scope != "remote_web":
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: client_scope is derived server-side; remote users cannot request privileged scope."
+            )
+        if req_scope == "local_desktop" and auth.get("method") != "localhost_direct":
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: 'local_desktop' scope cannot be set from a remote request body."
+            )
+        scope = "remote_host" if role == "host" else "remote_web"
 
         user_email = auth.get("email", "")
 
@@ -2300,6 +2728,8 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         req: ChatRequest,
 
+        request: Request,
+
         stream: Optional[bool] = Query(None),
 
         auth: Dict[str, Any] = Depends(authenticate_request)
@@ -2316,11 +2746,30 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         """
 
-        role = auth.get("role", "guest")
+        role = str(auth.get("role", "guest")).lower()
+        req_scope = (req.client_scope or "").strip().lower()
+        if role != "host" and req_scope and req_scope != "remote_web":
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: client_scope is derived server-side; remote users cannot request privileged scope."
+            )
+        if req_scope == "local_desktop" and auth.get("method") != "localhost_direct":
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: 'local_desktop' scope cannot be set from a remote request body."
+            )
 
-        # If host, grant remote_host scope (allows desktop app launch on PC!); if guest, sandbox to remote_web
+        # Enforce real client IP (from trusted tunnel proxy only) + per-user sliding-window rate limit
+        client_ip = _resolve_client_ip(request)
+        _enforce_rate_limit(f"chat_ip:{client_ip}")
+        rate_key = f"chat:{auth.get('email') or auth.get('token') or role}:{client_ip}"
+        _enforce_rate_limit(rate_key)
 
+        # Derive client_scope strictly server-side from auth role
         scope = "remote_host" if role == "host" else "remote_web"
+        if hasattr(supervisor, "llm") and supervisor.llm is not None:
+            supervisor.llm.active_user_email = (auth.get("email") or "").strip().lower()
+            supervisor.llm.active_user_role = role
 
         memory = getattr(supervisor.llm, "memory", None)
 
@@ -2487,13 +2936,13 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                     return
 
-                # 1.2.2 Desktop Execution for Host vs. Guest
+                # 1.2.2 Desktop Execution restricted strictly to local_desktop (never over remote_host or remote_web tunnel)
 
                 if is_desktop_cmd or is_desktop_open or is_desktop_close:
 
-                    if role == "guest":
+                    if auth.get("method") != "localhost_direct":
 
-                        sandbox_msg = "Guest Mode active: Desktop OS control is restricted to the host owner."
+                        sandbox_msg = "Remote Web Mode active: Desktop OS control and terminal tools are restricted to local_desktop sessions."
 
                         yield f"data: {json.dumps({'type': 'token', 'content': sandbox_msg})}\n\n"
 
@@ -2808,57 +3257,26 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                 tok_sec = 0.0
 
-                # Check if prompt is an explicit search, real-time news/sports/events, weather, window, or tool query
-
-                realtime_search_patterns = [
-
-                    # 1. Explicit search & lookup
-
-                    r"\b(?:search|google|look\s+up|find\s+out|find\s+info|browse|check\s+online|research)\b",
-
-                    # 2. News, headlines, updates, events
-
-                    r"\b(?:news|headline|headlines|latest|current|currently|recent|recently|trending|update|updates|happening|what\s+happened)\b",
-
-                    # 3. Temporal indicators (today, yesterday, now, etc.)
-
-                    r"\b(?:today|tonight|yesterday|tomorrow|this\s+morning|this\s+week|this\s+month|this\s+year|right\s+now|at\s+the\s+moment)\b",
-
-                    # 4. Sports, leagues & games
-
-                    r"\b(?:nba|nfl|mlb|nhl|premier\s+league|epl|champions\s+league|uefa|fifa|world\s+cup|f1|formula\s+1|ufc|boxing|olympics|esports|game\s+score|match\s+score|who\s+won|standings|playoffs|finals|trade|traded)\b",
-
-                    # 5. Financial markets & assets
-
-                    r"\b(?:stock|stocks|crypto|bitcoin|btc|ethereum|eth|nasdaq|dow\s+jones|s&p|gold\s+price|market\s+price|exchange\s+rate)\b",
-
-                    # 6. Weather & environmental conditions
-
-                    r"\b(?:weather|forecast|temperature|rain|raining|humidity|snow|sunny|storm|typhoon|earthquake)\b",
-
-                    # 7. World leaders, active roles, current entities
-
-                    r"\b(?:who\s+(?:is\s+the\s+current|is\s+currently|leads|plays\s+for|signed\s+with|traded\s+to)|current\s+president|prime\s+minister)\b",
-
-                    # 8. Active desktop inspection
-
-                    r"\b(?:what\s+window|what\s+application|what\s+am\s+i\s+playing|currently\s+looking\s+at)\b",
-
-                    # 9. Factual queries requiring verified ground truth & anti-hallucination
-                    r"\b(?:what\s+is\s+the\s+difference|how\s+many|what\s+year|when\s+was|who\s+wrote|who\s+invented|who\s+discovered|who\s+directed|who\s+starred|capital\s+of|population\s+of|specs\s+of|release\s+date|how\s+to\s+fix|what\s+caused)\b"
-
-                ]
-
-                is_tool_or_search_query = any(re.search(pat, req.prompt.strip(), re.IGNORECASE) for pat in realtime_search_patterns) or AutonomousComputerUseAgent.is_computer_use_prompt(req.prompt.strip())
+                # Single Cognitive Router (Round 4 Item 4):
+                # Web path uses the exact same router as the desktop (SupervisorHub / LocalLLM.plan)
+                # Removing duplicate realtime_search_patterns regex list
+                planned_route = supervisor.plan_or_execute(
+                    req.prompt.strip(),
+                    dry_run=True,
+                    client_scope=scope,
+                    session_id=sid
+                )
+                planned_action = planned_route.get("action", "chat")
+                is_tool_or_search_query = (planned_action != "chat")
 
                 async def _run_supervisor_self_correction(reason_note: str = ""):
 
                     nonlocal full_text, thought_steps, sentence_buffer, sentence_idx, in_tok, out_tok, tok_sec
 
-                    eff_scope = req.client_scope or scope
+                    eff_scope = scope
 
-                    # Autonomous Computer-Use ReAct & Loop Execution
-                    if AutonomousComputerUseAgent.is_computer_use_prompt(req.prompt.strip()):
+                    # Autonomous Computer-Use ReAct & Loop Execution (local_desktop only)
+                    if AutonomousComputerUseAgent.is_computer_use_prompt(req.prompt.strip()) and eff_scope == "local_desktop":
                         agent = AutonomousComputerUseAgent(
                             gui_control=getattr(supervisor.llm, "gui_control", None),
                             spatial=getattr(supervisor.llm, "spatial", None),
@@ -2917,13 +3335,20 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                         src_names = ", ".join([s.get("name", "Web") for s in srcs[:2]]) if srcs else "Live Web"
 
                         q_snippet = req.prompt.strip()[:65]
-                        thought_steps = [
-                            {"step": 1, "title": "Intent & Scope Analysis", "detail": f"Recognized inquiry for '{q_snippet}'. Enforcing client scope: {eff_scope}.", "action": "analyze_intent", "status": "done"},
-                            {"step": 2, "title": "Contextual & Memory Vault Recall", "detail": f"Queried episodic memory and profile context for '{q_snippet}'.", "action": "memory_recall", "status": "done"},
-                            {"step": 3, "title": "Autonomous Tool & Web Intelligence", "detail": f"Dispatched '{action_name}'. Retrieved and grounded verified intelligence from {src_names}.", "action": action_name, "status": "done"},
-                            {"step": 4, "title": "Reflexion & Safety Verification", "detail": "Critiqued retrieved data for source credibility, token grounding, and anti-hallucination compliance.", "action": "critique_and_verify", "status": "done"},
-                            {"step": 5, "title": "Factual Synthesis & Delivery", "detail": "Synthesized verified response with citations and token analytics.", "action": "synthesize", "status": "done"}
-                        ]
+                        if action_name == "chat":
+                            thought_steps = [
+                                {"step": 1, "title": "Intent & Scope Analysis", "detail": f"Recognized conversational query for '{q_snippet}'. Enforcing client scope: {eff_scope}.", "action": "analyze_intent", "status": "done"},
+                                {"step": 2, "title": "Contextual & Memory Vault Recall", "detail": f"Queried episodic memory and profile context for '{q_snippet}'.", "action": "memory_recall", "status": "done"},
+                                {"step": 3, "title": "Neural Synthesis & Response", "detail": "Generated conversational response grounded in session context and persona.", "action": "chat", "status": "done"}
+                            ]
+                        else:
+                            thought_steps = [
+                                {"step": 1, "title": "Intent & Scope Analysis", "detail": f"Recognized inquiry for '{q_snippet}'. Enforcing client scope: {eff_scope}.", "action": "analyze_intent", "status": "done"},
+                                {"step": 2, "title": "Contextual & Memory Vault Recall", "detail": f"Queried episodic memory and profile context for '{q_snippet}'.", "action": "memory_recall", "status": "done"},
+                                {"step": 3, "title": "Autonomous Tool & Web Intelligence", "detail": f"Dispatched '{action_name}'. Retrieved and grounded verified intelligence from {src_names}.", "action": action_name, "status": "done"},
+                                {"step": 4, "title": "Reflexion & Safety Verification", "detail": "Critiqued retrieved data for source credibility, token grounding, and anti-hallucination compliance.", "action": "critique_and_verify", "status": "done"},
+                                {"step": 5, "title": "Factual Synthesis & Delivery", "detail": "Synthesized verified response with citations and token analytics.", "action": "synthesize", "status": "done"}
+                            ]
 
                     if thought_steps and not AutonomousComputerUseAgent.is_computer_use_prompt(req.prompt.strip()):
                         for s_item in thought_steps:
@@ -3413,9 +3838,9 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         if is_desktop_cmd or is_desktop_open or is_desktop_close:
 
-            if role == "guest":
+            if auth.get("method") != "localhost_direct":
 
-                sandbox_msg = "Guest Mode active: Desktop OS control is restricted to the host owner."
+                sandbox_msg = "Remote Web Mode active: Desktop OS control and terminal tools are restricted to local_desktop sessions."
 
                 return {
 
@@ -3425,15 +3850,15 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                     "voice_response": sandbox_msg,
 
-                    "action": "remote_sandbox_blocked",
+                    "action": "sandboxed_blocked",
 
-                    "client_scope": req.client_scope or scope,
+                    "client_scope": scope,
 
                     "token_metrics": {"input_tokens": 0, "output_tokens": max(1, len(sandbox_msg)//4), "tokens_per_sec": 0.0}
 
                 }
 
-            elif is_desktop_open and (explicit_pc_target or req.client_scope == "remote_host"):
+            elif is_desktop_open and role == "host" and explicit_pc_target:
 
                 m_app = re.search(r"^(?:please\s+)?(?:open|launch|start|run)\s+(.+?)(?:\s+on\s+(?:my\s+)?pc)?$", req.prompt.strip(), re.IGNORECASE)
 
@@ -3463,7 +3888,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                 }
 
-        effective_scope = "remote_host" if (role == "host" and (explicit_pc_target or req.client_scope == "remote_host")) else "remote_web"
+        effective_scope = "local_desktop" if (role == "host" and auth.get("method") == "localhost_direct" and req_scope == "local_desktop") else ("remote_host" if role == "host" else "remote_web")
 
         # 1. Ensure or auto-create session thread
 
@@ -3485,6 +3910,19 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         gen_image_url = None
 
+        if req.attached_file_path:
+            if ".." in re.split(r"[\\/]+", req.attached_file_path) or ".." in req.attached_file_path:
+                raise HTTPException(status_code=403, detail="Forbidden: Path traversal in attached_file_path is not allowed.")
+            if effective_scope != "local_desktop":
+                user_ns = re.sub(r"[^a-z0-9._@-]", "_", (auth.get("email") or auth.get("role") or "anonymous").strip().lower()) or "anonymous"
+                allowed_up_dir = os.path.abspath(os.path.join(upload_dir, user_ns))
+                abs_attach = os.path.abspath(req.attached_file_path)
+                try:
+                    common_up = os.path.commonpath([abs_attach, allowed_up_dir])
+                except ValueError:
+                    common_up = ""
+                if common_up.lower() != allowed_up_dir.lower():
+                    raise HTTPException(status_code=403, detail="Forbidden: Remote users can only attach files uploaded by their own account.")
         if req.attached_file_path and os.path.isfile(req.attached_file_path):
 
             file_ext = os.path.splitext(req.attached_file_path)[1].lower()
@@ -3698,6 +4136,16 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         reply_text = result.get("voice_response") or "Command processed."
 
         action = result.get("action")
+
+        # Format and append source citations for non-streaming web chat if present
+        srcs = result.get("sources", [])
+        if srcs and isinstance(srcs, list) and not re.search(r"\*Sources:", reply_text, re.IGNORECASE):
+            src_links = []
+            for s in srcs:
+                if isinstance(s, dict) and s.get("url") and s.get("name"):
+                    src_links.append(f"[{s['name']}]({s['url']})")
+            if src_links:
+                reply_text += f"\n\n*Sources: {' • '.join(src_links[:3])}*" 
         if action == "show_ui":
             send_local_ipc_command("show")
         elif action == "hide_ui":
@@ -3851,6 +4299,8 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
             "scratchpad": result.get("scratchpad"),
 
+            "sources": result.get("sources", []),
+
             "thought_steps": result.get("thought_steps", []),
 
             "attached_file": attached_file_info,
@@ -3959,7 +4409,19 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         sid = session_id or request.query_params.get("session_id")
 
-        scope = client_scope or request.query_params.get("client_scope", "remote_web")
+        role_audio = str(auth.get("role", "guest")).lower()
+        req_audio_scope = (client_scope or request.query_params.get("client_scope", "")).strip().lower()
+        if role_audio != "host" and req_audio_scope and req_audio_scope != "remote_web":
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: client_scope is derived server-side; remote users cannot request privileged scope."
+            )
+        if req_audio_scope == "local_desktop" and auth.get("method") != "localhost_direct":
+            raise HTTPException(
+                status_code=403,
+                detail="Forbidden: 'local_desktop' scope cannot be set from a remote request body."
+            )
+        scope = "remote_host" if role_audio == "host" else "remote_web"
 
         if not sid:
 
@@ -4096,6 +4558,8 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     @app.get("/api/gaming/status")
 
     async def get_gaming_status(auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Gaming shield and host process telemetry are restricted to Host.")
 
         """Returns live Game Detection, Wake-Word Gaming Shield state, and Windows WASAPI app volumes."""
 
@@ -4185,6 +4649,8 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     @app.post("/api/gaming/heal-audio")
 
     async def heal_all_audio(auth: Dict[str, Any] = Depends(authenticate_request)):
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Host audio control is restricted to Host.")
 
         """Force-restores all Windows per-application audio sessions to 100% (1.0)."""
 
@@ -4326,7 +4792,9 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
     async def get_vitals(auth: Dict[str, Any] = Depends(authenticate_request)):
 
-        """Returns live PC telemetry: RTX 5060 Ti VRAM, CPU, RAM, and version info."""
+        """Returns live PC telemetry: RTX 5060 Ti VRAM, CPU, RAM, and version info (Host only; hidden from remote_web Tester/Guest)."""
+        if auth.get("role") != "host":
+            raise HTTPException(status_code=403, detail="Forbidden: Hardware vitals are restricted to Host.")
 
         sys_metrics = monitor.get_system_metrics()
 
@@ -4445,10 +4913,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                     await websocket.send_json({"type": "pong", "time": time.time()})
 
                 elif msg_type == "vitals":
-
-                    sys_metrics = monitor.get_system_metrics()
-
-                    await websocket.send_json({"type": "vitals", "data": sys_metrics})
+                    is_ws_host = bool(token and token == access_token)
+                    if not is_ws_host:
+                        await websocket.send_json({"type": "error", "message": "Forbidden: Hardware vitals are restricted to Host."})
+                    else:
+                        sys_metrics = monitor.get_system_metrics()
+                        await websocket.send_json({"type": "vitals", "data": sys_metrics})
 
                 elif msg_type == "chat":
                     prompt = data.get("prompt", "")
@@ -4602,6 +5072,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         if not desc:
             raise HTTPException(status_code=400, detail="Bug description is required.")
         reporter = str(data.get("reporter_name", "")).strip() or auth.get("email", "Tester")
+        gh_user = auth.get("github_login")
+        if gh_user:
+            if not reporter or reporter == "Tester" or "@" not in reporter:
+                reporter = f"@{gh_user}"
+            elif f"@{gh_user}" not in reporter:
+                reporter = f"@{gh_user} ({reporter})"
         category = str(data.get("category", "General")).strip()
         device_info = str(data.get("device_info", "")).strip()
         session_id = str(data.get("session_id", "")).strip()
@@ -5107,7 +5583,7 @@ def start_web_server_thread(
 
     cfg = load_web_config(config_path)
 
-    server_host = host or cfg.get("host", "0.0.0.0")
+    server_host = host or cfg.get("host", "127.0.0.1")
 
     server_port = port or cfg.get("port", 8765)
 
@@ -5116,18 +5592,33 @@ def start_web_server_thread(
     # 1. Activate Public Tunnel (ngrok permanent domain if configured, else Cloudflare)
 
     ng_info = ensure_ngrok_tunnel(server_port)
+    active_tunnel_name = "none"
 
     if ng_info and ng_info.get("public_url"):
-
         cf_info = ng_info
-
+        active_tunnel_name = "ngrok"
     else:
-
-        cf_info = ensure_cloudflare_tunnel(server_port)
+        # Round 3 Item 3: Make Cloudflare Quick Tunnel fallback opt-in via config (default off)
+        fallback_enabled = bool(
+            cfg.get("cloudflare_quick_tunnel_fallback", False)
+            or cfg.get("cloudflare_tunnel", {}).get("fallback_enabled", False)
+        )
+        if fallback_enabled:
+            logger.info("ngrok tunnel not active; Cloudflare Quick Tunnel fallback enabled in config.")
+            cf_info = ensure_cloudflare_tunnel(server_port)
+            if cf_info and cf_info.get("public_url"):
+                active_tunnel_name = "cloudflare"
+        else:
+            logger.warning(
+                "ngrok tunnel is not active and Cloudflare Quick Tunnel fallback is off by default (opt-in via config). "
+                "Project Libra web server will NOT be exposed publicly."
+            )
+            cf_info = {"status": "disabled", "public_url": "", "error": "Quick tunnel fallback disabled"}
 
     # 2. Initialize FastAPI app attached to SupervisorHub
 
     app = create_app(hub=hub, config_path=config_path)
+    app.state.active_tunnel = active_tunnel_name
 
     # Note: log_config=None is required so Uvicorn does not crash when sys.stdout is hooked by StreamTee
 
@@ -5174,6 +5665,19 @@ def start_web_server_thread(
     print(banner)
 
     return thread
+
+
+_default_app = None
+
+
+def __getattr__(name: str):
+    if name == "app":
+        global _default_app
+        if _default_app is None:
+            _default_app = create_app()
+        return _default_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 if __name__ == "__main__":
 

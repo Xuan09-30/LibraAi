@@ -78,8 +78,13 @@ class SkillForge:
     Discovers, validates, executes, and self-repairs modular skills stored in skills/<skill_slug>/.
     """
 
-    def __init__(self, skills_dir: str = "skills"):
-        self.skills_dir = os.path.join(PROJECT_ROOT, skills_dir)
+    def __init__(self, skills_dir: Optional[str] = None):
+        if skills_dir is None:
+            skills_dir = os.environ.get("LIBRA_SKILLS_DIR") or "skills"
+        if os.path.isabs(skills_dir):
+            self.skills_dir = skills_dir
+        else:
+            self.skills_dir = os.path.join(PROJECT_ROOT, skills_dir)
         os.makedirs(self.skills_dir, exist_ok=True)
         self.registry: Dict[str, Dict[str, Any]] = {}
         self.refresh_registry()
@@ -177,6 +182,83 @@ class SkillForge:
                     return meta
 
         return None
+
+    @staticmethod
+    def is_docker_sandbox_available(_force_unavailable: bool = False) -> bool:
+        """Checks if Docker daemon is running and accessible for isolated skill execution."""
+        if _force_unavailable:
+            return False
+        import subprocess
+        try:
+            proc = subprocess.run(["docker", "info"], capture_output=True, text=True, timeout=3.0)
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def build_docker_sandbox_command(code: str, image: str = "python:3.11-slim") -> List[str]:
+        """
+        Builds the hardened `docker run` command with:
+          --network none, --cap-drop ALL, --security-opt no-new-privileges,
+          --pids-limit 128, --user 65534:65534, --read-only, --tmpfs /tmp:rw,noexec,nosuid,size=64m
+        and zero writable host volume mounts.
+        """
+        cmd = [
+            "docker", "run", "--rm",
+            "--network", "none",
+            "--cap-drop", "ALL",
+            "--security-opt", "no-new-privileges",
+            "--memory", "256m",
+            "--cpus", "1",
+            "--pids-limit", "128",
+            "--user", "65534:65534",
+            "--read-only",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+            "-e", "HOME=/tmp",
+            "-i", image,
+            "python", "-c", code
+        ]
+        assert "--privileged" not in cmd, "Docker sandbox cannot use --privileged"
+        assert not any("docker.sock" in str(a) for a in cmd), "Docker sandbox cannot mount docker.sock"
+        return cmd
+
+    def execute_in_docker_sandbox(self, code: str, timeout_sec: float = 5.0, _force_docker_unavailable: bool = False) -> Dict[str, Any]:
+        """
+        Executes generated skill Python code inside an isolated Docker sandbox container
+        with --network none, --cap-drop ALL, --security-opt no-new-privileges, --pids-limit 128,
+        --user 65534:65534, --read-only, and --tmpfs /tmp.
+        """
+        import subprocess
+        if not self.is_docker_sandbox_available(_force_unavailable=_force_docker_unavailable):
+            return {
+                "status": "sandbox_error",
+                "error": "Docker sandbox is required for untrusted generated skill code, but the Docker daemon is unavailable.",
+                "voice_response": "Cannot execute generated skill code: Docker sandbox is offline."
+            }
+        cmd = self.build_docker_sandbox_command(code)
+        hard_timeout = min(float(timeout_sec), 30.0)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=hard_timeout)
+            stdout_text = (proc.stdout or "").strip()
+            stderr_text = (proc.stderr or "").strip()
+            MAX_OUT = 65536
+            if len(stdout_text) > MAX_OUT:
+                stdout_text = stdout_text[:MAX_OUT] + "\n... [TRUNCATED: Output exceeded 64KB cap]"
+            if len(stderr_text) > MAX_OUT:
+                stderr_text = stderr_text[:MAX_OUT] + "\n... [TRUNCATED: Output exceeded 64KB cap]"
+            return {
+                "status": "success" if proc.returncode == 0 else "error",
+                "stdout": stdout_text,
+                "stderr": stderr_text,
+                "error": stderr_text if proc.returncode != 0 else None,
+                "sandboxed": "docker"
+            }
+        except Exception as exc:
+            return {
+                "status": "sandbox_error",
+                "error": f"Docker sandbox execution error: {exc}",
+                "voice_response": "Generated skill execution failed inside Docker sandbox."
+            }
 
     def validate_skill_code(self, code: str) -> Tuple[bool, str]:
         """

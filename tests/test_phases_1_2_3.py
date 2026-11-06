@@ -122,6 +122,36 @@ class TestPhase1MarkovAndHMEM(unittest.TestCase):
         self.assertEqual(facts.get("in_game_name"), "Kyodon")
 
 
+
+    def test_10_lessons_expiry_conflict_resolution_and_hybrid_rrf_recall(self):
+        """
+        Tier 2 Memory Correctness:
+        1. Counterfactual rules in LESSONS support TTL expiry and conflict resolution
+           (newer rule for the same trigger supersedes conflicting older rule).
+        2. Hybrid sqlite-vec + FTS5 recall merges vector and lexical rankings via
+           Reciprocal Rank Fusion (RRF).
+        """
+        # 1. Conflict resolution: record two conflicting rules for the same trigger
+        self.mem.record_correction("launch code editor", "opened notepad", "open vscode", ttl_days=30)
+        self.mem.record_correction("launch code editor", "opened vscode", "open cursor", ttl_days=30)
+        lessons = self.mem.recall_lesson_objects("launch code editor")
+        self.assertEqual(len(lessons), 1, f"Conflicting older lesson was not superseded! Got: {lessons}")
+        self.assertEqual(lessons[0]["corrected_action"], "open cursor")
+
+        # 2. Expiry: record a rule that is already expired (ttl_days=-1)
+        self.mem.record_correction("open music player", "opened wmp", "open spotify", ttl_days=-1)
+        expired_lessons = self.mem.recall_lesson_objects("open music player")
+        self.assertEqual(len(expired_lessons), 0, "Expired counterfactual lesson should not be recalled!")
+
+        # 3. Hybrid sqlite-vec + FTS5 Reciprocal Rank Fusion (RRF)
+        self.mem.remember_fact("The user's primary GPU is an NVIDIA GeForce RTX 5060 Ti with 16GB VRAM.")
+        self.mem.remember_fact("The user enjoys eating spicy Ayam Gepuk in Kepong.")
+        rrf_results = self.mem.recall_relevant("RTX 5060 Ti 16GB VRAM", limit=2)
+        self.assertGreaterEqual(len(rrf_results), 1)
+        self.assertIn("RTX 5060 Ti", rrf_results[0]["content"])
+        self.assertIn("rrf_score", rrf_results[0], "Expected rrf_score from Reciprocal Rank Fusion!")
+
+
 class TestPhase2DualPassVisionAndSoM(unittest.TestCase):
     def setUp(self):
         self.spatial = SpatialGroundingEngine()
@@ -231,6 +261,60 @@ class TestPhase3PreActDeterministicActionCaching(unittest.TestCase):
 
         # Cleanup
         self.mem.delete_action_macro(norm)
+
+    def test_09_scoped_macro_cache_and_destructive_confirmation(self):
+        """
+        Tier 1 Security:
+        1. Include client_scope in macro cache key so local_desktop macros do not bleed into remote_web.
+        2. _execute_macro_chain refuses OS tools for remote_web BEFORE invoking _execute_cached_tool.
+        3. Destructive actions (delete, send, install, shutdown) require confirmation even when cached.
+        """
+        trig = "open calculator"
+        norm = normalize_trigger(trig)
+        chain = [{"action": "open_app", "args": {"target": "calc"}}]
+
+        self.mem.delete_action_macro(norm)
+        self.mem.record_action_macro(norm, f"macro:{norm}", chain, latency_ms=10.0)
+        self.mem.record_action_macro(norm, f"macro:{norm}", chain, latency_ms=10.0)
+
+        # Spy on _execute_cached_tool to prove it is NEVER called when remote_web hits a cached macro
+        calls = []
+        orig_exec = self.hub._execute_cached_tool
+        def spy_exec(action, args, dry_run=False):
+            calls.append((action, args))
+            return orig_exec(action, args, dry_run=dry_run)
+        self.hub._execute_cached_tool = spy_exec
+        try:
+            # 1. Remote web scope must not execute local_desktop cached OS macro
+            res_remote = self.hub.plan_or_execute(trig, dry_run=False, client_scope="remote_web")
+            self.assertEqual(res_remote.get("action"), "sandboxed_blocked")
+            self.assertEqual(len(calls), 0, "OS tool was executed before remote_web check!")
+
+            # 2. Direct call to _execute_macro_chain in remote_web scope must refuse OS tools without executing
+            res_chain = self.hub._execute_macro_chain(chain, norm_trigger=norm, intent_signature=f"macro:{norm}", client_scope="remote_web", dry_run=False)
+            self.assertEqual(res_chain.get("action"), "sandboxed_blocked")
+            self.assertEqual(len(calls), 0, "_execute_macro_chain executed OS tool in remote_web scope!")
+
+            # 3. Cached destructive action (delete, send, install) must require confirmation even when cached
+            for d_trig, d_act in [
+                ("delete temp logs", "delete_file"),
+                ("send project report email", "send_email"),
+                ("install python package", "install_package"),
+            ]:
+                d_norm = normalize_trigger(d_trig)
+                d_chain = [{"action": d_act, "args": {"target": d_trig}}]
+                self.mem.record_action_macro(d_norm, f"macro:local_desktop:{d_norm}", d_chain, latency_ms=10.0)
+                self.mem.record_action_macro(d_norm, f"macro:local_desktop:{d_norm}", d_chain, latency_ms=10.0)
+                res_destr = self.hub.plan_or_execute(d_trig, dry_run=False, client_scope="local_desktop")
+                self.assertTrue(res_destr.get("requires_confirmation"), f"Destructive cached macro '{d_trig}' executed without confirmation!")
+                self.assertEqual(res_destr.get("status"), "confirmation_required")
+                self.assertEqual(len(calls), 0, f"Destructive cached macro '{d_trig}' invoked tool before confirmation!")
+                self.mem.delete_action_macro(d_norm)
+                self.mem.delete_action_macro(f"local_desktop:{d_norm}")
+        finally:
+            self.hub._execute_cached_tool = orig_exec
+            self.mem.delete_action_macro(norm)
+            self.mem.delete_action_macro(f"local_desktop:{norm}")
 
 
 if __name__ == "__main__":

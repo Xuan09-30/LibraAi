@@ -1,33 +1,49 @@
 {
-  "web_server": {
-    "host": "0.0.0.0",
-    "port": 8765,
-    "admin_email": "REDACTED",
-    "access_token": "libra_access_token_phase10_secure"
-  },
-  "smtp": {
-    "enabled": false,
-    "host": "smtp.gmail.com",
-    "port": 587,
-    "user": "YOUR_SMTP_EMAIL@gmail.com",
-    "password": "YOUR_SMTP_PASSWORD",
-    "sender_email": "YOUR_SMTP_EMAIL@gmail.com",
-    "sender_name": "Project Libra Security"
-  },
-  "google_oauth": {
-    "enabled": false,
-    "client_id": "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com",
-    "client_secret": "YOUR_GOOGLE_CLIENT_SECRET",
-    "project_id": "libra-project"
-  },
-  "ngrok": {
-    "enabled": false,
-    "authtoken": "YOUR_NGROK_AUTHTOKEN",
-    "domain": ""
-  },
-  "github": {
-    "enabled": true,
-    "repo": "REDACTED/LibraAi",
-    "token": "YOUR_GITHUB_TOKEN"
-  }
+    "web_server": {
+        "host": "0.0.0.0",
+        "port": 8765,
+        "admin_email": "REDACTED",
+        "access_token": "YOUR_WEB_ACCESS_TOKEN"
+    },
+    "smtp": {
+        "enabled": false,
+        "host": "smtp.gmail.com",
+        "port": 587,
+        "user": "YOUR_SMTP_EMAIL@gmail.com",
+        "password": "YOUR_SMTP_PASSWORD",
+        "sender_email": "YOUR_SMTP_EMAIL@gmail.com",
+        "sender_name": "Project Libra Security"
+    },
+    "google_oauth": {
+        "enabled": false,
+        "client_id": "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com",
+        "client_secret": "YOUR_GOOGLE_CLIENT_SECRET",
+        "project_id": "libra-project"
+    },
+    "ngrok": {
+        "enabled": false,
+        "authtoken": "YOUR_NGROK_AUTHTOKEN",
+        "domain": ""
+    },
+    "github": {
+        "enabled": true,
+        "repo": "REDACTED/LibraAi",
+        "token": "YOUR_GITHUB_TOKEN"
+    },
+    "computer_use": {
+        "allowed_domains": [
+            "google.com",
+            "youtube.com",
+            "cinejoy.pk",
+            "example.com",
+            "wikipedia.org",
+            "github.com"
+        ],
+        "workflow_post_conditions": {
+            "cinejoy.pk": {
+                "expected_title": "cinejoy",
+                "expected_url": "cinejoy.pk"
+            }
+        }
+    }
 }

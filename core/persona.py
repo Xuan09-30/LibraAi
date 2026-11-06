@@ -16,11 +16,24 @@ class PersonaEngine:
 
     def __init__(
         self,
-        soul_path: str = "assets/SOUL.md",
-        user_path: str = "assets/USER.md"
+        soul_path: Optional[str] = None,
+        user_path: Optional[str] = None
     ):
-        self.soul_path = os.path.join(PROJECT_ROOT, soul_path)
-        self.user_path = os.path.join(PROJECT_ROOT, user_path)
+        env_soul = os.environ.get("LIBRA_SOUL_PATH")
+        env_user = os.environ.get("LIBRA_USER_PATH")
+        if soul_path:
+            self.soul_path = os.path.abspath(soul_path) if os.path.isabs(soul_path) else os.path.join(PROJECT_ROOT, soul_path)
+        elif env_soul:
+            self.soul_path = os.path.abspath(env_soul)
+        else:
+            self.soul_path = os.path.join(PROJECT_ROOT, "assets/SOUL.md")
+
+        if user_path:
+            self.user_path = os.path.abspath(user_path) if os.path.isabs(user_path) else os.path.join(PROJECT_ROOT, user_path)
+        elif env_user:
+            self.user_path = os.path.abspath(env_user)
+        else:
+            self.user_path = os.path.join(PROJECT_ROOT, "assets/USER.md")
         self.recent_responses: collections.deque = collections.deque(maxlen=10)
         self.soul_content = ""
         self.user_content = ""

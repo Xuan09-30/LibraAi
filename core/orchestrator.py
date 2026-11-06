@@ -36,10 +36,81 @@ BLOCKED_REMOTE_ACTIONS = {
     "select_profile",
     "media_action",
     "virus_scan",
+    "create_skill",
+    "run_learned_skill",
+    "clipboard_copilot",
+    "clipboard_save",
+    "clipboard_assist",
+    "active_window",
+    "workspace_macro",
+    "launch_workspace",
+    "spotify_action",
+    "spotify_play",
+    "spotify_now_playing",
+    "media_control",
+    "game_mode",
+    "toggle_game_mode",
+    "show_ui",
+    "hide_ui",
+    "persona_update",
+    "update_personality",
 }
 
+REMOTE_WEB_ALLOWED_TOOLS = {
+    "chat",
+    "web_search",
+    "deep_research",
+    "weather",
+    "world_time",
+    "time",
+    "places_search",
+    "compare_candidates",
+    "place_detail",
+    "recall_memory",
+    "remember_fact",
+    "forget_memory",
+    "profile_recall",
+    "currency_convert",
+    "unit_convert",
+    "math_eval",
+    "ping_check",
+    "clarify",
+    "list_skills",
+    "document_rag",
+    "lookup_entity",
+}
+
+REMOTE_HOST_ALLOWED_TOOLS = set(REMOTE_WEB_ALLOWED_TOOLS) | {
+    "daily_briefing",
+    "system_status",
+    "schedule_reminder",
+    "list_reminders",
+    "cancel_reminders",
+    "data_science",
+}
+
+DESTRUCTIVE_MACRO_ACTIONS = {
+    "shutdown",
+    "delete_file",
+    "delete_folder",
+    "remove_file",
+    "send_email",
+    "install_package",
+    "install_app",
+    "uninstall_app",
+    "format_drive",
+    "wipe_memory",
+}
+
+DESTRUCTIVE_MACRO_PATTERNS = [
+    r"\b(?:delete|remove|erase|wipe|format|uninstall)\b",
+    r"\b(?:send|dispatch)\s+(?:an?\s+)?(?:email|message|report)\b",
+    r"\b(?:install)\b",
+    r"\b(?:shut\s*down|reboot|restart)\b",
+]
+
 REMOTE_SANDBOX_PATTERNS = [
-    r"\b(?:launch|open|start|run|close|kill|shut\s*down)\s+(?:the\s+)?(?:app|application|game|program|software|chrome|steam|notepad|calc|pc|computer|system)\b",
+    r"\b(?:launch|open|start|run|close|kill|shut\s*down|power\s*off)\s+(?:the\s+|my\s+)?(?:app|application|game|program|software|chrome|steam|notepad|calc|pc|computer|system)\b",
     r"\b(?:click|double\s+click|right\s+click|press|tap)\s+(?:on\s+)?(?:the\s+)?(?:screen|button|icon|window|profile)\b",
     r"\b(?:look\s+at|what\s+is\s+on|see\s+on|capture|check)\s+my\s+screen\b",
     r"\b(?:open|show|reveal)\s+(?:that\s+|the\s+)?(?:folder|directory|file)\b",
@@ -194,8 +265,34 @@ class SupervisorHub:
 
         return [prompt]
 
-    def _execute_cached_tool(self, action: str, args: dict, dry_run: bool = False) -> Dict[str, Any]:
+    def get_registered_tools(self, client_scope: str = "local_desktop") -> set:
+        """
+        Returns the registered tool allowlist for the given client_scope.
+        remote_web and remote_host sessions never get OS-control or terminal tools registered.
+        """
+        if client_scope == "remote_web":
+            return set(REMOTE_WEB_ALLOWED_TOOLS)
+        if client_scope == "remote_host":
+            return set(REMOTE_HOST_ALLOWED_TOOLS)
+        return (
+            set(REMOTE_HOST_ALLOWED_TOOLS)
+            | set(BLOCKED_REMOTE_ACTIONS)
+            | {
+                "show_ui",
+                "hide_ui",
+            }
+        )
+
+    def _execute_cached_tool(self, action: str, args: dict, dry_run: bool = False, client_scope: str = "local_desktop") -> Dict[str, Any]:
         """Dispatches an already-compiled tool action directly to the runtime module."""
+        if client_scope != "local_desktop" and (action in BLOCKED_REMOTE_ACTIONS or action not in self.get_registered_tools(client_scope)):
+            return {
+                "action": "sandboxed_blocked",
+                "status": "blocked",
+                "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                "client_scope": client_scope,
+                "blocked_action": action
+            }
         if action == "open_app":
             target = args.get("app_id") or args.get("target", "")
             res = self.llm.dispatcher.launch_app(target, dry_run=dry_run)
@@ -260,6 +357,112 @@ class SupervisorHub:
             return {"action": action, "status": "success" if success else "error", "voice_response": msg}
         return res
 
+    def is_destructive_macro(self, norm_trigger: str, tool_chain: List[Dict[str, Any]]) -> bool:
+        """Checks if a macro or trigger involves destructive actions (delete, send, install, shutdown)."""
+        for step_item in (tool_chain or []):
+            if step_item.get("action") in DESTRUCTIVE_MACRO_ACTIONS:
+                return True
+            sub_prompt = str((step_item.get("args") or {}).get("target") or (step_item.get("args") or {}).get("prompt") or "")
+            if any(re.search(pat, sub_prompt, re.IGNORECASE) for pat in DESTRUCTIVE_MACRO_PATTERNS):
+                return True
+        if norm_trigger and any(re.search(pat, norm_trigger, re.IGNORECASE) for pat in DESTRUCTIVE_MACRO_PATTERNS):
+            return True
+        return False
+
+    def _execute_macro_chain(
+        self,
+        tool_chain: List[Dict[str, Any]],
+        norm_trigger: str = "",
+        intent_signature: str = "",
+        client_scope: str = "local_desktop",
+        dry_run: bool = False,
+        avg_latency_ms: float = 120.0,
+        t_start: Optional[float] = None,
+        confirmed: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Executes a cached macro tool_chain after verifying:
+        1. Remote scope refusal for OS tools BEFORE any tool execution.
+        2. Explicit user confirmation for destructive actions (delete, send, install, shutdown) even when cached.
+        """
+        t0 = t_start if t_start is not None else time.perf_counter()
+        macro_act = tool_chain[0].get("action") if len(tool_chain) == 1 else "macro_chain"
+
+        # 1. Refuse OS tools or unregistered tools for remote scopes BEFORE invoking _execute_cached_tool
+        if client_scope != "local_desktop":
+            reg_tools = self.get_registered_tools(client_scope)
+            if (
+                macro_act in BLOCKED_REMOTE_ACTIONS
+                or any(s.get("action") in BLOCKED_REMOTE_ACTIONS or s.get("action") not in reg_tools for s in tool_chain)
+            ):
+                return {
+                    "action": "sandboxed_blocked",
+                    "status": "blocked",
+                    "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                    "client_scope": client_scope
+                }
+
+        # 2. Require confirmation for destructive actions even when macro is cached
+        if not confirmed and self.is_destructive_macro(norm_trigger, tool_chain):
+            return {
+                "action": "confirm_required",
+                "status": "confirmation_required",
+                "requires_confirmation": True,
+                "pending_macro": tool_chain,
+                "trigger": norm_trigger,
+                "voice_response": f"Confirmation required before executing destructive action: {norm_trigger}."
+            }
+
+        profiler.record_preact_cache_hit(
+            trigger=norm_trigger,
+            intent_signature=intent_signature or f"macro:{client_scope}:{norm_trigger}",
+            latency_saved_ms=avg_latency_ms
+        )
+        step_results: List[Dict[str, Any]] = []
+        voice_responses: List[str] = []
+
+        for step_item in tool_chain:
+            act = step_item.get("action", "")
+            args = step_item.get("args", {})
+            res = self._execute_cached_tool(act, args, dry_run=dry_run, client_scope=client_scope)
+            step_results.append(res)
+            v = res.get("voice_response")
+            if v and v != "Dry-run response.":
+                voice_responses.append(v)
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        scoped_trig = f"{client_scope}:{norm_trigger}" if norm_trigger else ""
+        if not dry_run and scoped_trig and hasattr(self.llm, "memory") and hasattr(self.llm.memory, "record_action_macro"):
+            self.llm.memory.record_action_macro(
+                scoped_trig,
+                intent_signature or f"macro:{client_scope}:{norm_trigger}",
+                tool_chain,
+                latency_ms=elapsed_ms
+            )
+
+        combined_voice = " ".join(voice_responses) if voice_responses else f"Completed {norm_trigger}."
+        fast_tm = {
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+            "tokens_per_sec": 0.0, "saved_tokens": 350,
+            "model": "preact_macro", "fast_path": True
+        }
+        if hasattr(self.llm, "last_token_metrics"):
+            self.llm.last_token_metrics = dict(fast_tm)
+        out_macro = {
+            "action": macro_act,
+            "compound": len(tool_chain) > 1,
+            "steps": [norm_trigger],
+            "actions": [s.get("action") for s in tool_chain],
+            "step_results": step_results,
+            "voice_response": normalize_for_tts(combined_voice),
+            "preact_cached": True,
+            "token_metrics": fast_tm,
+            "latency_ms": round(elapsed_ms, 2)
+        }
+        if len(step_results) == 1 and isinstance(step_results[0], dict) and step_results[0].get("slug"):
+            out_macro["slug"] = step_results[0]["slug"]
+        return out_macro
+
     def _match_semantic_fastpath(self, prompt: str) -> Optional[Dict[str, Any]]:
         """
         Embedding-Assisted / Lexical Semantic Fast-Path (Phase 9).
@@ -302,7 +505,7 @@ class SupervisorHub:
         fast-path single dispatch, or multi-step coordination backed by AgentScratchpad.
         When client_scope == "remote_web", enforces strict sandboxing restricting desktop OS tools.
         """
-        if client_scope == "remote_web":
+        if client_scope != "local_desktop":
             for pat in REMOTE_SANDBOX_PATTERNS:
                 if re.search(pat, prompt, re.IGNORECASE):
                     if not re.search(r"open\s+(?:my\s+)?(?:google|chrome|browser)\s+and\s+search", prompt, re.IGNORECASE):
@@ -348,7 +551,7 @@ class SupervisorHub:
 
         # PHASE 12: AUTONOMOUS COMPUTER-USE REACT LOOP EXECUTION
         if AutonomousComputerUseAgent.is_computer_use_prompt(prompt):
-            if client_scope == "remote_web":
+            if client_scope != "local_desktop":
                 return {
                     "action": "sandboxed_blocked",
                     "status": "blocked",
@@ -365,79 +568,35 @@ class SupervisorHub:
             return agent.execute_task(prompt, dry_run=dry_run)
 
         norm_trigger = normalize_trigger(prompt)
-        intent_signature = f"macro:{norm_trigger}"
+        scoped_trigger = f"{client_scope}:{norm_trigger}"
+        intent_signature = f"macro:{client_scope}:{norm_trigger}"
         t_start = time.perf_counter()
         sub_steps = self.split_compound_intent(prompt)
 
         # PREACT DETERMINISTIC ACTION MACRO FAST-PATH (<5ms)
-        _DYNAMIC_NO_MACRO_ACTIONS = {"chat", "clarify", "error", "active_window", "weather", "world_time", "time", "run_learned_skill", "lookup_entity", "web_search", "deep_research", "computer_use_agent", "daily_briefing"}
+        _DYNAMIC_NO_MACRO_ACTIONS = {"chat", "clarify", "error", "active_window", "weather", "world_time", "time", "run_learned_skill", "lookup_entity", "web_search", "deep_research", "computer_use_agent", "daily_briefing", "remember_fact", "forget_memory", "recall_memory", "document_rag"}
         if len(sub_steps) == 1 and hasattr(self.llm, "memory") and hasattr(self.llm.memory, "get_action_macro"):
-            cached_macro = self.llm.memory.get_action_macro(norm_trigger)
+            cached_macro = self.llm.memory.get_action_macro(scoped_trigger) or self.llm.memory.get_action_macro(intent_signature)
+            if cached_macro is None and client_scope == "local_desktop":
+                cached_macro = self.llm.memory.get_action_macro(norm_trigger)
             if cached_macro and cached_macro.get("success_count", 0) >= 2:
                 tool_chain = cached_macro.get("tool_chain", [])
                 if tool_chain and not any(s.get("action") in _DYNAMIC_NO_MACRO_ACTIONS for s in tool_chain):
-                    profiler.record_preact_cache_hit(
-                        trigger=norm_trigger,
+                    return self._execute_macro_chain(
+                        tool_chain=tool_chain,
+                        norm_trigger=norm_trigger,
                         intent_signature=intent_signature,
-                        latency_saved_ms=cached_macro.get("avg_latency_ms", 120.0)
+                        client_scope=client_scope,
+                        dry_run=dry_run,
+                        avg_latency_ms=cached_macro.get("avg_latency_ms", 120.0),
+                        t_start=t_start
                     )
-                    step_results: List[Dict[str, Any]] = []
-                    voice_responses: List[str] = []
-
-                    for step_item in tool_chain:
-                        act = step_item.get("action", "")
-                        args = step_item.get("args", {})
-                        res = self._execute_cached_tool(act, args, dry_run=dry_run)
-                        step_results.append(res)
-                        v = res.get("voice_response")
-                        if v and v != "Dry-run response.":
-                            voice_responses.append(v)
-
-                    elapsed_ms = (time.perf_counter() - t_start) * 1000.0
-                    if not dry_run:
-                        self.llm.memory.record_action_macro(
-                            norm_trigger,
-                            intent_signature,
-                            tool_chain,
-                            latency_ms=elapsed_ms
-                        )
-
-                    combined_voice = " ".join(voice_responses) if voice_responses else f"Completed {norm_trigger}."
-                    macro_act = tool_chain[0].get("action") if len(tool_chain) == 1 else "macro_chain"
-                    if client_scope == "remote_web" and (macro_act in BLOCKED_REMOTE_ACTIONS or any(s.get("action") in BLOCKED_REMOTE_ACTIONS for s in tool_chain)):
-                        return {
-                            "action": "sandboxed_blocked",
-                            "status": "blocked",
-                            "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
-                            "client_scope": client_scope
-                        }
-                    fast_tm = {
-                        "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
-                        "tokens_per_sec": 0.0, "saved_tokens": 350,
-                        "model": "preact_macro", "fast_path": True
-                    }
-                    if hasattr(self.llm, "last_token_metrics"):
-                        self.llm.last_token_metrics = dict(fast_tm)
-                    out_macro = {
-                        "action": macro_act,
-                        "compound": len(tool_chain) > 1,
-                        "steps": [norm_trigger],
-                        "actions": [s.get("action") for s in tool_chain],
-                        "step_results": step_results,
-                        "voice_response": normalize_for_tts(combined_voice),
-                        "preact_cached": True,
-                        "token_metrics": fast_tm,
-                        "latency_ms": round(elapsed_ms, 2)
-                    }
-                    if len(step_results) == 1 and isinstance(step_results[0], dict) and step_results[0].get("slug"):
-                        out_macro["slug"] = step_results[0]["slug"]
-                    return out_macro
 
         # SEMANTIC FAST-PATH ROUTING (Phase 9) (<5ms) - Only for single-clause intents
         if len(sub_steps) == 1:
             sem_fast = self._match_semantic_fastpath(prompt)
             if sem_fast:
-                if client_scope == "remote_web" and sem_fast["action"] in BLOCKED_REMOTE_ACTIONS:
+                if client_scope != "local_desktop" and (sem_fast["action"] in BLOCKED_REMOTE_ACTIONS or sem_fast["action"] not in self.get_registered_tools(client_scope)):
                     return {
                         "action": "sandboxed_blocked",
                         "status": "blocked",
@@ -445,7 +604,7 @@ class SupervisorHub:
                         "client_scope": client_scope
                     }
                 profiler.record_metric("semantic_fastpath_hit", 1.0)
-                res = self._execute_cached_tool(sem_fast["action"], sem_fast["args"], dry_run=dry_run)
+                res = self._execute_cached_tool(sem_fast["action"], sem_fast["args"], dry_run=dry_run, client_scope=client_scope)
                 res["semantic_fastpath"] = True
                 res["compound"] = False
                 fast_tm = {
@@ -462,11 +621,23 @@ class SupervisorHub:
 
         # FAST PATH (<5ms): Single intent query
         if len(sub_steps) == 1:
-            res = self.llm.plan(prompt, dry_run=dry_run)
+            if client_scope != "local_desktop" and not dry_run:
+                # Tool-layer sandbox: inspect planned action in dry_run BEFORE allowing any OS/terminal tool to execute
+                preview = self.llm.plan(prompt, dry_run=True, client_scope=client_scope)
+                preview_act = preview.get("action")
+                if preview_act in BLOCKED_REMOTE_ACTIONS or (preview_act and preview_act not in self.get_registered_tools(client_scope)):
+                    return {
+                        "action": "sandboxed_blocked",
+                        "status": "blocked",
+                        "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                        "client_scope": client_scope,
+                        "blocked_action": preview_act
+                    }
+            res = self.llm.plan(prompt, dry_run=dry_run, client_scope=client_scope)
             res["compound"] = False
             elapsed_ms = (time.perf_counter() - t_start) * 1000.0
             act = res.get("action")
-            if client_scope == "remote_web" and act in BLOCKED_REMOTE_ACTIONS:
+            if client_scope != "local_desktop" and (act in BLOCKED_REMOTE_ACTIONS or (act and act not in self.get_registered_tools(client_scope))):
                 return {
                     "action": "sandboxed_blocked",
                     "status": "blocked",
@@ -478,7 +649,7 @@ class SupervisorHub:
                 tool_chain = [{"action": act, "args": res.get("args", {})}]
                 if hasattr(self.llm, "memory") and hasattr(self.llm.memory, "record_action_macro"):
                     self.llm.memory.record_action_macro(
-                        norm_trigger,
+                        scoped_trigger,
                         intent_signature,
                         tool_chain,
                         latency_ms=elapsed_ms
@@ -498,7 +669,18 @@ class SupervisorHub:
         for idx, step in enumerate(sub_steps[:self.MAX_STEPS]):
             if idx < len(self.scratchpad.subtasks):
                 self.scratchpad.subtasks[idx]["status"] = "running"
-            res = self.llm.plan(step, dry_run=dry_run)
+            if client_scope != "local_desktop" and not dry_run:
+                preview_step = self.llm.plan(step, dry_run=True, client_scope=client_scope)
+                p_act = preview_step.get("action")
+                if p_act in BLOCKED_REMOTE_ACTIONS or (p_act and p_act not in self.get_registered_tools(client_scope)):
+                    return {
+                        "action": "sandboxed_blocked",
+                        "status": "blocked",
+                        "voice_response": "Remote Web Mode active: Desktop OS control is restricted to local PC sessions.",
+                        "client_scope": client_scope,
+                        "blocked_action": p_act
+                    }
+            res = self.llm.plan(step, dry_run=dry_run, client_scope=client_scope)
             if idx < len(self.scratchpad.subtasks):
                 self.scratchpad.subtasks[idx]["action"] = res.get("action", step)
                 self.scratchpad.subtasks[idx]["args"] = res.get("args", {})
@@ -526,13 +708,13 @@ class SupervisorHub:
             if successful_chain and len(successful_chain) == len(step_results):
                 if hasattr(self.llm, "memory") and hasattr(self.llm.memory, "record_action_macro"):
                     self.llm.memory.record_action_macro(
-                        norm_trigger,
+                        scoped_trigger,
                         intent_signature,
                         successful_chain,
                         latency_ms=elapsed_ms
                     )
 
-        if client_scope == "remote_web" and any(a in BLOCKED_REMOTE_ACTIONS for a in actions):
+        if client_scope != "local_desktop" and any(a in BLOCKED_REMOTE_ACTIONS or a not in self.get_registered_tools(client_scope) for a in actions):
             return {
                 "action": "sandboxed_blocked",
                 "status": "blocked",

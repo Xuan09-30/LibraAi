@@ -1,11 +1,12 @@
 import os
 import sys
 
-
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 os.chdir(PROJECT_ROOT)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
+
+from ui.tokens import get_shared_qss, STATUS_THEMES
 
 log_dir = os.path.join(PROJECT_ROOT, "logs")
 os.makedirs(log_dir, exist_ok=True)
@@ -115,7 +116,6 @@ import html
 import numpy as np
 import pyaudio
 import torch
-import keyboard
 import queue
 import wave
 import subprocess
@@ -130,7 +130,10 @@ from PyQt6.QtGui import (
     QFont, QColor, QPainter, QBrush, QLinearGradient,
     QAction, QIcon, QPixmap, QPen, QRadialGradient
 )
-from PyQt6.QtWebEngineWidgets import QWebEngineView
+try:
+    from PyQt6.QtWebEngineWidgets import QWebEngineView
+except ImportError:
+    QWebEngineView = QWidget
 
 from openwakeword.model import Model
 from core.vad import SileroVADDetector
@@ -396,11 +399,11 @@ class VoiceAssistantWorker(QThread):
                     print(f"[Chime Playback Error]: {ex}")
             threading.Thread(target=_stream_worker, daemon=True).start()
 
-        self.status_changed.emit("SYSTEM READY // AWAITING VOCAL PROMPT")
+        self.status_changed.emit("Ready")
         if self.raw_chime_pcm:
             scaled = get_dynamic_chime_pcm(self.raw_chime_pcm, base_gain=0.25)
             play_chime_async(scaled)
-        self.notification_signal.emit("Project Libra Online", "Neural Core & Ambient Voice online. Say 'Hey Libra' anytime.")
+        self.notification_signal.emit("Libra Online", "Voice assistant ready. Say 'Hey Libra' anytime.")
 
         def speak_interruptible(text_or_stream):
             if self.mute_tts:
@@ -445,11 +448,6 @@ class VoiceAssistantWorker(QThread):
                     except Exception:
                         pass
 
-            hotkey_handle = None
-            try:
-                hotkey_handle = keyboard.add_hotkey(INTERRUPT_HOTKEY, trigger_barge_in)
-            except Exception:
-                pass
 
             # CONSUMER THREAD: Stays alive until synthesis completes AND queue drains
             def playback_worker():
@@ -465,6 +463,14 @@ class VoiceAssistantWorker(QThread):
                     out_stream_holder[0] = out_stream
 
                     while not self.interrupted.is_set():
+                        if sys.platform == "win32":
+                            try:
+                                u32 = ctypes.windll.user32
+                                if (u32.GetAsyncKeyState(0x11) & 0x8000) and (u32.GetAsyncKeyState(0x20) & 0x8000):
+                                    trigger_barge_in()
+                                    break
+                            except Exception:
+                                pass
                         try:
                             # Short block wait so thread remains responsive to barge-in
                             chunk = audio_queue.get(timeout=0.05)
@@ -572,11 +578,6 @@ class VoiceAssistantWorker(QThread):
                     pass
                 time.sleep(0.01)
 
-            if hotkey_handle:
-                try:
-                    keyboard.remove_hotkey(hotkey_handle)
-                except Exception:
-                    pass
 
             consumer_thread.join(timeout=0.5)
             self.visualizer_state.emit(False)
@@ -673,7 +674,7 @@ class VoiceAssistantWorker(QThread):
                             self.audio_ducker.restore_background_audio()
                     except Exception:
                         pass
-                    self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
+                    self.status_changed.emit("Ready")
                     self.visualizer_state.emit(False)
                     oww_model.reset()
                     ww_booster.reset()
@@ -741,7 +742,7 @@ class VoiceAssistantWorker(QThread):
                                     )
                                     self.pa = test_pa
                                     self.input_stream = stream
-                                    self.status_changed.emit("SYSTEM READY // AWAITING VOCAL PROMPT")
+                                    self.status_changed.emit("Ready")
                                     self.telemetry_update.emit("AUDIO_STATUS", "MICROPHONE ACTIVE")
                                     self.notification_signal.emit("Microphone Connected", "Libra voice listening is now online! Say 'Hey Libra' anytime.")
                                     self.log_received.emit("SYSTEM", "Microphone connected successfully. Voice listening online.")
@@ -763,7 +764,7 @@ class VoiceAssistantWorker(QThread):
                                 except Exception:
                                     pass
                             self.input_stream = None
-                            self.status_changed.emit("MICROPHONE DISCONNECTED // TEXT MODE")
+                            self.status_changed.emit("Text mode (Microphone disconnected)")
                             self.telemetry_update.emit("AUDIO_STATUS", "NO MIC DETECTED [TEXT MODE ACTIVE]")
                             self.notification_signal.emit("Microphone Disconnected", "Microphone unplugged or lost. Switched to Text Mode.")
                             self.log_received.emit("SYSTEM", "Microphone disconnected. Waiting for microphone reconnection...")
@@ -814,9 +815,9 @@ class VoiceAssistantWorker(QThread):
 
                 if user_text is None:
                     if in_followup_mode:
-                        self.status_changed.emit("CONVERSATIONAL FOLLOW-UP ACTIVE...")
+                        self.status_changed.emit("Listening...")
                     else:
-                        self.status_changed.emit("RECORDING USER INPUT...")
+                        self.status_changed.emit("Listening...")
 
                     vad_detector.reset()
 
@@ -883,10 +884,10 @@ class VoiceAssistantWorker(QThread):
                     if user_text is None:
                         if full_audio is None or len(full_audio) < 16000 * 0.3:
                             in_followup_mode = False
-                            self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
+                            self.status_changed.emit("Ready")
                             continue
 
-                        self.status_changed.emit("NEURAL TRANSCRIBING...")
+                        self.status_changed.emit("Transcribing...")
                         try:
                             with profiler.measure("STT_LATENCY"):
                                 user_text = stt.transcribe(full_audio)
@@ -900,7 +901,7 @@ class VoiceAssistantWorker(QThread):
             if not user_text or not user_text.strip():
                 ww_booster.clear_followup_window()
                 in_followup_mode = False
-                self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
+                self.status_changed.emit("Ready")
                 continue
 
             # Gaming Shield Post-STT Verification:
@@ -914,7 +915,7 @@ class VoiceAssistantWorker(QThread):
                     self.log_received.emit("SYSTEM", f"Gaming Shield: Suppressed in-game chatter '{user_text}'.")
                     ww_booster.clear_followup_window()
                     in_followup_mode = False
-                    self.status_changed.emit("STANDBY // LISTENING FOR WAKE WORD")
+                    self.status_changed.emit("Ready")
                     continue
 
             print(f"[Captured Input]: {user_text}")
@@ -959,7 +960,7 @@ class VoiceAssistantWorker(QThread):
                 self.orb_state_signal.emit("idle")
                 ww_booster.clear_followup_window()
                 in_followup_mode = False
-                self.status_changed.emit("STANDBY // READY")
+                self.status_changed.emit("Ready")
                 continue
 
             if clean_cmd_stripped in HIDE_PHRASES or clean_cmd in HIDE_PHRASES:
@@ -973,11 +974,11 @@ class VoiceAssistantWorker(QThread):
                 self.orb_state_signal.emit("idle")
                 ww_booster.clear_followup_window()
                 in_followup_mode = False
-                self.status_changed.emit("STANDBY // READY")
+                self.status_changed.emit("Ready")
                 continue
 
             # STATE 4: REASON & EXECUTE VIA LLM CORE
-            self.status_changed.emit("PROCESSING REASONING...")
+            self.status_changed.emit("Thinking...")
             self.orb_state_signal.emit("reasoning")
             if hasattr(llm, "idle_daemon") and llm.idle_daemon:
                 llm.idle_daemon.record_user_activity()
@@ -1149,7 +1150,6 @@ class MainWindowHotkeyThread(QThread):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = True
-        self._keyboard_handle = None
         self._last_trigger_time = 0.0
 
     def _safe_trigger(self):
@@ -1182,12 +1182,7 @@ class MainWindowHotkeyThread(QThread):
             else:
                 print("[GUI Info] Alt + Enter hotkey registered via low-level keyboard hook.")
 
-            # 2. Also register via keyboard module for OS-level reliability
-            try:
-                import keyboard
-                self._keyboard_handle = keyboard.add_hotkey("alt+enter", lambda: self._safe_trigger(), suppress=False)
-            except Exception:
-                pass
+
 
             msg = wintypes.MSG()
             while self._running:
@@ -1205,13 +1200,7 @@ class MainWindowHotkeyThread(QThread):
 
     def stop(self):
         self._running = False
-        if self._keyboard_handle:
-            try:
-                import keyboard
-                keyboard.remove_hotkey(self._keyboard_handle)
-            except Exception:
-                pass
-            self._keyboard_handle = None
+
         if sys.platform == "win32":
             try:
                 import ctypes
@@ -1313,7 +1302,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
     def init_ui(self):
         self.setWindowTitle("Project Libra")
         self.resize(1180, 780)
-        self.setStyleSheet("background-color: #09090b; color: #f8fafc; font-family: 'Segoe UI', -apple-system, sans-serif;")
+        self.setStyleSheet(get_shared_qss())
 
         central = QWidget(self)
         self.setCentralWidget(central)
@@ -1339,7 +1328,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
         header.addStretch()
 
-        self.vault_btn = QPushButton("◈ Memory Vault")
+        self.vault_btn = QPushButton("Memory")
         self.vault_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
         self.vault_btn.setStyleSheet("""
             QPushButton {
@@ -1348,7 +1337,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
             }
             QPushButton:hover { background: #27272a; border-color: rgba(255, 255, 255, 0.16); }
         """)
-        self.vault_btn.setToolTip("Inspect and edit Memory Vault (Obsidian Markdown Sync at assets/vault/)")
+        self.vault_btn.setToolTip("Inspect and edit memory notes")
         self.vault_btn.clicked.connect(self.open_memory_vault)
         header.addWidget(self.vault_btn)
 
@@ -1684,23 +1673,24 @@ class FuturisticVoiceAssistantUI(QMainWindow):
 
     def update_status(self, text: str):
         self.status_banner.setText(text)
-        if "SPEAKING" in text:
-            self.status_banner.setStyleSheet(
-                "background: #160f29; color: #c084fc; border: 1px solid #9333ea; border-radius: 6px; padding: 9px;"
-            )
-        elif "RECORDING" in text or "FOLLOW-UP" in text:
-            self.status_banner.setStyleSheet(
-                "background: #092019; color: #34d399; border: 1px solid #059669; border-radius: 6px; padding: 9px;"
-            )
-        elif "PROCESSING" in text or "TRANSCRIBING" in text:
-            self.status_banner.setStyleSheet(
-                "background: #231608; color: #fbbf24; border: 1px solid #d97706; border-radius: 6px; padding: 9px;"
-            )
+        upper = text.upper()
+        if "SPEAKING" in upper:
+            theme = STATUS_THEMES.get("SPEAKING")
+        elif "RECORDING" in upper or "FOLLOW-UP" in upper or "LISTENING" in upper:
+            theme = STATUS_THEMES.get("LISTENING")
+        elif "PROCESSING" in upper or "TRANSCRIBING" in upper or "THINKING" in upper:
+            theme = STATUS_THEMES.get("THINKING")
         else:
-            self.status_banner.setStyleSheet(
-                "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #091322, stop:0.5 #13243d, stop:1 #091322); "
-                "color: #00ffcc; border: 1px solid #00e5ff; border-radius: 6px; padding: 9px;"
-            )
+            theme = STATUS_THEMES.get("IDLE")
+        
+        self.status_banner.setStyleSheet(f"""
+            background: {theme['bg']};
+            color: {theme['color']};
+            border: 1px solid {theme['border']};
+            border-radius: 8px;
+            padding: 9px;
+            font-weight: 600;
+        """)
 
     def append_log(self, sender: str, msg: str):
         safe_msg = html.escape(str(msg))
@@ -1855,7 +1845,7 @@ class FuturisticVoiceAssistantUI(QMainWindow):
         self.setWindowIcon(icon)
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(icon)
-        self.tray_icon.setToolTip("Libra // Cybernetic Neural Assistant")
+        self.tray_icon.setToolTip("Libra")
 
         tray_menu = QMenu()
         show_action = QAction("Show Interface", self)

@@ -40,13 +40,57 @@ class TestWebSessionsAndTokens(unittest.TestCase):
     # 1. CLOUDFLARE IDENTITY & TOKEN AUTHENTICATION TESTS
     # -----------------------------------------------------------------------
     def test_01_cloudflare_identity_headers(self):
-        """Test Cloudflare Cf-Access-Authenticated-User-Email and X-User-Email header authentication."""
-        # Allowed Admin email
+        """Test Cloudflare Cf-Access-Authenticated-User-Email (RS256 only) and Bearer token."""
+        import jwt
+        import time
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives import serialization
+
+        self.app.state.cloudflare_access_enabled = True
+        priv_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        priv_pem = priv_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        pub_pem = priv_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+
+        class MockJWKS:
+            def get_signing_key_from_jwt(self, token):
+                class Key:
+                    def __init__(self, k): self.key = k
+                return Key(pub_pem)
+
+        self.app.state.cloudflare_access_jwks_client = MockJWKS()
+        self.app.state.cloudflare_access_team_domain = "test"
+
+        # 1. HS256 must be rejected with 401
+        hs_jwt = jwt.encode({"email": self.admin_email, "exp": time.time() + 300}, "secret", algorithm="HS256")
+        res_hs = self.client.get(
+            "/api/vitals",
+            headers={
+                "cf-access-authenticated-user-email": self.admin_email,
+                "cf-access-jwt-assertion": hs_jwt
+            }
+        )
+        self.assertEqual(res_hs.status_code, 401)
+
+        # 2. RS256 must be accepted with 200
+        cf_jwt = jwt.encode(
+            {"email": self.admin_email, "iss": "https://test.cloudflareaccess.com", "exp": time.time() + 300},
+            priv_pem,
+            algorithm="RS256"
+        )
         cf_headers = {
-            "cf-access-authenticated-user-email": self.admin_email
+            "cf-access-authenticated-user-email": self.admin_email,
+            "cf-access-jwt-assertion": cf_jwt
         }
         res_ok = self.client.get("/api/vitals", headers=cf_headers)
         self.assertEqual(res_ok.status_code, 200)
+        self.app.state.cloudflare_access_enabled = False
 
         # Token authentication
         res_tok = self.client.get("/api/vitals", headers={"Authorization": f"Bearer {self.token}"})
@@ -192,7 +236,7 @@ class TestWebSessionsAndTokens(unittest.TestCase):
 
     def test_07_fast_path_saved_tokens_telemetry(self):
         """Test fast-path queries report 0 input/output tokens and 350 saved tokens."""
-        res = self.hub.process_command("check system vitals", client_scope="remote_web", dry_run=True)
+        res = self.hub.process_command("check system vitals", client_scope="remote_host", dry_run=True)
         metrics = res.get("token_metrics", {})
         self.assertTrue(metrics.get("fast_path"))
         self.assertEqual(metrics.get("input_tokens"), 0)
@@ -278,6 +322,44 @@ class TestWebSessionsAndTokens(unittest.TestCase):
         self.assertIn("session-list", res_html.text)
         self.assertIn("new-chat-btn", res_html.text)
 
+
+
+    def test_11_round3_item_3_cloudflare_fallback_opt_in(self):
+        """
+        Round 3 Item 3:
+        Make Cloudflare Quick Tunnel fallback opt-in via config (default off).
+        If ngrok fails and fallback is off, log it and do not expose the server.
+        """
+        from unittest.mock import patch
+        import web.server as srv
+
+        # Case A: Default configuration (fallback is OFF by default)
+        with patch.object(srv, "ensure_ngrok_tunnel", return_value={"status": "error", "public_url": ""}), \
+             patch.object(srv, "ensure_cloudflare_tunnel") as mock_cf, \
+             patch("uvicorn.Server.run"):
+            thread = srv.start_web_server_thread(
+                hub=self.hub,
+                port=8765,
+                config_path="config.json"
+            )
+            # Under Item 3, ensure_cloudflare_tunnel must NOT be called when fallback is off!
+            mock_cf.assert_not_called()
+            self.assertEqual(thread.cloudflare_info.get("public_url", ""), "")
+            self.assertEqual(thread.cloudflare_info.get("status"), "disabled")
+
+        # Case B: Explicitly opted in via config
+        custom_cfg = {"cloudflare_quick_tunnel_fallback": True}
+        with patch.object(srv, "load_web_config", return_value=custom_cfg), \
+             patch.object(srv, "ensure_ngrok_tunnel", return_value={"status": "error", "public_url": ""}), \
+             patch.object(srv, "ensure_cloudflare_tunnel", return_value={"status": "online", "public_url": "https://test.trycloudflare.com"}) as mock_cf_optin, \
+             patch("uvicorn.Server.run"):
+            thread_optin = srv.start_web_server_thread(
+                hub=self.hub,
+                port=8765,
+                config_path="config.json"
+            )
+            mock_cf_optin.assert_called_once()
+            self.assertEqual(thread_optin.cloudflare_info.get("public_url"), "https://test.trycloudflare.com")
 
 if __name__ == "__main__":
     unittest.main()

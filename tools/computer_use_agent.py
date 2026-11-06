@@ -35,14 +35,187 @@ class AutonomousComputerUseAgent:
     4. Hardware-Safe Anti-Cheat Guard: Pauses synthetic inputs when games are running.
     """
 
-    def __init__(self, gui_control: Any, spatial: Any, model_mgr: Any = None, chrome_mgr: Any = None, memory: Any = None):
+    MAX_STEPS = 15
+    MAX_CONSECUTIVE_FAILURES = 3
+    ALLOWED_AGENT_ACTIONS = frozenset({
+        "click", "press", "type", "hotkey", "navigate", "retry", "done",
+        "aborted_for_anticheat", "needs_help", "confirmation_required"
+    })
+    DEFAULT_ALLOWED_DOMAINS = (
+        "google.com",
+        "youtube.com",
+        "cinejoy.pk",
+        "example.com",
+        "wikipedia.org",
+        "github.com",
+    )
+
+    def __init__(self, gui_control: Any, spatial: Any, model_mgr: Any = None, chrome_mgr: Any = None, memory: Any = None, vault_dir: Optional[str] = None):
         self.gui = gui_control
         self.spatial = spatial
         self.model_mgr = model_mgr
         self.chrome_mgr = chrome_mgr
         self.memory = memory
+        self.vault_dir = vault_dir or os.environ.get("LIBRA_VAULT_DIR")
         self._playwright = None
         self._cdp_browser = None
+
+    @classmethod
+    def validate_agent_action(cls, action: str) -> bool:
+        """Bounded action allowlist check preventing arbitrary or unapproved action types."""
+        return bool((action or "").strip().lower() in cls.ALLOWED_AGENT_ACTIONS)
+
+    @classmethod
+    def get_allowed_domains(cls) -> List[str]:
+        """Loads allowlisted navigation domains from config.json (falls back to DEFAULT_ALLOWED_DOMAINS)."""
+        try:
+            cfg_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+            if os.path.exists(cfg_file):
+                with open(cfg_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                domains = (data.get("computer_use") or {}).get("allowed_domains")
+                if isinstance(domains, list) and domains:
+                    return [str(d).strip().lower() for d in domains if str(d).strip()]
+        except Exception:
+            pass
+        return list(cls.DEFAULT_ALLOWED_DOMAINS)
+
+    @classmethod
+    def get_workflow_post_conditions(cls) -> Dict[str, Any]:
+        """Loads verified workflow post-conditions from config.json."""
+        try:
+            cfg_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+            if os.path.exists(cfg_file):
+                with open(cfg_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return (data.get("computer_use") or {}).get("workflow_post_conditions") or {}
+        except Exception:
+            pass
+        return {}
+
+    @classmethod
+    def is_domain_allowed(cls, domain_or_url: str, allowed_domains: Optional[List[str]] = None) -> bool:
+        """Checks whether a target domain or URL hostname is on the configured allowlist."""
+        raw = (domain_or_url or "").strip().lower()
+        if not raw:
+            return True
+        host = re.sub(r"^https?://", "", raw).split("/")[0].split(":")[0].strip()
+        if host.startswith("www."):
+            host = host[4:]
+        allow = [d.lower().lstrip(".") for d in (allowed_domains or cls.get_allowed_domains())]
+        return any(host == d or host.endswith("." + d) for d in allow)
+
+    @classmethod
+    def check_action_risk(cls, action: str, **kwargs) -> Dict[str, Any]:
+        """
+        Round 2 Item B:
+        Evaluates argument-level risk for `type`, `press`, `hotkey`, and `navigate`.
+        Requires user confirmation (`status="confirmation_required"`) for:
+          1. Win+R or Win key launchers
+          2. Opening a terminal / PowerShell / cmd
+          3. Downloads or running executables
+          4. Typing into password or credential fields
+          5. Navigating to a domain not on the allowlist in config.json
+        """
+        act = (action or "").strip().lower()
+        key = str(kwargs.get("key") or "").strip().lower()
+        keys = [str(k).strip().lower() for k in (kwargs.get("keys") or [])]
+        text = str(kwargs.get("text") or "").strip()
+        text_low = text.lower()
+        url = str(kwargs.get("url") or kwargs.get("domain") or "").strip()
+        url_low = url.lower()
+        target_field = str(kwargs.get("target_field") or kwargs.get("role_hint") or "").strip().lower()
+        thought = str(kwargs.get("thought") or "").strip().lower()
+
+        combined_context = " ".join([key, " ".join(keys), text_low, url_low, target_field, thought])
+
+        # 1. Win+R or Win key launchers
+        win_keys = {"win", "lwin", "rwin", "windows", "super", "meta", "winleft", "winright"}
+        if act in ("press", "hotkey", "type"):
+            if key in win_keys or any(k in win_keys for k in keys):
+                return {
+                    "risky": True,
+                    "status": "confirmation_required",
+                    "reason": "Win key / Win+R system launcher requires explicit user confirmation.",
+                    "category": "win_launcher",
+                }
+            if re.search(r"\b(?:win|windows|super)\s*\+\s*[a-z0-9]\b", combined_context) or re.search(r"\b(?:lwin|rwin|winkey)\b", combined_context):
+                return {
+                    "risky": True,
+                    "status": "confirmation_required",
+                    "reason": "Win+R or Windows shortcut launcher requires explicit user confirmation.",
+                    "category": "win_launcher",
+                }
+
+        # 2. Opening a terminal / PowerShell / cmd
+        if act in ("type", "press", "hotkey", "navigate"):
+            if re.search(r"\b(?:powershell(?:\.exe)?|pwsh(?:\.exe)?|cmd(?:\.exe)?|wt\.exe| bash(?:\.exe)?|wsl(?:\.exe)?|command\s+prompt|terminal)\b", combined_context):
+                return {
+                    "risky": True,
+                    "status": "confirmation_required",
+                    "reason": "Opening or typing commands into a terminal/PowerShell/cmd requires explicit user confirmation.",
+                    "category": "terminal_execution",
+                }
+
+        # 3. Downloads or running executables
+        if act in ("type", "press", "hotkey", "navigate", "click"):
+            if re.search(r"\.(?:exe|msi|bat|cmd|ps1|vbs|scr|jar|reg)\b", combined_context) or re.search(r"\b(?:download|installer|setup|payload|execute)\b", combined_context):
+                return {
+                    "risky": True,
+                    "status": "confirmation_required",
+                    "reason": "Downloading or running an executable/script requires explicit user confirmation.",
+                    "category": "executable_or_download",
+                }
+
+        # 4. Typing into password or credential fields
+        if act == "type":
+            if re.search(r"\b(?:password|passwd|passcode|credential|secret|api[_\s-]?key|private[_\s-]?key|auth[_\s-]?token|totp|otp|pin\s+code|ssn|credit\s+card)\b", f"{target_field} {thought} {text_low}"):
+                return {
+                    "risky": True,
+                    "status": "confirmation_required",
+                    "reason": "Typing into a password or credential field requires explicit user confirmation.",
+                    "category": "credential_input",
+                }
+
+        # 5. Navigating to a domain not on the allowlist in config
+        if act == "navigate" or (act == "type" and kwargs.get("is_navigation")):
+            nav_target = url or text
+            if nav_target and not cls.is_domain_allowed(nav_target):
+                return {
+                    "risky": True,
+                    "status": "confirmation_required",
+                    "reason": f"Domain '{nav_target}' is not on the computer_use.allowed_domains allowlist in config.json.",
+                    "category": "unallowed_domain",
+                }
+
+        return {"risky": False, "status": "ok"}
+
+    @staticmethod
+    def sanitize_untrusted_screen_text(raw_text: str) -> str:
+        """
+        Prompt-injection defense for untrusted on-screen OCR / DOM / UIAutomation text.
+        Strips instruction-override patterns, shell commands, and role tags, and bounds length.
+        """
+        if not raw_text:
+            return ""
+        cleaned = str(raw_text)
+        injection_patterns = [
+            r"ignore\s+(?:all\s+)?(?:prior\s+|previous\s+)?instructions.*",
+            r"disregard\s+(?:all\s+)?(?:prior\s+|previous\s+)?instructions.*",
+            r"\bpowershell(?:\.exe)?\b.*",
+            r"\bremove-item\b.*",
+            r"\bcmd(?:\.exe)?\s+/[ck]\b.*",
+            r"\brm\s+-rf\b.*",
+            r"\bdel\s+/[fqs]\b.*",
+            r"\bformat\s+[a-z]:.*",
+            r"<\|im_start\|>.*",
+            r"<\|im_end\|>.*",
+            r"\b(?:system|assistant|developer)\s*:\s*.*",
+        ]
+        for pat in injection_patterns:
+            cleaned = re.sub(pat, "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"[\r\n\t]+", " ", cleaned).strip(" —-;:,.|")
+        return cleaned[:120]
 
     def _get_cdp_session(self, port: int = 9222):
         """Attempts to connect to an active Chrome instance over CDP on port 9222."""
@@ -109,7 +282,7 @@ class AutonomousComputerUseAgent:
         q = (prompt or "").strip()
         q_low = q.lower()
 
-        domain_match = re.search(r"\b([a-z0-9\-]+\.(?:com|org|net|pk|io|tv|to|gg|co|me|ai|edu)(?:/[^\s,]*)?)\b", q_low)
+        domain_match = re.search(r"\b([a-z0-9\-]+\.(?:com|org|net|pk|io|tv|to|gg|co|me|ai|edu|gov|xyz|info|biz|ru|cn|tk|top|site|online)(?:/[^\s,]*)?)\b", q_low)
         domain = domain_match.group(1) if domain_match else None
 
         # Extract search query: "find and search <X> and click <Y>" or "search for <X> and click <Y>"
@@ -249,17 +422,17 @@ class AutonomousComputerUseAgent:
 
         t_low = (target_text or "").lower().strip()
         try:
-            # 2. RapidOCR text boxes on live screen
+            # 2. RapidOCR text boxes on live screen (treated as untrusted data)
             ocr_boxes = self.spatial.extract_screen_text_ocr()
             for item in ocr_boxes:
-                txt = (item.get("text") or "").lower().strip()
-                if t_low and (t_low in txt or txt in t_low):
+                txt = self.sanitize_untrusted_screen_text(item.get("text") or "").lower().strip()
+                if t_low and txt and (t_low in txt or txt in t_low):
                     return int(item["center_x"]), int(item["center_y"])
 
-            # 3. UIAutomation / Set-of-Mark elements
+            # 3. UIAutomation / Set-of-Mark elements (treated as untrusted data)
             elements = self.spatial.detect_ui_elements(active_window_only=True)
             for el in elements:
-                name = (el.get("name") or "").lower().strip()
+                name = self.sanitize_untrusted_screen_text(el.get("name") or "").lower().strip()
                 if t_low and name and (t_low in name or name in t_low):
                     return int(el["center_x"]), int(el["center_y"])
         except Exception:
@@ -329,11 +502,17 @@ class AutonomousComputerUseAgent:
 
         return {"popup_detected": False}
 
+    def is_game_mode_active(self) -> bool:
+        """Returns True if Gaming Shield / Anti-Cheat Safe Mode is currently active."""
+        gov = get_vram_governor()
+        return bool(gov and gov.is_gaming_lite_mode())
+
     def execute_task(
         self,
         prompt: str,
         dry_run: bool = False,
-        step_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+        step_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        post_condition: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Executes the Observe -> Think -> Act -> Verify loop and returns both:
@@ -341,8 +520,7 @@ class AutonomousComputerUseAgent:
         - `thought_steps`: UI-compatible step cards for the Web/Mobile Thought Process box
         """
         # Anti-cheat safety guard: never send synthetic mouse/keyboard inputs while a game is running
-        gov = get_vram_governor()
-        if not dry_run and gov and gov.is_gaming_lite_mode():
+        if not dry_run and self.is_game_mode_active():
             blocked_step = {
                 "step": 1,
                 "thought": "Protected game / anti-cheat detected. Paused synthetic mouse & keyboard automation to keep Anti-Cheat Safe Mode 100% compliant.",
@@ -369,9 +547,62 @@ class AutonomousComputerUseAgent:
         agent_trace: List[Dict[str, Any]] = []
         thought_steps: List[Dict[str, str]] = []
         step_num = 1
+        consecutive_failures = 0
+
+        def _confirmation_required_exit(risk_info: Dict[str, Any], attempted_action: str, **AttemptKwargs) -> Dict[str, Any]:
+            reason = risk_info.get("reason") or "High-risk computer-use action requires explicit user confirmation."
+            entry: Dict[str, Any] = {
+                "step": step_num,
+                "thought": f"Paused for user confirmation: {reason}",
+                "action": "confirmation_required",
+                "attempted_action": attempted_action,
+                "risk_category": risk_info.get("category", "risky_action"),
+            }
+            entry.update(AttemptKwargs)
+            agent_trace.append(entry)
+            thought_steps.append({
+                "step": f"Step {step_num}: CONFIRMATION REQUIRED",
+                "title": f"Confirmation Required ({risk_info.get('category', 'risky_action')})",
+                "status": "confirmation_required",
+                "detail": reason,
+            })
+            return {
+                "action": "computer_use_agent",
+                "status": "confirmation_required",
+                "reason": reason,
+                "risk_category": risk_info.get("category", "risky_action"),
+                "domain": domain,
+                "search_query": search_q,
+                "click_target": click_target,
+                "agent_trace": agent_trace,
+                "thought_steps": thought_steps,
+                "voice_response": f"Confirmation required before proceeding: {reason}",
+                "learned_workflow_saved": False,
+            }
+
+        # Pre-flight prompt & goal risk gates (never execute even Step 1 if prompt requests Win+R, terminal, password entry, or executable download)
+        prompt_risk = self.check_action_risk("type", text=prompt, thought=prompt)
+        if prompt_risk.get("status") == "confirmation_required":
+            return _confirmation_required_exit(prompt_risk, "type", text=prompt)
+
+        nav_risk = self.check_action_risk("navigate", domain=domain, url=domain)
+        if nav_risk.get("status") == "confirmation_required":
+            return _confirmation_required_exit(nav_risk, "navigate", domain=domain)
+
+        if search_q:
+            sq_risk = self.check_action_risk("type", text=search_q, target_field="search_input")
+            if sq_risk.get("status") == "confirmation_required":
+                return _confirmation_required_exit(sq_risk, "type", text=search_q)
+
+        if click_target:
+            ct_risk = self.check_action_risk("click", text=click_target, thought=f"click {click_target}")
+            if ct_risk.get("status") == "confirmation_required":
+                return _confirmation_required_exit(ct_risk, "click", target=click_target)
 
         def _record_step(thought: str, action: str, status: str = "completed", pace: Optional[float] = None, **kwargs):
             nonlocal step_num
+            if not self.validate_agent_action(action):
+                raise ValueError(f"Disallowed computer-use action '{action}' blocked by allowlist.")
             # Natural agent execution cadence so steps execute and stream one by one
             if step_callback:
                 pause = pace if pace is not None else (0.45 if not dry_run else 0.35)
@@ -436,6 +667,30 @@ class AutonomousComputerUseAgent:
                 except Exception:
                     pass
 
+        def _track_action_outcome(res_obj: Optional[Dict[str, Any]]) -> bool:
+            nonlocal consecutive_failures
+            if isinstance(res_obj, dict) and res_obj.get("status") in ("error", "paused_for_anticheat"):
+                consecutive_failures += 1
+            else:
+                consecutive_failures = 0
+            return consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES
+
+        def _needs_help_exit(reason: str = "") -> Dict[str, Any]:
+            msg = reason or f"Encountered {consecutive_failures} consecutive action failures; pausing autonomous loop and requesting user assistance."
+            _record_step(msg, "needs_help", status="needs_help")
+            return {
+                "action": "computer_use_agent",
+                "status": "needs_help",
+                "domain": domain,
+                "search_query": search_q,
+                "click_target": click_target,
+                "consecutive_failures": consecutive_failures,
+                "agent_trace": agent_trace,
+                "thought_steps": thought_steps,
+                "voice_response": msg,
+                "learned_workflow_saved": False,
+            }
+
         # ------------------------------------------------------------------
         # STEP 1: Open / Focus Google Chrome
         # ------------------------------------------------------------------
@@ -448,9 +703,13 @@ class AutonomousComputerUseAgent:
         )
         if not dry_run:
             focused = self.gui.focus_window_by_title("Google Chrome") if self.gui else False
-            if not focused and self.chrome_mgr:
-                self.chrome_mgr.launch_chrome(dry_run=False)
-                time.sleep(0.8)
+            if not focused:
+                if self.chrome_mgr:
+                    self.chrome_mgr.launch_chrome(dry_run=False)
+                    time.sleep(0.8)
+                elif self.gui:
+                    if _track_action_outcome(self.gui.click(x=chrome_x, y=chrome_y, dry_run=False)):
+                        return _needs_help_exit()
 
         # ------------------------------------------------------------------
         # STEP 2: Open a New Tab (Ctrl+T)
@@ -461,7 +720,8 @@ class AutonomousComputerUseAgent:
             key="ctrl+t"
         )
         if not dry_run and self.gui:
-            self.gui.hotkey("ctrl", "t", dry_run=False)
+            if _track_action_outcome(self.gui.hotkey("ctrl", "t", dry_run=False)):
+                return _needs_help_exit()
             time.sleep(0.25)
 
         # ------------------------------------------------------------------
@@ -473,7 +733,8 @@ class AutonomousComputerUseAgent:
             key="ctrl+l"
         )
         if not dry_run and self.gui:
-            self.gui.hotkey("ctrl", "l", dry_run=False)
+            if _track_action_outcome(self.gui.hotkey("ctrl", "l", dry_run=False)):
+                return _needs_help_exit()
             time.sleep(0.15)
 
         # ------------------------------------------------------------------
@@ -497,7 +758,8 @@ class AutonomousComputerUseAgent:
             text=domain
         )
         if not dry_run and self.gui:
-            self.gui.type_text(domain, interval=0.01, dry_run=False)
+            if _track_action_outcome(self.gui.type_text(domain, interval=0.01, dry_run=False)):
+                return _needs_help_exit()
             time.sleep(0.1)
 
         _record_step(
@@ -506,7 +768,8 @@ class AutonomousComputerUseAgent:
             key="enter"
         )
         if not dry_run and self.gui:
-            self.gui.press_key("enter", dry_run=False)
+            if _track_action_outcome(self.gui.press_key("enter", dry_run=False)):
+                return _needs_help_exit()
             time.sleep(1.5)
 
         # Check for immediate initial pop-up on page load
@@ -532,7 +795,8 @@ class AutonomousComputerUseAgent:
                 y=s_icon_y
             )
             if not dry_run and self.gui:
-                self.gui.click(x=s_icon_x, y=s_icon_y, dry_run=False)
+                if _track_action_outcome(self.gui.click(x=s_icon_x, y=s_icon_y, dry_run=False)):
+                    return _needs_help_exit()
                 time.sleep(0.4)
 
             # Pop-Up Tab Guard: Streaming sites often pop an ad on first click
@@ -554,7 +818,8 @@ class AutonomousComputerUseAgent:
                 y=s_box_y
             )
             if not dry_run and self.gui:
-                self.gui.click(x=s_box_x, y=s_box_y, dry_run=False)
+                if _track_action_outcome(self.gui.click(x=s_box_x, y=s_box_y, dry_run=False)):
+                    return _needs_help_exit()
                 time.sleep(0.25)
 
             # 8. Type search query & press Enter
@@ -564,8 +829,10 @@ class AutonomousComputerUseAgent:
                 text=search_q
             )
             if not dry_run and self.gui:
-                self.gui.type_text(search_q, interval=0.01, dry_run=False)
-                self.gui.press_key("enter", dry_run=False)
+                if _track_action_outcome(self.gui.type_text(search_q, interval=0.01, dry_run=False)):
+                    return _needs_help_exit()
+                if _track_action_outcome(self.gui.press_key("enter", dry_run=False)):
+                    return _needs_help_exit()
                 time.sleep(1.2)
 
             # 9. Click on matching result card (DOM / OCR Grounded)
@@ -577,7 +844,8 @@ class AutonomousComputerUseAgent:
                 y=res_y
             )
             if not dry_run and self.gui:
-                self.gui.click(x=res_x, y=res_y, dry_run=False)
+                if _track_action_outcome(self.gui.click(x=res_x, y=res_y, dry_run=False)):
+                    return _needs_help_exit()
                 time.sleep(1.0)
 
             # Pop-Up Tab Guard: Opening movie/series result often spawns an ad tab
@@ -593,6 +861,7 @@ class AutonomousComputerUseAgent:
         # ------------------------------------------------------------------
         # STEP 10–11: Click Target Button (e.g. 'Resume' / 'Play') with Self-Verification
         # ------------------------------------------------------------------
+        verified_click = True
         if click_target:
             btn_x, btn_y = self._find_text_on_screen(click_target, dry_run=dry_run, default_xy=(157, 620), role_hint="button")
             _record_step(
@@ -601,10 +870,11 @@ class AutonomousComputerUseAgent:
                 x=btn_x,
                 y=btn_y
             )
-            verified_click = True
             if not dry_run and self.gui:
                 c_res = self.gui.click(x=btn_x, y=btn_y, dry_run=False)
-                verified_click = bool(c_res.get("verified_change", True))
+                if _track_action_outcome(c_res):
+                    return _needs_help_exit()
+                verified_click = bool(c_res.get("verified_change", True)) and c_res.get("status") != "error"
                 time.sleep(0.6)
 
             # Check if clicking resume triggered a pop-up tab
@@ -627,12 +897,42 @@ class AutonomousComputerUseAgent:
                 y=modal_y
             )
             if not dry_run and self.gui:
-                self.gui.click(x=modal_x, y=modal_y, dry_run=False)
+                c_res_modal = self.gui.click(x=modal_x, y=modal_y, dry_run=False)
+                if _track_action_outcome(c_res_modal):
+                    return _needs_help_exit()
+                verified_click = bool(c_res_modal.get("verified_change", verified_click)) and c_res_modal.get("status") != "error"
                 time.sleep(0.3)
 
         # ------------------------------------------------------------------
-        # FINAL STEP: Done
+        # FINAL STEP: Verify End State Before Caching Workflow
         # ------------------------------------------------------------------
+        # Round 3 Item 6 & Round 4 Item 8: Enforce workflow template or user config provenance for post-conditions
+        effective_post_condition = None
+        config_post_conditions = self.get_workflow_post_conditions()
+        if post_condition:
+            prov = post_condition.get("provenance")
+            if prov in ("untrusted_llm", "model", "untrusted"):
+                if domain and domain in config_post_conditions:
+                    effective_post_condition = dict(config_post_conditions[domain])
+                else:
+                    effective_post_condition = None
+            else:
+                effective_post_condition = dict(post_condition)
+        elif domain and domain in config_post_conditions:
+            effective_post_condition = dict(config_post_conditions[domain])
+        else:
+            # Model plan (from parsed) cannot forge template provenance; untrusted LLM plan post-conditions are rejected
+            effective_post_condition = None
+        end_state_verified = self._verify_end_state(
+            domain=domain,
+            search_query=search_q,
+            click_target=click_target,
+            verified_click=verified_click,
+            consecutive_failures=consecutive_failures,
+            dry_run=dry_run,
+            post_condition=effective_post_condition,
+        )
+
         summary_target = (search_q or domain).title()
         domain_name = domain.split('.')[0].title() if '.' in domain else domain.title()
         _record_step(
@@ -640,8 +940,11 @@ class AutonomousComputerUseAgent:
             "done"
         )
 
-        # Autonomous Memory Learning & Reflexion Persistence ("remember how she did it")
-        self._save_learned_workflow(prompt, domain, search_q, click_target, agent_trace)
+        # Autonomous Memory Learning & Reflexion Persistence: ONLY save when end state is verified!
+        learned_saved = False
+        if end_state_verified:
+            self._save_learned_workflow(prompt, domain, search_q, click_target, agent_trace)
+            learned_saved = True
 
         voice_msg = f"Completed all {len(agent_trace)} steps: opened Chrome, navigated to {domain}"
         if search_q:
@@ -653,15 +956,124 @@ class AutonomousComputerUseAgent:
 
         return {
             "action": "computer_use_agent",
-            "status": "success",
+            "status": "success" if end_state_verified else "unverified",
             "domain": domain,
             "search_query": search_q,
             "click_target": click_target,
+            "post_condition": effective_post_condition,
             "agent_trace": agent_trace,
             "thought_steps": thought_steps,
             "voice_response": voice_msg,
-            "learned_workflow_saved": True
+            "learned_workflow_saved": learned_saved
         }
+
+    def _get_live_terminal_state(self) -> Dict[str, str]:
+        """Collects live window title, active browser URL, and on-screen OCR/UI text for post-condition verification."""
+        win_title = ""
+        current_url = ""
+        screen_texts: List[str] = []
+
+        # 1. CDP Browser URL & page title
+        _, browser = self._get_cdp_session()
+        if browser:
+            try:
+                if browser.contexts and browser.contexts[0].pages:
+                    page = browser.contexts[0].pages[-1]
+                    current_url = (page.url or "").strip()
+                    win_title = (page.title() or "").strip()
+            except Exception:
+                pass
+
+        # 2. OS Foreground window title
+        if not win_title and HAS_WIN32:
+            try:
+                hwnd = win32gui.GetForegroundWindow()
+                if hwnd:
+                    win_title = (win32gui.GetWindowText(hwnd) or "").strip()
+            except Exception:
+                pass
+
+        # 3. Spatial OCR and UIAutomation elements
+        if self.spatial:
+            try:
+                for item in (self.spatial.extract_screen_text_ocr() or []):
+                    txt = self.sanitize_untrusted_screen_text(item.get("text") or "")
+                    if txt:
+                        screen_texts.append(txt)
+            except Exception:
+                pass
+            try:
+                for el in (self.spatial.detect_ui_elements(active_window_only=True) or []):
+                    name = self.sanitize_untrusted_screen_text(el.get("name") or "")
+                    if name:
+                        screen_texts.append(name)
+                        if not win_title:
+                            win_title = name
+            except Exception:
+                pass
+
+        return {
+            "window_title": win_title,
+            "url": current_url,
+            "screen_text": " | ".join(screen_texts),
+        }
+
+    def _verify_end_state(
+        self,
+        domain: str,
+        search_query: Optional[str],
+        click_target: Optional[str],
+        verified_click: bool = True,
+        consecutive_failures: int = 0,
+        dry_run: bool = False,
+        post_condition: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """
+        Round 2 Item C:
+        Verifies a concrete post-condition per workflow (expected_title, expected_url,
+        or expected_screen_text defined with the workflow) before persisting any learned
+        workflow to the Obsidian Vault or PreAct macro cache.
+        If a workflow has no concrete post-condition defined, returns False so the run
+        is marked "unverified" and never cached as verified.
+        """
+        if consecutive_failures > 0:
+            return False
+        if click_target and not verified_click:
+            return False
+
+        # Must have a concrete post-condition defined with the workflow
+        if not isinstance(post_condition, dict) or not post_condition:
+            return False
+
+        exp_title = str(post_condition.get("expected_title") or "").strip().lower()
+        exp_url = str(post_condition.get("expected_url") or "").strip().lower()
+        exp_text = str(post_condition.get("expected_screen_text") or "").strip().lower()
+
+        if not (exp_title or exp_url or exp_text):
+            return False
+
+        live = self._get_live_terminal_state()
+        live_title = live.get("window_title", "").lower()
+        live_url = live.get("url", "").lower()
+        live_text = live.get("screen_text", "").lower()
+        combined_live = f"{live_title} {live_url} {live_text}".strip()
+
+        # In dry_run mode with no spatial/CDP mock attached, allow simulated verification if simulated_state is provided
+        sim = post_condition.get("simulated_state")
+        if dry_run and isinstance(sim, dict):
+            live_title = str(sim.get("window_title") or live_title).lower()
+            live_url = str(sim.get("url") or live_url).lower()
+            live_text = str(sim.get("screen_text") or live_text).lower()
+            combined_live = f"{live_title} {live_url} {live_text}".strip()
+
+        if exp_title and exp_title not in live_title and exp_title not in combined_live:
+            return False
+        if exp_url and exp_url not in live_url and exp_url not in combined_live:
+            return False
+        if exp_text and exp_text not in live_text and exp_text not in combined_live:
+            return False
+
+        return True
 
     def _save_learned_workflow(
         self,
@@ -704,7 +1116,7 @@ class AutonomousComputerUseAgent:
 
         # 2. Save to Obsidian Vault Markdown (Permanent Human & Agent Readable)
         try:
-            vault_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "vault")
+            vault_dir = getattr(self, "vault_dir", None) or os.environ.get("LIBRA_VAULT_DIR") or os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "assets", "vault")
             os.makedirs(vault_dir, exist_ok=True)
             vault_file = os.path.join(vault_dir, f"learned_workflow_{clean_domain}.md")
 
@@ -736,3 +1148,5 @@ class AutonomousComputerUseAgent:
                 f.write(content)
         except Exception as vault_err:
             print(f"[VAULT SAVE ERROR] {vault_err}")
+
+    _save_learned_workflow_to_vault = _save_learned_workflow

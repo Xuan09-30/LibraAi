@@ -9,9 +9,593 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="icon" type="image/png" href="/static/icon.png">
-  <link rel="stylesheet" href="/static/style.css?v=10.6.5">
-  <link rel="stylesheet" href="/static/prism.css?v=10.5.2">
+  <link rel="stylesheet" href="/static/tokens.css?v=2026110502">
+  <link rel="stylesheet" href="/static/style.css?v=2026110502">
+  <link rel="stylesheet" href="/static/prism.css?v=2026110502">
   <script src="/static/three.min.js"></script>
+  <!-- CRITICAL INLINE MODAL STYLES (IMMUNE TO BROWSER STYLESHEET CACHING) -->
+      <style id="critical-modal-styles">
+    /* ========================================================================
+       REVAMPED CYBERNETIC CRITICAL MODAL STYLES (AUTH & VAULT)
+       ======================================================================== */
+    /* MODAL OVERLAYS */
+    #auth-modal.modal-overlay, #vault-modal.modal-overlay {
+      position: fixed !important;
+      inset: 0 !important;
+      background: rgba(0, 0, 0, 0.8) !important;
+      backdrop-filter: blur(14px) !important;
+      -webkit-backdrop-filter: blur(14px) !important;
+      display: none;
+      align-items: center !important;
+      justify-content: center !important;
+      z-index: 100000 !important;
+      padding: 16px !important;
+      box-sizing: border-box !important;
+    }
+    #auth-modal.modal-overlay.open, #auth-modal.modal-overlay.active,
+    #vault-modal.modal-overlay.open, #vault-modal.modal-overlay.active {
+      display: flex !important;
+    }
+
+    /* SHARED MODAL HEADER & CLOSE BUTTON */
+    .modal-header,
+    .vault-modal-content .modal-header,
+    .auth-modal-clean .auth-modal-top-header {
+      display: flex !important;
+      align-items: center !important;
+      justify-content: space-between !important;
+      width: 100% !important;
+      box-sizing: border-box !important;
+      background: transparent !important;
+    }
+    .vault-modal-content .modal-header {
+      padding: 14px 20px !important;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+    }
+    .auth-modal-clean .auth-modal-top-header {
+      padding-bottom: 12px !important;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+      margin-bottom: 4px !important;
+    }
+    .modal-header-title {
+      display: flex !important;
+      align-items: center !important;
+      gap: 8px !important;
+      min-width: 0 !important;
+    }
+    .modal-close-btn {
+      display: inline-flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      width: 32px !important;
+      height: 32px !important;
+      min-width: 32px !important;
+      min-height: 32px !important;
+      background: rgba(255, 255, 255, 0.06) !important;
+      border: 1px solid rgba(255, 255, 255, 0.12) !important;
+      border-radius: 8px !important;
+      color: #94a3b8 !important;
+      cursor: pointer !important;
+      padding: 0 !important;
+      transition: all 0.15s ease !important;
+      flex-shrink: 0 !important;
+      outline: none !important;
+    }
+    .modal-close-btn:hover {
+      background: rgba(239, 68, 68, 0.2) !important;
+      border-color: rgba(239, 68, 68, 0.45) !important;
+      color: #fca5a5 !important;
+      transform: scale(1.05) !important;
+    }
+
+    /* AUTH MODAL CONTAINER - RESTRAINED LINEAR STYLE */
+    .auth-modal-clean {
+      max-width: 400px !important;
+      width: 92% !important;
+      padding: 24px !important;
+      background: #11141c !important;
+      border: 1px solid rgba(255, 255, 255, 0.1) !important;
+      border-radius: 12px !important;
+      box-shadow: 0 20px 48px rgba(0, 0, 0, 0.7) !important;
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 16px !important;
+      box-sizing: border-box !important;
+      color: #f8fafc !important;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+    }
+    .auth-modal-clean .auth-modal-top-header {
+      display: flex !important;
+      align-items: center !important;
+      justify-content: space-between !important;
+      padding-bottom: 12px !important;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+      margin-bottom: 0 !important;
+    }
+    .auth-header-title-clean {
+      font-size: 15px !important;
+      font-weight: 600 !important;
+      color: #f8fafc !important;
+      letter-spacing: normal !important;
+    }
+    .auth-clean-header {
+      display: flex !important;
+      flex-direction: column !important;
+      align-items: flex-start !important;
+      text-align: left !important;
+      gap: 6px !important;
+      margin-bottom: 2px !important;
+    }
+    .auth-clean-title {
+      font-size: 20px !important;
+      font-weight: 600 !important;
+      color: #f8fafc !important;
+      margin: 0 !important;
+      letter-spacing: -0.2px !important;
+    }
+    .auth-clean-subtitle {
+      font-size: 13px !important;
+      color: #94a3b8 !important;
+      margin: 0 !important;
+      line-height: 1.5 !important;
+      max-width: 100% !important;
+    }
+    .oauth-buttons-column {
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 8px !important;
+      width: 100% !important;
+      margin-top: 4px !important;
+    }
+
+    /* OAUTH BUTTONS - SECONDARY OUTLINED CARDS */
+    .google-sign-in-clean-btn,
+    .github-sign-in-clean-btn {
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      gap: 10px !important;
+      width: 100% !important;
+      height: 42px !important;
+      min-height: 42px !important;
+      background: #171b26 !important;
+      color: #f8fafc !important;
+      font-size: 13.5px !important;
+      font-weight: 500 !important;
+      border-radius: 8px !important;
+      text-decoration: none !important;
+      border: 1px solid rgba(255, 255, 255, 0.12) !important;
+      box-shadow: none !important;
+      cursor: pointer !important;
+      box-sizing: border-box !important;
+      transition: background 0.15s ease, border-color 0.15s ease !important;
+    }
+    .google-sign-in-clean-btn:hover,
+    .github-sign-in-clean-btn:hover {
+      background: #1f2533 !important;
+      border-color: rgba(255, 255, 255, 0.22) !important;
+    }
+    .google-sign-in-clean-btn span,
+    .github-sign-in-clean-btn span {
+      color: #f8fafc !important;
+      font-weight: 500 !important;
+    }
+
+    /* DIVIDER */
+    .auth-divider {
+      display: flex !important;
+      align-items: center !important;
+      gap: 12px !important;
+      width: 100% !important;
+      margin: 6px 0 !important;
+    }
+    .auth-divider-line {
+      flex: 1 !important;
+      height: 1px !important;
+      background: rgba(255, 255, 255, 0.08) !important;
+    }
+    .auth-divider-text {
+      font-size: 12px !important;
+      color: #64748b !important;
+      text-transform: none !important;
+      letter-spacing: normal !important;
+      font-weight: 400 !important;
+      white-space: nowrap !important;
+    }
+
+    /* TOKEN INPUT BOX */
+    .auth-token-box {
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 10px !important;
+      width: 100% !important;
+    }
+    .auth-token-input {
+      display: block !important;
+      width: 100% !important;
+      height: 42px !important;
+      min-height: 42px !important;
+      box-sizing: border-box !important;
+      background: #141722 !important;
+      border: 1px solid rgba(255, 255, 255, 0.12) !important;
+      border-radius: 8px !important;
+      padding: 0 12px !important;
+      color: #f8fafc !important;
+      font-size: 13.5px !important;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+      outline: none !important;
+      overflow: hidden !important;
+      text-overflow: ellipsis !important;
+      white-space: nowrap !important;
+      transition: border-color 0.15s ease !important;
+    }
+    .auth-token-input:focus {
+      border-color: #00d2ff !important;
+      box-shadow: 0 0 0 2px rgba(0, 210, 255, 0.18) !important;
+    }
+    .auth-token-input::placeholder {
+      color: #64748b !important;
+      text-overflow: ellipsis !important;
+    }
+
+    /* BUTTON ACTIONS ROW */
+    .auth-actions-row {
+      display: flex !important;
+      gap: 8px !important;
+      width: 100% !important;
+    }
+    /* PRIMARY BUTTON: SINGLE CYAN ACTION */
+    .auth-btn-primary {
+      flex: 1 !important;
+      height: 42px !important;
+      min-height: 42px !important;
+      display: inline-flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      gap: 6px !important;
+      background: #00d2ff !important;
+      color: #090d16 !important;
+      font-weight: 600 !important;
+      font-size: 13.5px !important;
+      border: none !important;
+      border-radius: 8px !important;
+      cursor: pointer !important;
+      box-shadow: none !important;
+      transition: background 0.15s ease, opacity 0.15s ease !important;
+    }
+    .auth-btn-primary:hover {
+      background: #38bdf8 !important;
+      opacity: 0.95 !important;
+      transform: none !important;
+      box-shadow: none !important;
+    }
+    /* SECONDARY BUTTON: OUTLINED */
+    .auth-btn-secondary {
+      flex: 1 !important;
+      height: 42px !important;
+      min-height: 42px !important;
+      display: inline-flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      gap: 6px !important;
+      background: transparent !important;
+      color: #f1f5f9 !important;
+      font-weight: 500 !important;
+      font-size: 13.5px !important;
+      border: 1px solid rgba(255, 255, 255, 0.14) !important;
+      border-radius: 8px !important;
+      cursor: pointer !important;
+      transition: background 0.15s ease, border-color 0.15s ease !important;
+    }
+    .auth-btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.05) !important;
+      border-color: rgba(255, 255, 255, 0.25) !important;
+      color: #ffffff !important;
+    }
+    @media (max-width: 480px) {
+      .auth-modal-clean {
+        padding: 20px 16px !important;
+        width: 95% !important;
+      }
+      .auth-actions-row {
+        flex-direction: column !important;
+        gap: 8px !important;
+      }
+      .auth-btn-primary,
+      .auth-btn-secondary {
+        width: 100% !important;
+        flex: unset !important;
+      }
+    }
+
+    /* VAULT MODAL CONTAINER - RESTRAINED LINEAR STYLE */
+    .vault-modal-content {
+      max-width: 820px !important;
+      width: 92% !important;
+      max-height: 85vh !important;
+      display: flex !important;
+      flex-direction: column !important;
+      background: #0f121a !important;
+      border: 1px solid rgba(255, 255, 255, 0.1) !important;
+      border-radius: 12px !important;
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.75) !important;
+      overflow: hidden !important;
+      box-sizing: border-box !important;
+      color: #f8fafc !important;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+    }
+    .vault-header-text {
+      font-size: 16px !important;
+      font-weight: 600 !important;
+      color: #f8fafc !important;
+      letter-spacing: normal !important;
+    }
+    .vault-header-sub {
+      font-size: 12px !important;
+      font-weight: 400 !important;
+      color: #94a3b8 !important;
+      margin-left: 10px !important;
+      background: transparent !important;
+      border: none !important;
+      padding: 0 !important;
+      border-radius: 0 !important;
+      letter-spacing: normal !important;
+    }
+
+    /* VAULT TOOLBAR STRIP */
+    .vault-modal-controls {
+      display: flex !important;
+      gap: 10px !important;
+      align-items: center !important;
+      padding: 12px 18px !important;
+      background: #131722 !important;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08) !important;
+      box-sizing: border-box !important;
+    }
+    .vault-search-wrapper {
+      position: relative !important;
+      flex: 1 !important;
+      display: flex !important;
+      align-items: center !important;
+      min-width: 0 !important;
+    }
+    .vault-search-icon {
+      position: absolute !important;
+      left: 11px !important;
+      color: #64748b !important;
+      pointer-events: none !important;
+    }
+    .vault-search-input {
+      height: 38px !important;
+      width: 100% !important;
+      padding-left: 34px !important;
+      padding-right: 12px !important;
+      background: #0d1017 !important;
+      border: 1px solid rgba(255, 255, 255, 0.12) !important;
+      border-radius: 8px !important;
+      color: #f8fafc !important;
+      font-size: 13px !important;
+      outline: none !important;
+      box-sizing: border-box !important;
+      overflow: hidden !important;
+      text-overflow: ellipsis !important;
+      white-space: nowrap !important;
+      transition: border-color 0.15s ease !important;
+    }
+    .vault-search-input:focus {
+      border-color: #00d2ff !important;
+      box-shadow: 0 0 0 2px rgba(0, 210, 255, 0.18) !important;
+    }
+    .vault-search-input::placeholder {
+      color: #64748b !important;
+      text-overflow: ellipsis !important;
+    }
+    .vault-filter-wrapper {
+      min-width: 140px !important;
+    }
+    .vault-category-select {
+      height: 38px !important;
+      width: 100% !important;
+      padding: 0 10px !important;
+      background: #0d1017 !important;
+      border: 1px solid rgba(255, 255, 255, 0.12) !important;
+      border-radius: 8px !important;
+      color: #f8fafc !important;
+      font-size: 13px !important;
+      outline: none !important;
+      cursor: pointer !important;
+      box-sizing: border-box !important;
+      transition: border-color 0.15s ease !important;
+    }
+    .vault-category-select:focus {
+      border-color: #00d2ff !important;
+    }
+
+    /* VAULT ADD BUTTON: SINGLE PRIMARY CYAN BUTTON */
+    .vault-add-btn {
+      height: 38px !important;
+      min-height: 38px !important;
+      padding: 0 14px !important;
+      display: inline-flex !important;
+      align-items: center !important;
+      gap: 6px !important;
+      background: #00d2ff !important;
+      color: #090d16 !important;
+      font-weight: 600 !important;
+      font-size: 13px !important;
+      border: none !important;
+      border-radius: 8px !important;
+      cursor: pointer !important;
+      white-space: nowrap !important;
+      box-shadow: none !important;
+      transition: background 0.15s ease, opacity 0.15s ease !important;
+    }
+    .vault-add-btn:hover {
+      background: #38bdf8 !important;
+      opacity: 0.95 !important;
+      box-shadow: none !important;
+      transform: none !important;
+    }
+
+    /* VAULT CARDS GRID & CARDS */
+    .vault-cards-grid {
+      padding: 16px 18px !important;
+      overflow-y: auto !important;
+      display: grid !important;
+      grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)) !important;
+      gap: 12px !important;
+      max-height: 520px !important;
+      box-sizing: border-box !important;
+    }
+    .vault-card {
+      background: #141824 !important;
+      border: 1px solid rgba(255, 255, 255, 0.08) !important;
+      border-radius: 8px !important;
+      padding: 14px 16px !important;
+      display: flex !important;
+      flex-direction: column !important;
+      gap: 10px !important;
+      box-sizing: border-box !important;
+      box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25) !important;
+      transition: border-color 0.15s ease, background 0.15s ease !important;
+    }
+    .vault-card:hover {
+      border-color: rgba(255, 255, 255, 0.18) !important;
+      background: #181d2a !important;
+      transform: none !important;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35) !important;
+    }
+    .vault-card.pinned {
+      border-color: rgba(245, 158, 11, 0.3) !important;
+      background: #171b26 !important;
+    }
+    .vault-card-header {
+      display: flex !important;
+      align-items: center !important;
+      justify-content: space-between !important;
+      gap: 8px !important;
+    }
+    .vault-card-header-left {
+      display: flex !important;
+      align-items: center !important;
+      gap: 8px !important;
+      min-width: 0 !important;
+      flex: 1 !important;
+    }
+    .vault-card-header-right {
+      display: flex !important;
+      align-items: center !important;
+      gap: 8px !important;
+      flex-shrink: 0 !important;
+    }
+    .vault-pin-btn {
+      width: 26px !important;
+      height: 26px !important;
+      display: inline-flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      background: transparent !important;
+      border: none !important;
+      color: #64748b !important;
+      font-size: 14px !important;
+      cursor: pointer !important;
+      padding: 0 !important;
+      transition: color 0.15s ease !important;
+    }
+    .vault-pin-btn:hover {
+      color: #f59e0b !important;
+    }
+    .vault-pin-btn.pinned {
+      color: #f59e0b !important;
+    }
+    .vault-card-key {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important;
+      font-size: 12px !important;
+      font-weight: 500 !important;
+      color: #94a3b8 !important;
+      background: rgba(255, 255, 255, 0.04) !important;
+      border: 1px solid rgba(255, 255, 255, 0.08) !important;
+      padding: 2px 7px !important;
+      border-radius: 4px !important;
+      max-width: 220px !important;
+      overflow: hidden !important;
+      text-overflow: ellipsis !important;
+      white-space: nowrap !important;
+    }
+    .vault-category-badge {
+      font-size: 11px !important;
+      font-weight: 500 !important;
+      color: #cbd5e1 !important;
+      background: rgba(255, 255, 255, 0.06) !important;
+      border: 1px solid rgba(255, 255, 255, 0.1) !important;
+      padding: 2px 8px !important;
+      border-radius: 4px !important;
+      letter-spacing: normal !important;
+      text-transform: none !important;
+    }
+    .vault-card-time {
+      font-size: 11px !important;
+      color: #64748b !important;
+    }
+    .vault-delete-btn {
+      width: 24px !important;
+      height: 24px !important;
+      display: inline-flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      background: transparent !important;
+      border: none !important;
+      color: #64748b !important;
+      cursor: pointer !important;
+      font-size: 12px !important;
+      padding: 0 !important;
+      transition: color 0.15s ease !important;
+    }
+    .vault-delete-btn:hover {
+      color: #ef4444 !important;
+    }
+    .vault-card-body {
+      background: rgba(0, 0, 0, 0.25) !important;
+      border: 1px solid rgba(255, 255, 255, 0.05) !important;
+      border-radius: 6px !important;
+      padding: 10px 12px !important;
+      font-size: 13.5px !important;
+      line-height: 1.5 !important;
+      color: #f1f5f9 !important;
+      word-break: break-word !important;
+    }
+
+    @media (max-width: 640px) {
+      .vault-modal-content {
+        width: 95% !important;
+        max-height: 90vh !important;
+      }
+      .vault-modal-controls {
+        flex-direction: column !important;
+        align-items: stretch !important;
+        gap: 8px !important;
+        padding: 12px 14px !important;
+      }
+      .vault-filter-wrapper {
+        min-width: unset !important;
+        width: 100% !important;
+      }
+      .vault-add-btn {
+        width: 100% !important;
+        justify-content: center !important;
+      }
+      .vault-cards-grid {
+        grid-template-columns: 1fr !important;
+        padding: 12px 14px !important;
+      }
+      .vault-card-key {
+        max-width: 160px !important;
+      }
+      .vault-card-time {
+        display: none !important;
+      }
+    }
+  </style>
 </head>
 <body>
   <div id="app-layout">
@@ -131,20 +715,20 @@
             <span>New Chat</span>
           </button>
           <span id="active-thread-title" class="active-thread-title">Main Chat</span>
-          <span class="scope-pill">ONLINE</span>
-          <span id="role-badge" class="role-badge guest" title="Access Role (Click to Sign In)" style="cursor: pointer;">🧪 GUEST</span>
+          <span class="scope-pill">Online</span>
+          <span id="role-badge" class="role-badge guest" title="Access Role (Click to Sign In)" style="cursor: pointer;">Guest</span>
         </div>
 
         <div class="header-right">
           <!-- BUG REPORT BUTTON (AVAILABLE TO ALL TESTERS & HOST) -->
           <button id="bug-nav-btn" class="header-action-btn" title="Report a Bug / Host Bug Reports">
-            <span>🐞 Bug</span>
+            <span>Report bug</span>
             <span id="bug-badge" class="nav-counter-badge" style="display: none;">0</span>
           </button>
 
           <!-- OPTIONS & SETTINGS BUTTON -->
           <button id="options-nav-btn" class="header-action-btn" title="System Options, Custom Instructions & Host Tools">
-            <span>⚙️ Options</span>
+            <span>Settings</span>
           </button>
 
           <!-- HIDDEN TELEMETRY ANCHOR (ACCESSIBLE VIA HOST DRAWER & OPTIONS MODAL) -->
@@ -160,7 +744,7 @@
             <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
               <rect x="5" y="5" width="14" height="14" rx="2"></rect>
             </svg>
-            <span>STOP VOICE</span>
+            <span>Stop voice</span>
           </button>
 
           <!-- HARDWARE VITALS (HOST ONLY) -->
@@ -344,7 +928,7 @@
     <div class="modal-content" style="max-width: 650px; width: 94%;">
       <div class="modal-header">
         <div class="modal-header-title">
-          <span style="color: var(--neon-cyan);">⚙️ OPTIONS &amp; CUSTOM INSTRUCTIONS</span>
+          <span style="color: #f8fafc; font-weight: 600; font-size: 16px;">Settings</span>
         </div>
         <button id="close-options-modal" class="modal-close-btn" title="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -356,10 +940,10 @@
 
       <!-- OPTIONS TAB NAVIGATION -->
       <div class="options-tab-bar">
-        <button class="options-tab-btn active" data-tab="tab-profile">👤 Profile &amp; Instructions</button>
-        <button class="options-tab-btn host-only-btn" data-tab="tab-invites" style="display: none;">🔑 Invites &amp; Tunnel</button>
-        <button class="options-tab-btn host-only-btn" data-tab="tab-github" style="display: none;">🐙 GitHub Sync</button>
-        <button class="options-tab-btn host-only-btn" id="options-open-users-btn" style="display: none;">👥 Users</button>
+        <button class="options-tab-btn active" data-tab="tab-profile">Profile & Instructions</button>
+        <button class="options-tab-btn host-only-btn" data-tab="tab-invites" style="display: none;">Invites & Tunnel</button>
+        <button class="options-tab-btn host-only-btn" data-tab="tab-github" style="display: none;">GitHub Sync</button>
+        <button class="options-tab-btn host-only-btn" id="options-open-users-btn" style="display: none;">Users & Roles</button>
       </div>
 
       <div class="modal-body" style="max-height: 440px; overflow-y: auto;">
@@ -368,7 +952,7 @@
           <!-- CARD A: VOICE OUTPUT SPEECH SETTING -->
           <div class="options-settings-card">
             <div class="options-card-left">
-              <span class="options-card-title">🔊 Voice Output (Speech Aloud)</span>
+              <span class="options-card-title">Voice output</span>
               <span class="options-card-desc">Choose if Libra speaks aloud with neural voice (Kokoro-82M) or replies silently with text.</span>
             </div>
             <div class="options-card-right">
@@ -379,11 +963,11 @@
             </div>
           </div>
           <div id="voice-status-note" class="voice-status-note">
-            🔊 <strong>Speaking Aloud:</strong> Libra speaks every answer using high-speed neural voice.
+            <strong>Speaking aloud:</strong> Libra speaks every answer using high-speed neural voice.
           </div>
 
           <!-- CARD B: PREFERENCES & IDENTITY -->
-          <div class="options-settings-section-title">👤 Personal Profile</div>
+          <div class="options-settings-section-title">Personal profile</div>
           <p style="font-size: 12px; color: #a1a1aa; margin-bottom: 12px; line-height: 1.5;">
             Personalize how Libra addresses you and customizes daily weather &amp; briefings.
           </p>
@@ -400,7 +984,7 @@
           </div>
 
           <!-- CARD C: CUSTOM INSTRUCTIONS -->
-          <div class="options-settings-section-title" style="margin-top: 16px;">✨ Custom Instructions</div>
+          <div class="options-settings-section-title" style="margin-top: 16px;">Custom instructions</div>
           <div style="margin-bottom: 12px;">
             <label class="options-input-label">What should Libra know about you to provide better responses?</label>
             <textarea id="prof-about-input" class="auth-input" rows="3" placeholder="e.g. Preferred languages, daily workflow, hobbies, or personal background." style="margin: 0; width: 100%; resize: vertical;"></textarea>
@@ -417,8 +1001,8 @@
           </div>
 
           <div id="prof-status-msg" style="display: none; font-size: 12px; margin-bottom: 8px;"></div>
-          <button id="save-profile-btn" class="modal-btn primary" style="width: 100%;">💾 SAVE PREFERENCES &amp; INSTRUCTIONS</button>
-          <button id="options-token-telemetry-btn" type="button" class="modal-btn secondary" style="margin-top: 10px; width: 100%;">📊 View Real-Time GPU Token Telemetry</button>
+          <button id="save-profile-btn" class="modal-btn primary" style="width: 100%;">Save preferences</button>
+          <button id="options-token-telemetry-btn" type="button" class="modal-btn secondary" style="margin-top: 10px; width: 100%;">View token telemetry</button>
         </div>
 
         <!-- TAB 2: GUEST INVITES & CLOUDFLARE/NGROK TUNNEL -->
@@ -430,7 +1014,7 @@
           <div style="background: rgba(0, 242, 254, 0.05); border: 1px solid rgba(0, 242, 254, 0.2); border-radius: 8px; padding: 10px; margin-bottom: 12px;">
             <div style="font-size: 11px; color: #cbd5e1; font-weight: 600; margin-bottom: 4px;">🌐 Public Server Address (ngrok):</div>
             <div style="display: flex; gap: 6px;">
-              <input type="text" id="options-public-url" class="auth-input" value="https://smokiness-edition-overhaul.ngrok-free.dev" readonly style="margin: 0; flex: 1; font-family: monospace; font-size: 11px;">
+              <input type="text" id="options-public-url" class="auth-input" value="" placeholder="Auto-detected from active tunnel (/api/auth/me)" readonly style="margin: 0; flex: 1; font-family: monospace; font-size: 11px;">
               <button id="copy-public-url-btn" class="modal-btn" style="padding: 0 12px; font-size: 11px;">Copy</button>
             </div>
           </div>
@@ -474,8 +1058,8 @@
 
           <div id="options-gh-status-msg" style="display: none; font-size: 12px; margin-bottom: 8px;"></div>
           <div style="display: flex; gap: 8px;">
-            <button id="save-gh-config-btn" class="modal-btn primary" style="flex: 1;">💾 SAVE GITHUB TOKEN</button>
-            <button id="sync-pending-gh-btn" class="modal-btn" style="padding: 0 14px; font-size: 11px; background: rgba(168, 85, 247, 0.15); border: 1px solid rgba(168, 85, 247, 0.4); color: #c084fc;">🚀 Push Reports to GitHub</button>
+            <button id="save-gh-config-btn" class="modal-btn primary" style="flex: 1;">Save GitHub token</button>
+            <button id="sync-pending-gh-btn" class="modal-btn" style="padding: 0 14px; font-size: 11px; background: rgba(168, 85, 247, 0.15); border: 1px solid rgba(168, 85, 247, 0.4); color: #c084fc;">Push reports to GitHub</button>
           </div>
         </div>
 
@@ -496,7 +1080,7 @@
             <polyline points="3 6 5 6 21 6"/>
             <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
           </svg>
-          <span>DELETE CONVERSATION</span>
+          <span>Delete conversation</span>
         </div>
         <button id="close-delete-modal" class="modal-close-btn" title="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -508,8 +1092,8 @@
       <div class="modal-body">
         <p id="delete-modal-prompt" class="modal-prompt-text">Are you sure you want to delete this thread?</p>
         <div class="modal-action-row">
-          <button id="cancel-delete-btn" class="modal-btn secondary">CANCEL</button>
-          <button id="confirm-delete-btn" class="modal-btn danger">DELETE</button>
+          <button id="cancel-delete-btn" class="modal-btn secondary">Cancel</button>
+          <button id="confirm-delete-btn" class="modal-btn danger">Delete</button>
         </div>
       </div>
     </div>
@@ -526,7 +1110,7 @@
             <path d="M12 20h9"/>
             <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/>
           </svg>
-          <span>RENAME CONVERSATION</span>
+          <span>Rename conversation</span>
         </div>
         <button id="close-rename-modal" class="modal-close-btn" title="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -538,8 +1122,8 @@
       <div class="modal-body">
         <input type="text" id="rename-input" class="auth-input" placeholder="Enter thread title..." maxlength="60">
         <div class="modal-action-row">
-          <button id="cancel-rename-btn" class="modal-btn secondary">CANCEL</button>
-          <button id="confirm-rename-btn" class="modal-btn primary">SAVE</button>
+          <button id="cancel-rename-btn" class="modal-btn secondary">Cancel</button>
+          <button id="confirm-rename-btn" class="modal-btn primary">Save</button>
         </div>
       </div>
     </div>
@@ -561,62 +1145,74 @@
   </div>
 
   <!-- ========================================================================
-       MODAL: AUTHENTICATION (CYBERNETIC GATEWAY & ACCESS PORTAL)
+       MODAL: AUTHENTICATION
        ======================================================================== -->
   <div id="auth-modal" class="modal-overlay">
-    <div class="modal-content auth-modal-clean" style="max-width: 440px; width: 92%;">
-      <div class="modal-header">
+    <div class="modal-content auth-modal-clean">
+      <div class="modal-header auth-modal-top-header">
         <div class="modal-header-title">
-          <span style="color: #00f2fe;">✦ PROJECT LIBRA GATEWAY</span>
-          <span style="font-size: 11px; color: #64748b; margin-left: 8px;">ACCESS PORTAL</span>
+          <span class="auth-header-title-clean">Sign in</span>
         </div>
-        <button id="close-auth-modal-btn" class="modal-close-btn" title="Close">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <button id="close-auth-modal-btn" class="modal-close-btn" title="Close" type="button">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="18" y1="6" x2="6" y2="18"/>
             <line x1="6" y1="6" x2="18" y2="18"/>
           </svg>
         </button>
       </div>
 
-      <div class="modal-body auth-modal-body" style="padding-top: 6px;">
-        <div class="auth-clean-header" style="text-align: center; margin-bottom: 20px;">
-          <div class="auth-brand-badge">
-            <span class="auth-brand-sparkle">✦</span>
-            <span>NEURAL COGNITIVE ASSISTANT</span>
-          </div>
-          <h2 class="auth-clean-title" id="g-main-heading">Sign In to Continue</h2>
-          <p class="auth-clean-subtitle" id="g-sub-heading">Authenticate to access your private neural workspace, local LLMs, and real-time GPU telemetry.</p>
+      <div class="modal-body auth-modal-body">
+        <div class="auth-clean-header">
+          <h2 class="auth-clean-title" id="g-main-heading">Sign in to Libra</h2>
+          <p class="auth-clean-subtitle" id="g-sub-heading">Authenticate with your account to access sessions and sync preferences.</p>
         </div>
 
         <div id="auth-status-msg" class="auth-status-msg" style="display: none;"></div>
 
-        <!-- VIEW A: GOOGLE SIGN-IN -->
+        <!-- OAUTH PROVIDERS -->
         <div id="auth-view-google" class="auth-view-google">
-          <a href="/auth/google/login" class="google-sign-in-clean-btn" id="real-google-oauth-btn" title="Sign in with your Google Account">
-            <svg class="google-svg-clean" viewBox="0 0 24 24" width="20" height="20">
-              <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.8-2.4 3.66v3.04h3.88c2.28-2.09 3.66-5.17 3.66-9.14z"/>
-              <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.04c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.13C3.26 21.36 7.33 24 12 24z"/>
-              <path fill="#FBBC05" d="M5.28 14.28c-.24-.72-.38-1.49-.38-2.28s.14-1.56.38-2.28V6.59H1.25C.45 8.18 0 9.99 0 12s.45 3.82 1.25 5.41l4.03-3.13z"/>
-              <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.33 0 3.26 2.64 1.25 6.59l4.03 3.13c.95-2.83 3.6-4.97 6.72-4.97z"/>
-            </svg>
-            <span>Continue with Google</span>
-          </a>
+          <div class="oauth-buttons-column">
+            <!-- GOOGLE SIGN-IN -->
+            <a href="/auth/google/login" class="google-sign-in-clean-btn" id="real-google-oauth-btn" title="Sign in with Google">
+              <svg class="google-svg-clean" viewBox="0 0 24 24" width="18" height="18">
+                <path fill="#4285F4" d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.8-2.4 3.66v3.04h3.88c2.28-2.09 3.66-5.17 3.66-9.14z"/>
+                <path fill="#34A853" d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.04c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.1-6.72-4.93H1.25v3.13C3.26 21.36 7.33 24 12 24z"/>
+                <path fill="#FBBC05" d="M5.28 14.28c-.24-.72-.38-1.49-.38-2.28s.14-1.56.38-2.28V6.59H1.25C.45 8.18 0 9.99 0 12s.45 3.82 1.25 5.41l4.03-3.13z"/>
+                <path fill="#EA4335" d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.33 0 3.26 2.64 1.25 6.59l4.03 3.13c.95-2.83 3.6-4.97 6.72-4.97z"/>
+              </svg>
+              <span>Continue with Google</span>
+            </a>
+
+            <!-- GITHUB SIGN-IN -->
+            <a href="/auth/github/login" class="github-sign-in-clean-btn" id="real-github-oauth-btn" title="Sign in with GitHub">
+              <svg class="github-svg-clean" viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+                <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/>
+              </svg>
+              <span>Continue with GitHub</span>
+            </a>
+          </div>
 
           <div class="auth-divider">
             <div class="auth-divider-line"></div>
-            <span class="auth-divider-text">OR ACCESS VIA TOKEN</span>
+            <span class="auth-divider-text">or continue with token</span>
             <div class="auth-divider-line"></div>
           </div>
 
-          <div class="auth-token-box" style="display: flex; flex-direction: column; gap: 10px; width: 100%;">
-            <input type="password" id="auth-modal-token-input" class="user-input auth-input" placeholder="Paste Master Key or Guest Access Token..." style="margin: 0; width: 100%;">
-            <div style="display: flex; gap: 8px;">
-              <button id="auth-modal-token-btn" type="button" class="user-btn-primary" style="flex: 1; height: 42px; justify-content: center; font-size: 12px;">🔑 Sign in with Key</button>
-              <button id="auth-modal-guest-btn" type="button" class="modal-btn secondary" style="flex: 1; height: 42px; justify-content: center; font-size: 12px;">⚡ Enter as Guest</button>
+          <div class="auth-token-box">
+            <input type="password" id="auth-modal-token-input" class="auth-token-input" placeholder="Paste master key, guest token, or GitHub token...">
+            <div class="auth-actions-row">
+              <button id="auth-modal-token-btn" type="button" class="auth-btn-primary">
+                <span>Sign in</span>
+              </button>
+              <button id="auth-modal-guest-btn" type="button" class="auth-btn-secondary">
+                <span>Continue as guest</span>
+              </button>
             </div>
           </div>
         </div>
       </div>
+    </div>
+  </div>
     </div>
   </div>
 
@@ -666,26 +1262,43 @@
     </div>
   </div>
        ======================================================================== -->
+  <!-- ========================================================================
+       MODAL: MEMORY VAULT
+       ======================================================================== -->
   <div id="vault-modal" class="modal-overlay">
     <div class="modal-content vault-modal-content">
       <div class="modal-header">
         <div class="modal-header-title">
-          <span style="color: #00ffcc;">🧠 CORE MEMORY & KNOWLEDGE</span>
-          <span style="font-size: 11px; color: #64748b; margin-left: 8px;">FACTS, HABITS & WORKSPACE PREFERENCES</span>
+          <span class="vault-header-text">Memory</span>
+          <span class="vault-header-sub">Saved notes and preferences</span>
         </div>
-        <button id="close-vault-modal" class="modal-close-btn" title="Close">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <button id="close-vault-modal" class="modal-close-btn" title="Close" type="button">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="18" y1="6" x2="6" y2="18"/>
             <line x1="6" y1="6" x2="18" y2="18"/>
           </svg>
         </button>
       </div>
       <div class="vault-modal-controls">
-        <input type="text" id="vault-search-input" class="auth-input" placeholder="Search memory notes (FTS5 BM25)...">
-        <select id="vault-category-filter" class="auth-input vault-select">
-          <option value="">ALL CATEGORIES</option>
-        </select>
-        <button id="vault-add-btn" class="modal-btn primary" style="white-space: nowrap;">+ ADD NOTE</button>
+        <div class="vault-search-wrapper">
+          <svg class="vault-search-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"></circle>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+          </svg>
+          <input type="text" id="vault-search-input" class="vault-search-input" placeholder="Search memory notes...">
+        </div>
+        <div class="vault-filter-wrapper">
+          <select id="vault-category-filter" class="vault-category-select">
+            <option value="">All categories</option>
+          </select>
+        </div>
+        <button id="vault-add-btn" class="vault-add-btn" title="Add a new memory note" type="button">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+          <span>Add note</span>
+        </button>
       </div>
       <div id="vault-cards-grid" class="vault-cards-grid">
         <!-- Rendered dynamically by app.js -->
@@ -908,7 +1521,7 @@
     <div class="modal-content" style="max-width: 620px; width: 94%;">
       <div class="modal-header">
         <div class="modal-header-title">
-          <span style="color: #fb7185;">🐞 BUG REPORT &amp; TESTER FEEDBACK</span>
+          <span style="color: #f8fafc; font-weight: 600; font-size: 16px;">Report an issue</span>
         </div>
         <button id="close-bug-modal" class="modal-close-btn" title="Close">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -921,7 +1534,7 @@
         <!-- HOST-ONLY BUG REPORT INBOX (TOP VIEW FOR HOST) -->
         <div id="host-bug-inbox-section" style="display: none; margin-bottom: 16px;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-            <div style="font-size: 13px; font-weight: 700; color: #f1f5f9;">📥 TESTER BUG INBOX <span id="host-bug-inbox-count" style="color: #fb7185; font-size: 11px;">(0 Reports)</span></div>
+            <div style="font-size: 13px; font-weight: 700; color: #f1f5f9;">Tester reports <span id="host-bug-inbox-count" style="color: #fb7185; font-size: 11px;">(0 Reports)</span></div>
             <button id="refresh-bugs-btn" class="modal-btn" style="padding: 3px 10px; font-size: 11px; background: rgba(0, 242, 254, 0.1); border: 1px solid rgba(0, 242, 254, 0.3); color: var(--neon-cyan); border-radius: 4px; cursor: pointer;">🔄 Refresh</button>
           </div>
 
@@ -935,15 +1548,15 @@
 
           <!-- Bug Inbox Tabs -->
           <div class="bug-tab-bar" style="display: flex; gap: 6px; margin-bottom: 10px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 6px;">
-            <button id="bug-tab-active-btn" type="button" style="padding: 4px 12px; font-size: 11px; background: rgba(251, 113, 133, 0.15); border: 1px solid rgba(251, 113, 133, 0.4); color: #fb7185; border-radius: 6px; cursor: pointer; font-weight: 600;">🔴 Active Reports (<span id="bug-tab-active-count">0</span>)</button>
-            <button id="bug-tab-resolved-btn" type="button" style="padding: 4px 12px; font-size: 11px; background: transparent; border: 1px solid rgba(255, 255, 255, 0.15); color: #94a3b8; border-radius: 6px; cursor: pointer; font-weight: 600;">🟢 Resolved History (<span id="bug-tab-resolved-count">0</span>)</button>
+            <button id="bug-tab-active-btn" type="button" style="padding: 4px 12px; font-size: 11px; background: rgba(251, 113, 133, 0.15); border: 1px solid rgba(251, 113, 133, 0.4); color: #fb7185; border-radius: 6px; cursor: pointer; font-weight: 600;">Active reports (<span id="bug-tab-active-count">0</span>)</button>
+            <button id="bug-tab-resolved-btn" type="button" style="padding: 4px 12px; font-size: 11px; background: transparent; border: 1px solid rgba(255, 255, 255, 0.15); color: #94a3b8; border-radius: 6px; cursor: pointer; font-weight: 600;">Resolved history (<span id="bug-tab-resolved-count">0</span>)</button>
           </div>
 
           <div id="bug-reports-list" style="display: flex; flex-direction: column; gap: 8px; max-height: 270px; overflow-y: auto;"></div>
           <div id="bug-resolved-list" style="display: none; flex-direction: column; gap: 8px; max-height: 270px; overflow-y: auto;"></div>
           
           <div style="margin-top: 14px; text-align: center;">
-            <button id="toggle-host-submit-form" style="background: none; border: 1px dashed rgba(255, 255, 255, 0.2); color: #94a3b8; font-size: 11px; padding: 5px 12px; border-radius: 6px; cursor: pointer; transition: all 0.15s ease;">➕ File a New Bug / Feedback as Host</button>
+            <button id="toggle-host-submit-form" style="background: none; border: 1px dashed rgba(255, 255, 255, 0.2); color: #94a3b8; font-size: 11px; padding: 5px 12px; border-radius: 6px; cursor: pointer; transition: all 0.15s ease;">File a new report as host</button>
           </div>
         </div>
 
@@ -974,7 +1587,7 @@
           </div>
 
           <div id="bug-submit-status" style="display: none; font-size: 12px; margin-bottom: 8px;"></div>
-          <button id="submit-bug-btn" class="modal-btn primary" style="width: 100%;">🚀 SUBMIT BUG REPORT &amp; SCREENSHOT</button>
+          <button id="submit-bug-btn" class="modal-btn primary" style="width: 100%;">Submit report</button>
         </div>
       </div>
     </div>
@@ -984,6 +1597,6 @@
   <script src="/static/html2canvas.min.js"></script>
   <!-- MAIN SCRIPT -->
   <script src="/static/prism.min.js?v=10.4.0"></script>
-  <script src="/static/app.js?v=10.6.5"></script>
+  <script src="/static/app.js?v=2026110502"></script>
 </body>
 </html>

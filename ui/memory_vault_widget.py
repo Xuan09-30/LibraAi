@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from typing import Optional, List, Dict, Any
 
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -14,6 +15,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from core.memory import SemanticMemory, MemoryCore
+from ui.tokens import get_shared_qss
 
 
 class FactCard(QFrame):
@@ -30,8 +32,8 @@ class FactCard(QFrame):
 
     def init_ui(self):
         self.setObjectName("FactCard")
-        border_color = "#f59e0b" if self.pinned else "#1e293b"
-        bg_color = "#091220" if self.pinned else "#050b14"
+        border_color = "rgba(245, 158, 11, 0.4)" if self.pinned else "rgba(255, 255, 255, 0.08)"
+        bg_color = "#181c2e" if self.pinned else "#141824"
 
         self.setStyleSheet(f"""
             QFrame#FactCard {{
@@ -41,7 +43,7 @@ class FactCard(QFrame):
                 padding: 10px;
             }}
             QFrame#FactCard:hover {{
-                border-color: #00ffcc;
+                border-color: rgba(255, 255, 255, 0.2);
             }}
         """)
 
@@ -60,29 +62,30 @@ class FactCard(QFrame):
         self.pin_btn.setStyleSheet(f"""
             QPushButton {{
                 background: transparent; color: {pin_color};
-                border: none; font-size: 14px;
+                border: none; font-size: 14px; padding: 0;
             }}
             QPushButton:hover {{ color: #fbbf24; }}
         """)
-        self.pin_btn.setToolTip("Pin fact (protects from Markovian eviction)")
+        self.pin_btn.setToolTip("Pin note")
         self.pin_btn.clicked.connect(self._toggle_pin)
         header.addWidget(self.pin_btn)
 
         key_label = QLabel(f"{self.fact.get('entity', '')}.{self.fact.get('relation', '')}")
-        key_label.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        key_label.setStyleSheet("color: #00ffcc;")
+        key_label.setFont(QFont("Segoe UI", 9))
+        key_label.setStyleSheet("color: #94a3b8; font-family: monospace;")
         header.addWidget(key_label)
 
         header.addStretch()
 
-        cat_badge = QLabel(f"[{self.fact.get('category', 'general').upper()}]")
+        cat_name = self.fact.get("category", "general").capitalize()
+        cat_badge = QLabel(cat_name)
         cat_badge.setFont(QFont("Segoe UI", 8))
-        cat_badge.setStyleSheet("color: #38bdf8; background: #0c1c2e; padding: 2px 6px; border-radius: 4px;")
+        cat_badge.setStyleSheet("color: #cbd5e1; background: rgba(255, 255, 255, 0.06); padding: 2px 8px; border-radius: 4px;")
         header.addWidget(cat_badge)
 
         time_str = str(self.fact.get("updated_at", ""))[:16]
         time_lbl = QLabel(time_str)
-        time_lbl.setFont(QFont("Segoe UI", 7))
+        time_lbl.setFont(QFont("Segoe UI", 8))
         time_lbl.setStyleSheet("color: #64748b;")
         header.addWidget(time_lbl)
 
@@ -92,7 +95,7 @@ class FactCard(QFrame):
         self.body_label = QLabel(self.fact.get("value", ""))
         self.body_label.setFont(QFont("Segoe UI", 9))
         self.body_label.setWordWrap(True)
-        self.body_label.setStyleSheet("color: #e2e8f0; line-height: 1.4;")
+        self.body_label.setStyleSheet("color: #f8fafc; line-height: 1.4;")
         layout.addWidget(self.body_label)
 
         # Action Buttons: Edit, Delete
@@ -100,28 +103,28 @@ class FactCard(QFrame):
         actions.setSpacing(6)
         actions.addStretch()
 
-        edit_btn = QPushButton("EDIT")
-        edit_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        edit_btn = QPushButton("Edit")
+        edit_btn.setFont(QFont("Segoe UI", 8))
         edit_btn.setStyleSheet("""
             QPushButton {
-                background-color: #0c1829; color: #38bdf8;
-                border: 1px solid #142a47; border-radius: 4px;
-                padding: 4px 10px;
+                background-color: #18181b; color: #cbd5e1;
+                border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 6px;
+                padding: 4px 10px; min-height: 24px;
             }
-            QPushButton:hover { background-color: #12253f; border-color: #38bdf8; }
+            QPushButton:hover { background-color: #222226; color: #ffffff; border-color: rgba(255, 255, 255, 0.25); }
         """)
         edit_btn.clicked.connect(lambda: self.edit_requested.emit(self.fact))
         actions.addWidget(edit_btn)
 
-        del_btn = QPushButton("DELETE")
-        del_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        del_btn = QPushButton("Delete")
+        del_btn.setFont(QFont("Segoe UI", 8))
         del_btn.setStyleSheet("""
             QPushButton {
-                background-color: #1a0f14; color: #f43f5e;
-                border: 1px solid #381520; border-radius: 4px;
-                padding: 4px 10px;
+                background-color: transparent; color: #94a3b8;
+                border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 6px;
+                padding: 4px 10px; min-height: 24px;
             }
-            QPushButton:hover { background-color: #2e1018; border-color: #f43f5e; }
+            QPushButton:hover { background-color: rgba(239, 68, 68, 0.1); color: #ef4444; border-color: rgba(239, 68, 68, 0.3); }
         """)
         del_btn.clicked.connect(lambda: self.delete_requested.emit(self.fact_id))
         actions.addWidget(del_btn)
@@ -137,9 +140,9 @@ class EditFactDialog(QDialog):
     def __init__(self, fact: Dict[str, Any], parent=None):
         super().__init__(parent)
         self.fact = fact
-        self.setWindowTitle("EDIT MEMORY FACT // OBSIDIAN VAULT")
+        self.setWindowTitle("Edit note")
         self.resize(520, 280)
-        self.setStyleSheet("background-color: #060b14; color: #f1f5f9;")
+        self.setStyleSheet("background-color: #09090b; color: #f8fafc;")
         self.init_ui()
 
     def init_ui(self):
@@ -147,9 +150,9 @@ class EditFactDialog(QDialog):
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(10)
 
-        title = QLabel(f"EDIT FACT: {self.fact.get('entity', '')}.{self.fact.get('relation', '')}")
+        title = QLabel(f"Note: {self.fact.get('entity', '')}.{self.fact.get('relation', '')}")
         title.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
-        title.setStyleSheet("color: #00ffcc;")
+        title.setStyleSheet("color: #f8fafc;")
         layout.addWidget(title)
 
         # Category
@@ -158,7 +161,7 @@ class EditFactDialog(QDialog):
         cat_lbl.setFont(QFont("Segoe UI", 9))
         self.cat_edit = QLineEdit(self.fact.get("category", "general"))
         self.cat_edit.setFont(QFont("Segoe UI", 9))
-        self.cat_edit.setStyleSheet("background-color: #0a1424; color: #38bdf8; border: 1px solid rgba(255, 255, 255, 0.08); padding: 4px;")
+        self.cat_edit.setStyleSheet("background-color: #18181b; color: #f8fafc; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 6px; padding: 6px 10px;")
         cat_layout.addWidget(cat_lbl)
         cat_layout.addWidget(self.cat_edit)
         layout.addLayout(cat_layout)
@@ -167,22 +170,22 @@ class EditFactDialog(QDialog):
         self.text_edit = QTextEdit()
         self.text_edit.setPlainText(self.fact.get("value", ""))
         self.text_edit.setFont(QFont("Segoe UI", 10))
-        self.text_edit.setStyleSheet("background-color: #04070e; color: #f8fafc; border: 1px solid rgba(255, 255, 255, 0.08); padding: 8px;")
+        self.text_edit.setStyleSheet("background-color: #121215; color: #f8fafc; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 6px; padding: 8px;")
         layout.addWidget(self.text_edit)
 
         # Buttons
         btns = QHBoxLayout()
         btns.addStretch()
 
-        cancel_btn = QPushButton("CANCEL")
+        cancel_btn = QPushButton("Cancel")
         cancel_btn.setFont(QFont("Segoe UI", 9))
-        cancel_btn.setStyleSheet("background: #0d1522; color: #94a3b8; border: 1px solid #1e293b; padding: 6px 14px;")
+        cancel_btn.setStyleSheet("background: #18181b; color: #cbd5e1; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 6px; padding: 6px 14px;")
         cancel_btn.clicked.connect(self.reject)
         btns.addWidget(cancel_btn)
 
-        save_btn = QPushButton("SAVE NOTE")
+        save_btn = QPushButton("Save note")
         save_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        save_btn.setStyleSheet("background: #fafafa; color: #09090b; border: 1px solid #fafafa; padding: 6px 14px;")
+        save_btn.setStyleSheet("background-color: #00d2ff; color: #090d16; font-weight: 600; border: none; border-radius: 6px; padding: 6px 14px;")
         save_btn.clicked.connect(self.accept)
         btns.addWidget(save_btn)
 
@@ -199,13 +202,13 @@ class MemoryVaultWidget(QDialog):
     """
     Inspectable Memory Vault Window (v11.0 / Phase 11).
     Displays human-readable Markdown-synced semantic memory facts with instant
-    FTS5 BM25 search, category filters, and one-click edit/pin/delete.
+    search, category filters, and one-click edit/pin/delete.
     """
 
     def __init__(self, memory: Optional[SemanticMemory] = None, parent=None):
         super().__init__(parent)
         self.memory = memory or SemanticMemory()
-        self.setWindowTitle("LIBRA AI // MEMORY VAULT (OBSIDIAN SYNC)")
+        self.setWindowTitle("Memory")
         self.resize(920, 680)
         self.setStyleSheet("background-color: #09090b; color: #f8fafc; font-family: 'Segoe UI', sans-serif;")
         self.init_ui()
@@ -219,10 +222,10 @@ class MemoryVaultWidget(QDialog):
         # 1. Header Row
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("◈ Memory Vault")
+        title = QLabel("Memory")
         title.setFont(QFont("Segoe UI", 12, QFont.Weight.Bold))
         title.setStyleSheet("color: #ffffff; letter-spacing: -0.2px;")
-        sub = QLabel(f"BI-DIRECTIONAL OBSIDIAN SYNC: assets/vault/ (*.md)")
+        sub = QLabel("Saved notes and preferences")
         sub.setFont(QFont("Segoe UI", 8))
         sub.setStyleSheet("color: #64748b;")
         title_box.addWidget(title)
@@ -231,33 +234,33 @@ class MemoryVaultWidget(QDialog):
 
         header.addStretch()
 
-        self.vault_path_btn = QPushButton("📂 OPEN VAULT FOLDER")
-        self.vault_path_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        self.vault_path_btn = QPushButton("Open vault folder")
+        self.vault_path_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Medium))
         self.vault_path_btn.setStyleSheet("""
             QPushButton {
-                background: #18181b; color: #f4f4f5;
-                border: 1px solid #142a47; border-radius: 4px; padding: 6px 12px;
+                background: #18181b; color: #cbd5e1;
+                border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 6px; padding: 6px 12px;
             }
-            QPushButton:hover { border-color: #00ffcc; }
+            QPushButton:hover { background: #222226; color: #ffffff; border-color: rgba(255, 255, 255, 0.25); }
         """)
         self.vault_path_btn.clicked.connect(self._open_vault_folder)
         header.addWidget(self.vault_path_btn)
 
         main_layout.addLayout(header)
 
-        # 2. Controls: Instant Search (FTS5) + Category Filter + Add Fact Button
+        # 2. Controls: Search + Category Filter + Add Note Button
         controls = QHBoxLayout()
         controls.setSpacing(10)
 
         self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Instant search memory notes (FTS5 BM25)...")
+        self.search_box.setPlaceholderText("Search memory notes...")
         self.search_box.setFont(QFont("Segoe UI", 10))
         self.search_box.setStyleSheet("""
             QLineEdit {
-                background-color: #18181b; color: #f8fafc;
-                border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 6px; padding: 8px 12px;
+                background-color: #121215; color: #f8fafc;
+                border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 8px; padding: 8px 12px;
             }
-            QLineEdit:focus { border-color: #00ffcc; }
+            QLineEdit:focus { border-color: #00d2ff; }
         """)
         self.search_box.textChanged.connect(self.refresh_facts)
         controls.addWidget(self.search_box, stretch=6)
@@ -266,22 +269,29 @@ class MemoryVaultWidget(QDialog):
         self.cat_filter.setFont(QFont("Segoe UI", 9))
         self.cat_filter.setStyleSheet("""
             QComboBox {
-                background-color: #060c18; color: #38bdf8;
-                border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 6px; padding: 7px 10px;
+                background-color: #18181b; color: #f8fafc;
+                border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 8px; padding: 7px 10px;
             }
         """)
-        self.cat_filter.addItem("ALL CATEGORIES")
+        self.cat_filter.addItem("All categories")
         self.cat_filter.currentTextChanged.connect(self.refresh_facts)
         controls.addWidget(self.cat_filter, stretch=3)
 
-        add_btn = QPushButton("+ NEW FACT")
+        add_btn = QPushButton("+ Add note")
+        add_btn.setObjectName("primary")
         add_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         add_btn.setStyleSheet("""
             QPushButton {
-                background: #fafafa; color: #09090b;
-                border: 1px solid #fafafa; border-radius: 6px; padding: 8px 14px;
+                background-color: #00d2ff;
+                color: #090d16;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 14px;
+                font-weight: 600;
             }
-            QPushButton:hover { background: #059669; }
+            QPushButton:hover {
+                background-color: #38bdf8;
+            }
         """)
         add_btn.clicked.connect(self._create_fact_dialog)
         controls.addWidget(add_btn, stretch=2)
@@ -311,7 +321,7 @@ class MemoryVaultWidget(QDialog):
 
         query = self.search_box.text().strip()
         cat_text = self.cat_filter.currentText()
-        category = None if cat_text in ["", "ALL CATEGORIES"] else cat_text
+        category = None if cat_text in ["", "All categories", "ALL CATEGORIES"] else cat_text.lower()
 
         facts = self.memory.get_vault_facts(query=query if query else None, category=category)
 
@@ -320,17 +330,17 @@ class MemoryVaultWidget(QDialog):
         current_cat = self.cat_filter.currentText()
         self.cat_filter.blockSignals(True)
         self.cat_filter.clear()
-        self.cat_filter.addItem("ALL CATEGORIES")
+        self.cat_filter.addItem("All categories")
         for c in all_categories:
             if c:
-                self.cat_filter.addItem(c.upper())
+                self.cat_filter.addItem(c.capitalize())
         idx = self.cat_filter.findText(current_cat)
         if idx >= 0:
             self.cat_filter.setCurrentIndex(idx)
         self.cat_filter.blockSignals(False)
 
         if not facts:
-            no_data = QLabel("No memory vault notes found matching query.")
+            no_data = QLabel("No memory notes found matching query.")
             no_data.setFont(QFont("Segoe UI", 10))
             no_data.setStyleSheet("color: #64748b; padding: 20px;")
             no_data.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -360,8 +370,8 @@ class MemoryVaultWidget(QDialog):
     def _on_delete_fact(self, fact_id: int):
         reply = QMessageBox.question(
             self,
-            "DELETE MEMORY FACT",
-            f"Are you sure you want to permanently delete this fact note from memory and assets/vault/?",
+            "Delete note",
+            "Are you sure you want to permanently delete this memory note?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:

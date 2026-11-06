@@ -6,6 +6,40 @@ import warnings
 import asyncio
 import httpx
 import urllib.parse
+import ipaddress
+import socket
+
+def is_safe_public_url(url: str) -> bool:
+    """SSRF protection: ensures URL scheme is http/https and destination IP is not private/loopback/metadata."""
+    if not url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        h_low = hostname.lower().strip()
+        if h_low in ("localhost", "127.0.0.1", "::1", "0.0.0.0", "local"):
+            return False
+        addr_info = socket.getaddrinfo(h_low, None)
+        for _, _, _, _, sockaddr in addr_info:
+            ip_str = sockaddr[0]
+            ip_obj = ipaddress.ip_address(ip_str)
+            if (
+                ip_obj.is_private
+                or ip_obj.is_loopback
+                or ip_obj.is_link_local
+                or ip_obj.is_reserved
+                or ip_obj.is_multicast
+                or str(ip_obj).startswith("169.254.")
+                or str(ip_obj) in ("0.0.0.0", "::")
+            ):
+                return False
+        return True
+    except Exception:
+        return False
 import xml.etree.ElementTree as ET
 import concurrent.futures
 from datetime import datetime
@@ -128,7 +162,7 @@ class HardenedResearchEngine:
         Checks SQLite web_cache first, then extracts clean article text using Trafilatura
         stripping boilerplates/scripts, converting to clean markdown, and caching the result.
         """
-        if not url:
+        if not url or not is_safe_public_url(url):
             return None
 
         # Check cache
@@ -146,13 +180,25 @@ class HardenedResearchEngine:
         # Fetch and extract with fast bounded timeout
         try:
             downloaded = None
+            ssrf_blocked = False
             try:
                 headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-                resp = httpx.get(url, timeout=2.0, follow_redirects=True, headers=headers)
-                if resp.status_code == 200:
-                    downloaded = resp.text
+                current_url = url
+                for _ in range(5):
+                    if not is_safe_public_url(current_url):
+                        ssrf_blocked = True
+                        break
+                    resp = httpx.get(current_url, timeout=2.0, follow_redirects=False, headers=headers)
+                    if resp.is_redirect and "location" in resp.headers:
+                        current_url = urllib.parse.urljoin(str(resp.url), resp.headers["location"])
+                    else:
+                        if resp.status_code == 200:
+                            downloaded = resp.text
+                        break
             except Exception:
                 pass
+            if ssrf_blocked:
+                return None
             if not downloaded:
                 downloaded = trafilatura.fetch_url(url)
 
@@ -186,7 +232,7 @@ class HardenedResearchEngine:
 
     async def async_clean_markdown_extract(self, url: str) -> Optional[Dict[str, str]]:
         """Fast non-blocking async article extraction."""
-        if not url:
+        if not url or not is_safe_public_url(url):
             return None
 
         # Check cache
@@ -204,10 +250,22 @@ class HardenedResearchEngine:
         try:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             downloaded = None
-            async with httpx.AsyncClient(timeout=1.6, follow_redirects=True, headers=headers) as client:
-                resp = await client.get(url)
-                if resp.status_code == 200:
-                    downloaded = resp.text
+            ssrf_blocked = False
+            async with httpx.AsyncClient(timeout=1.6, follow_redirects=False, headers=headers) as client:
+                current_url = url
+                for _ in range(5):
+                    if not is_safe_public_url(current_url):
+                        ssrf_blocked = True
+                        break
+                    resp = await client.get(current_url)
+                    if resp.is_redirect and "location" in resp.headers:
+                        current_url = urllib.parse.urljoin(str(resp.url), resp.headers["location"])
+                    else:
+                        if resp.status_code == 200:
+                            downloaded = resp.text
+                        break
+            if ssrf_blocked:
+                return None
 
             if downloaded:
                 extracted = trafilatura.extract(

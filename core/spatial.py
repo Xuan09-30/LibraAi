@@ -333,7 +333,7 @@ class SpatialGroundingEngine:
         - mode="crop": Crops specific region at native 1:1 resolution to assets/screen_crop.png.
                        Returns (path, {}).
         """
-        assets_dir = os.path.join(PROJECT_ROOT, "assets")
+        assets_dir = os.environ.get("LIBRA_ASSETS_DIR") or os.path.join(PROJECT_ROOT, "assets")
         os.makedirs(assets_dir, exist_ok=True)
 
         img = screenshot_img

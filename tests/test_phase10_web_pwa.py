@@ -1,6 +1,19 @@
 import os
 import sys
+import time
 import unittest
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+
+class MockJWKSClient:
+    def __init__(self, public_key):
+        self.public_key = public_key
+
+    def get_signing_key_from_jwt(self, token):
+        class MockKey:
+            def __init__(self, key):
+                self.key = key
+        return MockKey(self.public_key)
 import json
 import wave
 import io
@@ -26,6 +39,19 @@ class TestPhase10WebPWA(unittest.TestCase):
         cls.token = cls.cfg.get("access_token", "libra_access_token_phase10_secure")
         cls.app = create_app(hub=cls.hub, config_path="config.json")
         cls.client = TestClient(cls.app)
+
+        # Generate RSA keypair for RS256 JWKS testing (Round 5 Item 1)
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        cls.rsa_private_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        cls.rsa_public_pem = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        cls.mock_jwks = MockJWKSClient(cls.rsa_public_pem)
 
     # -----------------------------------------------------------------------
     # 1. CLIENT SCOPE SANDBOXING TESTS
@@ -59,11 +85,13 @@ class TestPhase10WebPWA(unittest.TestCase):
         self.assertNotEqual(res_chat.get("status"), "blocked")
         self.assertNotEqual(res_chat.get("action"), "sandboxed_blocked")
 
-        # System status (read-only vitals)
+        # System status (restricted to local_desktop / remote_host per Round 2 Item A.5; blocked in remote_web)
         q_vitals = "check system vitals"
-        res_vitals = self.hub.process_command(q_vitals, client_scope="remote_web", dry_run=True)
-        self.assertNotEqual(res_vitals.get("status"), "blocked")
-        self.assertEqual(res_vitals.get("action"), "system_status")
+        res_vitals_host = self.hub.process_command(q_vitals, client_scope="remote_host", dry_run=True)
+        self.assertNotEqual(res_vitals_host.get("status"), "blocked")
+        self.assertEqual(res_vitals_host.get("action"), "system_status")
+        res_vitals_web = self.hub.process_command(q_vitals, client_scope="remote_web", dry_run=True)
+        self.assertEqual(res_vitals_web.get("status"), "blocked")
 
     def test_03_desktop_scope_remains_unrestricted(self):
         """Test 3: Default local_desktop client_scope allows desktop control without sandboxing."""
@@ -76,27 +104,64 @@ class TestPhase10WebPWA(unittest.TestCase):
     # 2. ZERO-TRUST GMAIL & TOKEN AUTHENTICATION TESTS
     # -----------------------------------------------------------------------
     def test_04_auth_unauthorized_rejection(self):
-        """Test 4: Unauthenticated request returns 401, wrong email returns 403."""
+        """Test 4: Unauthenticated request returns 401, stranger email with valid JWT returns 403, forged returns 401."""
         # No credentials -> 401 Unauthorized
         res_no_auth = self.client.get("/api/vitals")
         self.assertEqual(res_no_auth.status_code, 401)
 
-        # Stranger email header -> 403 Forbidden
-        headers_stranger = {"Cf-Access-Authenticated-User-Email": "stranger@gmail.com"}
+        # Stranger email header without JWT or proxy enabled -> 401 Unauthorized (Item 1 hardening)
+        headers_stranger_forged = {"Cf-Access-Authenticated-User-Email": "stranger@gmail.com"}
+        res_stranger_forged = self.client.get("/api/vitals", headers=headers_stranger_forged)
+        self.assertEqual(res_stranger_forged.status_code, 401)
+
+        # Stranger email with Cloudflare Access enabled and valid RS256 JWT -> 403 Forbidden
+        import jwt
+        self.app.state.cloudflare_access_enabled = True
+        self.app.state.cloudflare_access_team_domain = "team"
+        self.app.state.cloudflare_access_audience = "test-aud"
+        self.app.state.cloudflare_access_jwks_client = self.mock_jwks
+        stranger_jwt = jwt.encode(
+            {"email": "stranger@gmail.com", "aud": "test-aud", "iss": "https://team.cloudflareaccess.com", "exp": time.time() + 300},
+            self.rsa_private_pem,
+            algorithm="RS256",
+            headers={"kid": "key1"}
+        )
+        headers_stranger = {
+            "Cf-Access-Authenticated-User-Email": "stranger@gmail.com",
+            "Cf-Access-Jwt-Assertion": stranger_jwt
+        }
         res_stranger = self.client.get("/api/vitals", headers=headers_stranger)
         self.assertEqual(res_stranger.status_code, 403)
+        self.app.state.cloudflare_access_enabled = False
 
     def test_05_auth_authorized_gmail_and_token(self):
-        """Test 5: Authorized Gmail and valid Bearer tokens are permitted."""
-        # Authorized Gmail via Cloudflare header
-        headers_cf = {"Cf-Access-Authenticated-User-Email": self.admin_email}
+        """Test 5: Authorized Gmail (via verified Cloudflare Access / custom header) and valid Bearer tokens are permitted."""
+        import jwt
+        # Authorized Gmail via verified Cloudflare Access RS256 JWT header
+        self.app.state.cloudflare_access_enabled = True
+        self.app.state.cloudflare_access_team_domain = "team"
+        self.app.state.cloudflare_access_audience = "test-aud"
+        self.app.state.cloudflare_access_jwks_client = self.mock_jwks
+        cf_jwt = jwt.encode(
+            {"email": self.admin_email, "aud": "test-aud", "iss": "https://team.cloudflareaccess.com", "exp": time.time() + 300},
+            self.rsa_private_pem,
+            algorithm="RS256",
+            headers={"kid": "key1"}
+        )
+        headers_cf = {
+            "Cf-Access-Authenticated-User-Email": self.admin_email,
+            "Cf-Access-Jwt-Assertion": cf_jwt
+        }
         res_cf = self.client.get("/api/vitals", headers=headers_cf)
         self.assertEqual(res_cf.status_code, 200)
+        self.app.state.cloudflare_access_enabled = False
 
-        # Authorized Gmail via custom header
+        # Authorized Gmail via custom header (when explicitly enabled in config)
+        self.app.state.allow_custom_user_email_header = True
         headers_custom = {"X-User-Email": self.admin_email}
         res_custom = self.client.get("/api/vitals", headers=headers_custom)
         self.assertEqual(res_custom.status_code, 200)
+        self.app.state.allow_custom_user_email_header = False
 
         # Valid Bearer token
         headers_token = {"Authorization": f"Bearer {self.token}"}
@@ -131,7 +196,7 @@ class TestPhase10WebPWA(unittest.TestCase):
         data = res.json()
         self.assertEqual(data.get("status"), "success")
         self.assertTrue(len(data.get("reply_text", "")) > 0)
-        self.assertEqual(data.get("client_scope"), "remote_web")
+        self.assertIn(data.get("client_scope"), ("remote_web", "remote_host"))
 
     def test_08_post_chat_sandboxing_enforced(self):
         """Test 8: /api/chat enforces desktop sandboxing for remote OS launch commands."""

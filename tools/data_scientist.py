@@ -15,7 +15,7 @@ from tools.file_manager import FileManager
 from tools.repl_runner import PersistentDataREPL
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-PLOTS_DIR = os.path.join(PROJECT_ROOT, "assets", "plots")
+PLOTS_DIR = os.environ.get("LIBRA_PLOTS_DIR") or os.path.join(PROJECT_ROOT, "assets", "plots")
 
 WORLD_BANK_INDICATORS = {
     "gdp growth": ("NY.GDP.MKTP.KD.ZG", "GDP Growth (Annual %)"),

@@ -36,11 +36,7 @@ def _get_clipboard_skill():
 
 clipboard_skill = _get_clipboard_skill()
 
-try:
-    import keyboard
-    KEYBOARD_AVAILABLE = True
-except ImportError:
-    KEYBOARD_AVAILABLE = False
+KEYBOARD_AVAILABLE = False
 
 # Win32 Constants
 MOD_ALT = 0x0001
@@ -120,7 +116,6 @@ class GlobalHotkeyThread(QThread):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = True
-        self._keyboard_handles = []
         self._last_trigger_time = 0.0
 
     def _safe_trigger(self):
@@ -162,25 +157,7 @@ class GlobalHotkeyThread(QThread):
         if success2:
             print("[Spotlight] Fallback hotkey registered: [Ctrl + Shift + L] -> Universal Highlight & Ask.")
 
-        # 2. Register low-level keyboard hook via keyboard module for OS-level reliability
-        if KEYBOARD_AVAILABLE:
-            try:
-                h1 = keyboard.add_hotkey("alt+space", lambda: self._safe_trigger(), suppress=True)
-                self._keyboard_handles.append(h1)
-            except Exception:
-                try:
-                    h1 = keyboard.add_hotkey("alt+space", lambda: self._safe_trigger(), suppress=False)
-                    self._keyboard_handles.append(h1)
-                except Exception:
-                    pass
-
-            try:
-                h2 = keyboard.add_hotkey("ctrl+shift+l", lambda: self._safe_trigger(), suppress=False)
-                self._keyboard_handles.append(h2)
-            except Exception:
-                pass
-
-        if not success1 and not success2 and not self._keyboard_handles:
+        if not success1 and not success2:
             print(f"[Spotlight] Failed to register global hotkeys (Error {ctypes.GetLastError()}).")
             return
 
@@ -199,13 +176,6 @@ class GlobalHotkeyThread(QThread):
 
     def stop(self):
         self._running = False
-        if KEYBOARD_AVAILABLE and self._keyboard_handles:
-            for h in list(self._keyboard_handles):
-                try:
-                    keyboard.remove_hotkey(h)
-                except Exception:
-                    pass
-            self._keyboard_handles.clear()
         if sys.platform == "win32":
             try:
                 ctypes.windll.user32.PostQuitMessage(0)
@@ -254,8 +224,8 @@ class SpotlightBar(QWidget):
         self.container.setObjectName("SpotlightContainer")
         self.container.setStyleSheet("""
             QFrame#SpotlightContainer {
-                background-color: rgba(24, 24, 27, 0.96);
-                border: 1px solid rgba(255, 255, 255, 0.12);
+                background-color: #121215;
+                border: 1px solid rgba(255, 255, 255, 0.14);
                 border-radius: 12px;
             }
         """)
@@ -272,8 +242,8 @@ class SpotlightBar(QWidget):
         self.pill_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         self.pill_btn.setStyleSheet("""
             QPushButton {
-                background: #0f2338; color: #38bdf8;
-                border: 1px solid #0284c7; border-radius: 4px;
+                background: #18181b; color: #cbd5e1;
+                border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 6px;
                 padding: 3px 8px; text-align: left;
             }
             QPushButton:hover { background: #163352; color: #f43f5e; border-color: #f43f5e; }
@@ -285,7 +255,7 @@ class SpotlightBar(QWidget):
 
         self.top_row.addStretch()
 
-        esc_hint = QLabel("[ESC] DISMISS | [ENTER] EXECUTE")
+        esc_hint = QLabel("Esc to dismiss · Enter to run")
         esc_hint.setFont(QFont("Segoe UI", 7))
         esc_hint.setStyleSheet("color: #64748b;")
         self.top_row.addWidget(esc_hint)
@@ -296,9 +266,9 @@ class SpotlightBar(QWidget):
         input_row = QHBoxLayout()
         input_row.setSpacing(8)
 
-        icon_lbl = QLabel("✦")
-        icon_lbl.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
-        icon_lbl.setStyleSheet("color: #38bdf8;")
+        icon_lbl = QLabel("›")
+        icon_lbl.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+        icon_lbl.setStyleSheet("color: #00d2ff;")
         input_row.addWidget(icon_lbl)
 
         self.input_field = QLineEdit()
@@ -335,16 +305,16 @@ class SpotlightBar(QWidget):
         self.action_row.setSpacing(6)
         self.action_row.addStretch()
 
-        self.replace_btn = QPushButton("INJECT [Ctrl+V]")
-        self.replace_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        self.replace_btn.setStyleSheet("background: #047857; color: #a7f3d0; border: 1px solid #10b981; padding: 4px 10px; border-radius: 4px;")
+        self.replace_btn = QPushButton("Replace selection")
+        self.replace_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Medium))
+        self.replace_btn.setStyleSheet("QPushButton { background-color: #00d2ff; color: #090d16; border: none; border-radius: 6px; padding: 5px 12px; font-weight: 600; } QPushButton:hover { background-color: #38bdf8; }")
         self.replace_btn.clicked.connect(self.inject_replacement)
         self.replace_btn.hide()
         self.action_row.addWidget(self.replace_btn)
 
-        self.copy_btn = QPushButton("COPY")
-        self.copy_btn.setFont(QFont("Segoe UI", 8))
-        self.copy_btn.setStyleSheet("background: #0f1d30; color: #38bdf8; border: 1px solid #1e3a5f; padding: 4px 10px; border-radius: 4px;")
+        self.copy_btn = QPushButton("Copy")
+        self.copy_btn.setFont(QFont("Segoe UI", 9))
+        self.copy_btn.setStyleSheet("QPushButton { background-color: #18181b; color: #cbd5e1; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 6px; padding: 5px 12px; } QPushButton:hover { background-color: #222226; color: #ffffff; border-color: rgba(255, 255, 255, 0.25); }")
         self.copy_btn.clicked.connect(self.copy_output)
         self.copy_btn.hide()
         self.action_row.addWidget(self.copy_btn)

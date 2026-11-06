@@ -155,6 +155,71 @@ def run_tests():
 
 
 
+
+
+def test_router_30_labeled_queries_accuracy():
+    """
+    Tier 1 & Tier 2 Router Accuracy Test Table (30 labeled queries across chitchat, real-time, and mixed):
+    - Real-time signals must be checked FIRST.
+    - Chitchat is only matched when the query is short (<= 8 words) and has NO real-time signal.
+    """
+    llm = LocalLLM()
+    # Stub call_ollama so router test is deterministic and fast when falling through to LLM classifier
+    llm.call_ollama = lambda *a, **kw: '{"action": "chat", "query": ""}'
+
+    labeled_table = [
+        # --- 10 Chitchat Queries (<= 8 words, no real-time signal -> 'chat') ---
+        ("how you feeling today?", "chitchat", "chat"),
+        ("how are you doing", "chitchat", "chat"),
+        ("hey libra", "chitchat", "chat"),
+        ("are you okay", "chitchat", "chat"),
+        ("what are you up to", "chitchat", "chat"),
+        ("tell me a joke", "chitchat", "chat"),
+        ("how was your day", "chitchat", "chat"),
+        ("are you awake", "chitchat", "chat"),
+        ("hello there", "chitchat", "chat"),
+        ("any fun stuff we can do?", "chitchat", "chat"),
+
+        # --- 10 Real-time Queries (real-time signal -> 'web_search') ---
+        ("latest news on AI benchmarks", "real-time", "web_search"),
+        ("what is the bitcoin price", "real-time", "web_search"),
+        ("breaking news headlines", "real-time", "web_search"),
+        ("who won the game", "real-time", "web_search"),
+        ("premier league standings", "real-time", "web_search"),
+        ("f1 match score", "real-time", "web_search"),
+        ("stock price of nvidia", "real-time", "web_search"),
+        ("top news updates today", "real-time", "web_search"),
+        ("what happened today in tech", "real-time", "web_search"),
+        ("crypto price updates today", "real-time", "web_search"),
+
+        # --- 10 Mixed Queries (chitchat greeting + real-time signal or >8 words) ---
+        ("hey how are you doing what is the latest news", "mixed", "web_search"),
+        ("hello libra how is your day and check breaking news", "mixed", "web_search"),
+        ("hi how you feeling today what is the bitcoin price", "mixed", "web_search"),
+        ("hey there what is up with the nba playoff standings", "mixed", "web_search"),
+        ("yo are you awake tell me today's headlines", "mixed", "web_search"),
+        ("how is it going can you check premier league standings", "mixed", "web_search"),
+        ("greetings libra what happened today in formula 1", "mixed", "web_search"),
+        ("hey are you okay what is the stock price", "mixed", "web_search"),
+        ("hi what are you doing check live score", "mixed", "web_search"),
+        ("how are you doing today can you explain why the sky appears blue during daytime", "mixed", "chat"),
+    ]
+
+    correct = 0
+    mismatches = []
+    for query, category, expected_action in labeled_table:
+        res = llm.plan(query, dry_run=True)
+        actual_action = res.get("action")
+        if actual_action == expected_action:
+            correct += 1
+        else:
+            mismatches.append((query, category, expected_action, actual_action))
+
+    accuracy = (correct / len(labeled_table)) * 100.0
+    print(f"\n[Router Test Table] Accuracy: {correct}/{len(labeled_table)} ({accuracy:.1f}%)")
+    assert len(mismatches) == 0, f"Router accuracy {correct}/{len(labeled_table)} ({accuracy:.1f}%). Mismatches: {mismatches}"
+
+
 def test_suite():
     run_tests()
 
