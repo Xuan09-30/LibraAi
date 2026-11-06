@@ -121,9 +121,11 @@ class TestLoginSessionLoop:
 
         # Mock GitHub OAuth callback
         mock_access_token_resp = MagicMock()
+        mock_access_token_resp.status_code = 200
         mock_access_token_resp.json.return_value = {"access_token": "gho_mocked_token_xyz"}
-
         mock_user_resp = MagicMock()
+        mock_user_resp.status_code = 200
+
         mock_user_resp.json.return_value = {
             "login": test_gh_user,
             "email": test_gh_email,
@@ -132,7 +134,9 @@ class TestLoginSessionLoop:
 
         with patch("httpx.AsyncClient.post", return_value=mock_access_token_resp), \
              patch("httpx.AsyncClient.get", return_value=mock_user_resp):
-            cb_res = self.client.get("/auth/github/callback?code=mock_valid_code")
+            mock_state = "mock_valid_state_12345"
+            self.client.cookies.set("libra_gh_state", mock_state)
+            cb_res = self.client.get(f"/auth/github/callback?code=mock_valid_code&state={mock_state}")
             assert cb_res.status_code == 200, f"GitHub callback failed: {cb_res.text}"
             assert "Authenticated with GitHub" in cb_res.text
 

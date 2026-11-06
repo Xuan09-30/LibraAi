@@ -1284,6 +1284,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         name: Optional[str] = None
 
+    class LinkAccountRequest(BaseModel):
+
+        link_token: str
+
+        action: str = "link" 
+
     @app.post("/api/auth/send-code")
 
     async def post_send_verification_code(req: SendCodeRequest, request: Request):
@@ -1421,26 +1427,85 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         role = "host" if is_host else "guest"
 
+        # Determine sub identifier (Google user ID or email)
+        sub = clean_email
+        if req.credential:
+            try:
+                parts = req.credential.split(".")
+                if len(parts) >= 2:
+                    padded = parts[1] + ("=" * ((4 - len(parts[1]) % 4) % 4))
+                    payload = json.loads(base64.urlsafe_b64decode(padded))
+                    if payload.get("sub"):
+                        sub = str(payload.get("sub"))
+            except Exception:
+                pass
+
+        # 1. Check existing Google identity
+        identity = memory.get_identity("google", sub) if hasattr(memory, "get_identity") else None
+        if identity and hasattr(memory, "get_canonical_user_by_id"):
+            canonical_user = memory.get_canonical_user_by_id(identity["user_id"])
+            if canonical_user:
+                tok = canonical_user["unique_token"]
+                response.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax")
+                return {
+                    "status": "success",
+                    "token": tok,
+                    "user_id": canonical_user["user_id"],
+                    "role": canonical_user["role"],
+                    "email": canonical_user["primary_email"],
+                    "display_name": canonical_user["display_name"],
+                    "github_username": canonical_user.get("github_username", ""),
+                    "is_new_user": False
+                }
+
+        # 2. Check for linking candidate (Google emails are verified)
+        candidate = memory.find_linking_candidate(clean_email, "google", email_verified=True) if hasattr(memory, "find_linking_candidate") else None
+        if candidate and hasattr(memory, "create_pending_link"):
+            link_token = memory.create_pending_link(
+                user_id=candidate["user"]["user_id"],
+                provider="google",
+                provider_user_id=sub,
+                email=clean_email,
+                display_name=dname,
+                github_username="",
+                other_provider=candidate["existing_provider"]
+            )
+            return {
+                "status": "linking_required",
+                "link_token": link_token,
+                "email": clean_email,
+                "other_provider": candidate["existing_provider"],
+                "confirmation_url": f"/auth/link-confirmation?token={link_token}",
+                "message": f"An account using {clean_email} already exists, created via {candidate['existing_provider']}. Link your accounts?"
+            }
+
+        # 3. Create canonical user and link identity
+        if hasattr(memory, "create_canonical_user") and hasattr(memory, "link_identity"):
+            user = memory.create_canonical_user(primary_email=clean_email, display_name=dname, role=role)
+            memory.link_identity(user_id=user["user_id"], provider="google", provider_user_id=sub, email=clean_email, email_verified=True)
+            tok = user.get("unique_token", "")
+            response.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax")
+            return {
+                "status": "success",
+                "token": tok,
+                "user_id": user["user_id"],
+                "role": user.get("role", role),
+                "email": user.get("primary_email", clean_email),
+                "display_name": user.get("display_name", dname),
+                "github_username": user.get("github_username", ""),
+                "is_new_user": True
+            }
+
         user = memory.get_or_create_registered_user(clean_email, default_role=role, display_name=dname)
-
         tok = user.get("unique_token", "")
-
         response.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax")
-
         return {
-
             "status": "success",
-
             "token": tok,
-
             "role": user.get("role", role),
-
             "email": user.get("email", clean_email),
-
             "display_name": user.get("display_name", dname),
-
             "is_new_user": user.get("is_new_user", False)
-
         }
 
     @app.post("/api/auth/verify-code")
@@ -2468,6 +2533,46 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                 gh_name = u_data.get("name") or gh_user
                 gh_email = u_data.get("email") or f"{gh_user.lower()}@github.com"
 
+                gh_uid = str(u_data.get("id") or gh_user)
+                gh_email = str(u_data.get("email") or "").strip().lower()
+
+                # Check email verification status from GitHub API
+                email_verified = False
+                if "verified" in u_data:
+                    email_verified = bool(u_data.get("verified"))
+                elif "email_verified" in u_data:
+                    email_verified = bool(u_data.get("email_verified"))
+
+                if not email_verified or not gh_email:
+                    try:
+                        emails_res = await client.get(
+                            "https://api.github.com/user/emails",
+                            headers={
+                                "Authorization": f"Bearer {access_token}",
+                                "Accept": "application/vnd.github+json",
+                                "User-Agent": "Project-Libra"
+                            }
+                        )
+                        if emails_res.status_code == 200:
+                            emails_data = emails_res.json()
+                            if isinstance(emails_data, list):
+                                match = None
+                                if gh_email:
+                                    match = next((item for item in emails_data if str(item.get("email", "")).lower() == gh_email.lower()), None)
+                                if not match:
+                                    match = next((item for item in emails_data if item.get("primary") and item.get("verified")), None)
+                                if not match and emails_data:
+                                    match = emails_data[0]
+                                if match:
+                                    gh_email = str(match.get("email", "")).lower()
+                                    email_verified = bool(match.get("verified", False))
+                    except Exception as email_err:
+                        logger.debug(f"GitHub user/emails fallback: {email_err}")
+
+                if not gh_email:
+                    gh_email = f"{gh_user.lower()}@github.com"
+                    email_verified = False
+
                 # Discard access token immediately (do not store or log)
                 del access_token
                 del token_data
@@ -2476,14 +2581,79 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                 if not memory:
                     raise HTTPException(status_code=500, detail="Memory subsystem offline")
 
+                # 1. Check if this exact GitHub identity is already linked
+                identity = memory.get_identity("github", gh_uid) if hasattr(memory, "get_identity") else None
+                if identity and hasattr(memory, "get_canonical_user_by_id"):
+                    canonical_user = memory.get_canonical_user_by_id(identity["user_id"])
+                    if canonical_user:
+                        tok = canonical_user["unique_token"]
+                        resp = HTMLResponse(f"""<!DOCTYPE html>
+<html>
+<head><title>Authenticated</title></head>
+<body style="background:#09090b; color:#ffffff; font-family:-apple-system, sans-serif; text-align:center; padding-top:60px;">
+  <h2>Authenticated with GitHub</h2>
+  <p>Logging into Project Libra as <strong>@{html.escape(gh_user)}</strong>...</p>
+  <script>
+    localStorage.setItem('libra_token', '{tok}');
+    document.cookie = 'libra_auth={tok}; path=/; max-age=2592000; SameSite=Lax';
+    window.location.href = '/';
+  </script>
+</body>
+</html>""", status_code=200)
+                        resp.set_cookie(key="libra_token", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
+                        resp.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
+                        resp.delete_cookie(key="libra_gh_state", path="/")
+                        return resp
+
+                # 2. Check for linking candidate (ONLY IF EMAIL IS VERIFIED BY PROVIDER)
+                # CRITICAL SECURITY RULE: Unverified emails NEVER trigger a linking prompt or merge!
+                candidate = None
+                if email_verified and hasattr(memory, "find_linking_candidate"):
+                    candidate = memory.find_linking_candidate(gh_email, "github", email_verified=True)
+
+                if candidate and hasattr(memory, "create_pending_link"):
+                    link_token = memory.create_pending_link(
+                        user_id=candidate["user"]["user_id"],
+                        provider="github",
+                        provider_user_id=gh_uid,
+                        email=gh_email,
+                        display_name=gh_name,
+                        github_username=gh_user,
+                        other_provider=candidate["existing_provider"]
+                    )
+                    resp = _render_account_linking_screen(
+                        link_token=link_token,
+                        email=gh_email,
+                        other_provider=candidate["existing_provider"],
+                        new_provider="GitHub",
+                        new_username=gh_user
+                    )
+                    resp.delete_cookie(key="libra_gh_state", path="/")
+                    return resp
+
+                # 3. Otherwise (unverified email or new user): Create separate canonical user & link identity
                 is_host = (gh_email.lower() == admin_email.lower() or gh_user.lower() == "REDACTED")
                 role = "host" if is_host else "tester"
-                user = memory.get_or_create_registered_user(
+                user = memory.create_canonical_user(
+                    primary_email=gh_email,
+                    display_name=gh_name,
+                    role=role,
+                    github_username=gh_user
+                ) if hasattr(memory, "create_canonical_user") else memory.get_or_create_registered_user(
                     email=gh_email,
                     default_role=role,
                     display_name=gh_name,
                     github_username=gh_user
                 )
+                if hasattr(memory, "link_identity"):
+                    memory.link_identity(
+                        user_id=user["user_id"],
+                        provider="github",
+                        provider_user_id=gh_uid,
+                        email=gh_email,
+                        email_verified=email_verified,
+                        github_username=gh_user
+                    )
                 tok = user.get("unique_token", "")
 
                 resp = HTMLResponse(f"""<!DOCTYPE html>
@@ -2508,6 +2678,280 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             return HTMLResponse(f"<h3>GitHub Authentication Error</h3><p>An unexpected error occurred during authentication.</p><p><a href='/auth/github/login'>Return to Login</a></p>", status_code=500)
 
     # -----------------------------------------------------------------------
+
+
+    # -----------------------------------------------------------------------
+    # ACCOUNT LINKING CONFIRMATION & MANAGEMENT (Phase 14)
+    # -----------------------------------------------------------------------
+
+    def _render_account_linking_screen(link_token: str, email: str, other_provider: str, new_provider: str = "GitHub", new_username: str = ""):
+        """Renders the high-class responsive HTML confirmation screen for account linking."""
+        other_disp = other_provider.title()
+        new_disp = new_provider.title()
+        return HTMLResponse(f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Account Linking - Project Libra</title>
+  <style>
+    :root {{
+      --bg-app: #09090b;
+      --bg-card: #121215;
+      --border-subtle: rgba(255, 255, 255, 0.1);
+      --border-focus: rgba(16, 185, 129, 0.4);
+      --text-primary: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent-green: #10b981;
+      --accent-green-hover: #059669;
+    }}
+    body {{
+      margin: 0;
+      padding: 20px;
+      background: var(--bg-app);
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-sizing: border-box;
+    }}
+    .linking-card {{
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 16px;
+      padding: 36px 32px;
+      max-width: 480px;
+      width: 100%;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+      text-align: center;
+      box-sizing: border-box;
+    }}
+    .badge-row {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      margin-bottom: 24px;
+    }}
+    .provider-pill {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      font-size: 13px;
+      font-weight: 500;
+      color: #e2e8f0;
+    }}
+    .link-icon-wrap {{
+      color: #64748b;
+      font-size: 16px;
+      display: flex;
+      align-items: center;
+    }}
+    h1 {{
+      font-size: 22px;
+      font-weight: 600;
+      margin: 0 0 12px 0;
+      letter-spacing: -0.02em;
+    }}
+    .prompt-box {{
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 12px;
+      padding: 16px 18px;
+      margin: 20px 0 24px 0;
+      text-align: left;
+    }}
+    .prompt-text {{
+      font-size: 15px;
+      line-height: 1.5;
+      color: #f1f5f9;
+      margin: 0 0 8px 0;
+    }}
+    .prompt-text strong {{
+      color: #ffffff;
+      font-weight: 600;
+    }}
+    .prompt-subtext {{
+      font-size: 12px;
+      color: var(--text-muted);
+      line-height: 1.4;
+      margin: 0;
+    }}
+    .button-stack {{
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }}
+    .btn {{
+      width: 100%;
+      padding: 13px 20px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      border: none;
+      transition: all 0.15s ease;
+      box-sizing: border-box;
+      text-decoration: none;
+      display: inline-block;
+      text-align: center;
+    }}
+    .btn-confirm-link {{
+      background: var(--accent-green);
+      color: #042f2e;
+    }}
+    .btn-confirm-link:hover {{
+      background: var(--accent-green-hover);
+      transform: translateY(-1px);
+    }}
+    .btn-decline-link {{
+      background: transparent;
+      color: #cbd5e1;
+      border: 1px solid rgba(255, 255, 255, 0.15);
+    }}
+    .btn-decline-link:hover {{
+      background: rgba(255, 255, 255, 0.05);
+      border-color: rgba(255, 255, 255, 0.3);
+      color: #ffffff;
+    }}
+    .back-link {{
+      margin-top: 24px;
+      font-size: 13px;
+    }}
+    .back-link a {{
+      color: var(--text-muted);
+      text-decoration: none;
+    }}
+    .back-link a:hover {{
+      color: #ffffff;
+      text-decoration: underline;
+    }}
+  </style>
+</head>
+<body>
+  <div class="linking-card" id="account-linking-card">
+    <div class="badge-row">
+      <span class="provider-pill">
+        <span>{html.escape(other_disp)}</span>
+      </span>
+      <span class="link-icon-wrap">&harr;</span>
+      <span class="provider-pill">
+        <span>{html.escape(new_disp)}</span>
+      </span>
+    </div>
+    <h1>Link Your Accounts</h1>
+    <div class="prompt-box">
+      <p class="prompt-text" id="linking-prompt-message">
+        An account using <strong>{html.escape(email)}</strong> already exists, created via <strong>{html.escape(other_disp)}</strong>. Link your accounts?
+      </p>
+      <p class="prompt-subtext">
+        Linking unites both logins under one profile, giving you shared conversation threads, tokens, and unified bug tracking.
+      </p>
+    </div>
+    <form method="POST" action="/api/auth/link-account" class="button-stack" id="linking-form">
+      <input type="hidden" name="link_token" value="{html.escape(link_token)}">
+      <button type="submit" name="action" value="link" class="btn btn-confirm-link" id="confirm-link-btn">Yes, Link Accounts</button>
+      <button type="submit" name="action" value="separate" class="btn btn-decline-link" id="decline-link-btn">No, Keep Separate</button>
+    </form>
+    <div class="back-link">
+      <a href="/">&larr; Return to Libra</a>
+    </div>
+  </div>
+</body>
+</html>""", status_code=200)
+
+    @app.get("/auth/link-confirmation")
+    async def get_account_link_confirmation(token: Optional[str] = Query(None)):
+        """Renders the account linking confirmation page for a given link_token."""
+        if not token:
+            return HTMLResponse("<h3>Invalid or missing account linking token.</h3><p><a href='/'>Return to Libra</a></p>", status_code=400)
+        memory = getattr(supervisor.llm, "memory", None)
+        if not memory or not hasattr(memory, "get_pending_link"):
+            raise HTTPException(status_code=500, detail="Memory subsystem offline")
+        pending = memory.get_pending_link(token)
+        if not pending:
+            return HTMLResponse("<h3>Linking token expired or already used.</h3><p><a href='/'>Return to Libra</a></p>", status_code=400)
+        return _render_account_linking_screen(
+            link_token=token,
+            email=pending["email"],
+            other_provider=pending.get("other_provider", "Google"),
+            new_provider=pending.get("provider", "GitHub"),
+            new_username=pending.get("github_username", "")
+        )
+
+    @app.post("/api/auth/link-account")
+    async def post_confirm_account_link(
+        request: Request,
+        response: Response
+    ):
+        """Confirms or declines account linking, supporting both JSON REST calls and HTML Form posts."""
+        memory = getattr(supervisor.llm, "memory", None)
+        if not memory or not hasattr(memory, "confirm_account_link"):
+            raise HTTPException(status_code=500, detail="Memory subsystem offline")
+
+        link_token = ""
+        action = "link"
+
+        try:
+            ct = request.headers.get("content-type", "")
+            if "application/json" in ct:
+                body = await request.json()
+                if isinstance(body, dict):
+                    link_token = body.get("link_token", "")
+                    action = body.get("action", "link")
+            else:
+                form = await request.form()
+                link_token = form.get("link_token", "")
+                action = form.get("action", "link")
+        except Exception:
+            pass
+
+        if not link_token:
+            raise HTTPException(status_code=400, detail="link_token is required.")
+
+        try:
+            result = memory.confirm_account_link(link_token, action)
+        except ValueError as ve:
+            raise HTTPException(status_code=400, detail=str(ve))
+
+        user = result.get("user") or {}
+        tok = user.get("unique_token", "")
+        response.set_cookie(key="libra_token", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
+        response.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
+
+        # If browser HTML submission, return authenticated redirect HTML
+        accept_header = request.headers.get("accept", "")
+        if "text/html" in accept_header and "application/json" not in accept_header:
+            return HTMLResponse(f"""<!DOCTYPE html>
+<html>
+<head><title>Authenticated</title></head>
+<body style="background:#09090b; color:#ffffff; font-family:-apple-system, sans-serif; text-align:center; padding-top:60px;">
+  <h2>Account Updated</h2>
+  <p>Logging into Project Libra as <strong>{html.escape(user.get('display_name', 'User'))}</strong>...</p>
+  <script>
+    localStorage.setItem('libra_token', '{tok}');
+    document.cookie = 'libra_auth={tok}; path=/; max-age=2592000; SameSite=Lax';
+    window.location.href = '/';
+  </script>
+</body>
+</html>""", status_code=200)
+
+        return {
+            "status": "success",
+            "action": action,
+            "token": tok,
+            "user_id": user.get("user_id", ""),
+            "email": user.get("primary_email") or user.get("email", ""),
+            "display_name": user.get("display_name", ""),
+            "role": user.get("role", "tester"),
+            "github_username": user.get("github_username", "")
+        }
 
     # MULTI-CHAT SESSIONS API (Phase 10 Gemini-Style Threads)
 

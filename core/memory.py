@@ -770,6 +770,59 @@ class SemanticMemory:
 
         """)
 
+        # 17. Canonical Users Table (Phase 14 Account Linking)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                primary_email TEXT NOT NULL,
+                display_name TEXT,
+                role TEXT DEFAULT 'guest',
+                unique_token TEXT UNIQUE NOT NULL,
+                github_username TEXT DEFAULT '',
+                totp_secret TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # 18. Identities Table (Multi-Provider Account Linking)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS identities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                provider_user_id TEXT NOT NULL,
+                email TEXT NOT NULL,
+                email_verified INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(provider, provider_user_id),
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            )
+        """)
+
+        # 19. Pending Account Links Table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_account_links (
+                link_token TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                provider_user_id TEXT NOT NULL,
+                email TEXT NOT NULL,
+                display_name TEXT,
+                github_username TEXT DEFAULT '',
+                other_provider TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at REAL NOT NULL
+            )
+        """)
+
+        try:
+            cols = [col[1] for col in cursor.execute("PRAGMA table_info(registered_users)").fetchall()]
+            if "user_id" not in cols:
+                cursor.execute("ALTER TABLE registered_users ADD COLUMN user_id TEXT DEFAULT ''")
+        except Exception:
+            pass
+
         conn.commit()
 
         if self.db_path != ":memory:":
@@ -5224,16 +5277,29 @@ class SemanticMemory:
 
         try:
 
-            # 1. Check registered users
-
+            # 1. Check canonical users table
             cursor.execute("""
-
-                SELECT email, display_name, role, unique_token, github_username
-
-                FROM registered_users
-
+                SELECT user_id, primary_email, display_name, role, unique_token, github_username
+                FROM users
                 WHERE unique_token = ?
+            """, (token.strip(),))
+            urow = cursor.fetchone()
+            if urow and hmac.compare_digest(str(urow[4]), str(token.strip())):
+                return {
+                    "user_id": urow[0],
+                    "email": urow[1],
+                    "primary_email": urow[1],
+                    "display_name": urow[2],
+                    "role": urow[3],
+                    "unique_token": urow[4],
+                    "github_username": urow[5] or ""
+                }
 
+            # 2. Check registered users fallback
+            cursor.execute("""
+                SELECT email, display_name, role, unique_token, github_username, user_id
+                FROM registered_users
+                WHERE unique_token = ?
             """, (token.strip(),))
 
             row = cursor.fetchone()
@@ -5696,6 +5762,471 @@ class SemanticMemory:
             return ""
 
         return "\n".join(parts)
+
+
+    # -------------------------------------------------------------------------
+    # CANONICAL USERS & MULTI-PROVIDER ACCOUNT LINKING (Phase 14)
+    # -------------------------------------------------------------------------
+
+    def get_canonical_user_by_id(self, user_id: str) -> Optional[dict]:
+        """Gets canonical user record by internal user_id."""
+        if not user_id:
+            return None
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT user_id, primary_email, display_name, role, unique_token, github_username, totp_secret, created_at, last_login
+                FROM users
+                WHERE user_id = ?
+            """, (user_id.strip(),))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "user_id": row[0],
+                    "email": row[1],
+                    "primary_email": row[1],
+                    "display_name": row[2],
+                    "role": row[3],
+                    "unique_token": row[4],
+                    "github_username": row[5] or "",
+                    "totp_secret": row[6] or "",
+                    "created_at": str(row[7]),
+                    "last_login": str(row[8])
+                }
+            return None
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def get_canonical_user_by_email(self, email: str) -> Optional[dict]:
+        """Gets canonical user record by primary email or verified identity email."""
+        if not email:
+            return None
+        clean_email = email.strip().lower()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT user_id, primary_email, display_name, role, unique_token, github_username, totp_secret, created_at, last_login
+                FROM users
+                WHERE LOWER(primary_email) = ?
+            """, (clean_email,))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "user_id": row[0],
+                    "email": row[1],
+                    "primary_email": row[1],
+                    "display_name": row[2],
+                    "role": row[3],
+                    "unique_token": row[4],
+                    "github_username": row[5] or "",
+                    "totp_secret": row[6] or "",
+                    "created_at": str(row[7]),
+                    "last_login": str(row[8])
+                }
+
+            cursor.execute("""
+                SELECT u.user_id, u.primary_email, u.display_name, u.role, u.unique_token, u.github_username, u.totp_secret, u.created_at, u.last_login
+                FROM identities i
+                JOIN users u ON i.user_id = u.user_id
+                WHERE LOWER(i.email) = ? AND i.email_verified = 1
+                ORDER BY i.created_at ASC
+                LIMIT 1
+            """, (clean_email,))
+            irow = cursor.fetchone()
+            if irow:
+                return {
+                    "user_id": irow[0],
+                    "email": irow[1],
+                    "primary_email": irow[1],
+                    "display_name": irow[2],
+                    "role": irow[3],
+                    "unique_token": irow[4],
+                    "github_username": irow[5] or "",
+                    "totp_secret": irow[6] or "",
+                    "created_at": str(irow[7]),
+                    "last_login": str(irow[8])
+                }
+            return None
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def create_canonical_user(
+        self,
+        primary_email: str,
+        display_name: str = "",
+        role: str = "guest",
+        unique_token: str = None,
+        github_username: str = "",
+        totp_secret: str = ""
+    ) -> dict:
+        """Creates a fresh canonical user with a unique user_id."""
+        import secrets
+        clean_email = primary_email.strip().lower()
+        user_id = f"usr_{secrets.token_hex(8)}"
+        tok = unique_token or f"libra_usr_{secrets.token_hex(16)}"
+        dname = (display_name or clean_email.split("@")[0]).strip()
+        gh_user = (github_username or "").strip()
+        totp = (totp_secret or "").strip()
+
+        is_main_host = (clean_email == "REDACTED")
+        effective_role = "host" if is_main_host else (role or "tester")
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO users (user_id, primary_email, display_name, role, unique_token, github_username, totp_secret, created_at, last_login)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """, (user_id, clean_email, dname, effective_role, tok, gh_user, totp))
+
+            cursor.execute("SELECT email FROM registered_users WHERE LOWER(email) = ?", (clean_email,))
+            if not cursor.fetchone():
+                cursor.execute("""
+                    INSERT INTO registered_users (email, display_name, role, unique_token, totp_secret, github_username, created_at, last_login, user_id)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+                """, (clean_email, dname, effective_role, tok, totp, gh_user, user_id))
+            else:
+                cursor.execute("""
+                    UPDATE registered_users
+                    SET user_id = ?, github_username = COALESCE(NULLIF(github_username, ''), ?)
+                    WHERE LOWER(email) = ?
+                """, (user_id, gh_user, clean_email))
+
+            conn.commit()
+            return {
+                "user_id": user_id,
+                "email": clean_email,
+                "primary_email": clean_email,
+                "display_name": dname,
+                "role": effective_role,
+                "unique_token": tok,
+                "github_username": gh_user,
+                "totp_secret": totp,
+                "is_new_user": True
+            }
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def get_identity(self, provider: str, provider_user_id: str) -> Optional[dict]:
+        """Gets identity by provider and provider-specific user ID."""
+        if not provider or not provider_user_id:
+            return None
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT id, user_id, provider, provider_user_id, email, email_verified, created_at
+                FROM identities
+                WHERE LOWER(provider) = ? AND provider_user_id = ?
+            """, (provider.strip().lower(), str(provider_user_id).strip()))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "id": row[0],
+                    "user_id": row[1],
+                    "provider": row[2],
+                    "provider_user_id": row[3],
+                    "email": row[4],
+                    "email_verified": bool(row[5]),
+                    "created_at": str(row[6])
+                }
+            return None
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def get_user_identities(self, user_id: str) -> list[dict]:
+        """Lists all identities linked to a canonical user."""
+        if not user_id:
+            return []
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT id, user_id, provider, provider_user_id, email, email_verified, created_at
+                FROM identities
+                WHERE user_id = ?
+                ORDER BY created_at ASC
+            """, (user_id.strip(),))
+            rows = cursor.fetchall()
+            return [{
+                "id": r[0],
+                "user_id": r[1],
+                "provider": r[2],
+                "provider_user_id": r[3],
+                "email": r[4],
+                "email_verified": bool(r[5]),
+                "created_at": str(r[6])
+            } for r in rows]
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def link_identity(
+        self,
+        user_id: str,
+        provider: str,
+        provider_user_id: str,
+        email: str,
+        email_verified: bool = False,
+        github_username: str = ""
+    ) -> dict:
+        """
+        Links an identity to a canonical user.
+        Enforces UNIQUE(provider, provider_user_id) constraint.
+        """
+        if not user_id or not provider or not provider_user_id:
+            raise ValueError("user_id, provider, and provider_user_id are required.")
+
+        prov = provider.strip().lower()
+        p_uid = str(provider_user_id).strip()
+        clean_email = email.strip().lower()
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT id, user_id, provider, provider_user_id, email, email_verified, created_at
+                FROM identities
+                WHERE provider = ? AND provider_user_id = ?
+            """, (prov, p_uid))
+            existing = cursor.fetchone()
+            if existing:
+                if existing[1] == user_id:
+                    return {
+                        "id": existing[0],
+                        "user_id": existing[1],
+                        "provider": existing[2],
+                        "provider_user_id": existing[3],
+                        "email": existing[4],
+                        "email_verified": bool(existing[5]),
+                        "created_at": str(existing[6])
+                    }
+                else:
+                    raise ValueError(f"Provider account '{prov}:{p_uid}' is already linked to another user.")
+
+            cursor.execute("""
+                INSERT INTO identities (user_id, provider, provider_user_id, email, email_verified, created_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (user_id, prov, p_uid, clean_email, 1 if email_verified else 0))
+            new_id = cursor.lastrowid
+
+            if github_username:
+                gh_clean = github_username.strip()
+                cursor.execute("UPDATE users SET github_username = ? WHERE user_id = ?", (gh_clean, user_id))
+                cursor.execute("UPDATE registered_users SET github_username = ? WHERE user_id = ?", (gh_clean, user_id))
+
+            conn.commit()
+            return {
+                "id": new_id,
+                "user_id": user_id,
+                "provider": prov,
+                "provider_user_id": p_uid,
+                "email": clean_email,
+                "email_verified": bool(email_verified)
+            }
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def find_linking_candidate(self, email: str, provider: str, email_verified: bool) -> Optional[dict]:
+        """
+        Checks if a verified email matches an existing account created via a DIFFERENT provider.
+        CRITICAL SECURITY PROPERTY: If email_verified is False, NEVER returns a candidate.
+        """
+        if not email or not email_verified:
+            return None
+
+        clean_email = email.strip().lower()
+        prov = provider.strip().lower()
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT user_id, primary_email, display_name, role, unique_token, github_username
+                FROM users
+                WHERE LOWER(primary_email) = ?
+            """, (clean_email,))
+            user_row = cursor.fetchone()
+
+            if not user_row:
+                cursor.execute("""
+                    SELECT email, display_name, role, unique_token, github_username, user_id
+                    FROM registered_users
+                    WHERE LOWER(email) = ?
+                """, (clean_email,))
+                reg_row = cursor.fetchone()
+                if reg_row:
+                    u_id = reg_row[5] if len(reg_row) > 5 and reg_row[5] else None
+                    if not u_id:
+                        u_res = self.create_canonical_user(
+                            primary_email=reg_row[0],
+                            display_name=reg_row[1],
+                            role=reg_row[2],
+                            unique_token=reg_row[3],
+                            github_username=reg_row[4] or ""
+                        )
+                        u_id = u_res["user_id"]
+                    user_row = (u_id, reg_row[0], reg_row[1], reg_row[2], reg_row[3], reg_row[4])
+
+            if not user_row:
+                return None
+
+            user_id = user_row[0]
+
+            cursor.execute("""
+                SELECT provider, provider_user_id
+                FROM identities
+                WHERE user_id = ?
+            """, (user_id,))
+            identities = cursor.fetchall()
+
+            if any(i[0].lower() == prov for i in identities):
+                return None
+
+            other_provider = "email"
+            if identities:
+                other_provider = identities[0][0]
+            elif "gmail.com" in clean_email:
+                other_provider = "google"
+
+            user_dict = {
+                "user_id": user_row[0],
+                "email": user_row[1],
+                "primary_email": user_row[1],
+                "display_name": user_row[2],
+                "role": user_row[3],
+                "unique_token": user_row[4],
+                "github_username": user_row[5] or ""
+            }
+
+            return {
+                "user": user_dict,
+                "existing_provider": other_provider
+            }
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def create_pending_link(
+        self,
+        user_id: str,
+        provider: str,
+        provider_user_id: str,
+        email: str,
+        display_name: str = "",
+        github_username: str = "",
+        other_provider: str = "Google"
+    ) -> str:
+        """Creates a secure short-lived token for linking confirmation."""
+        import secrets
+        import time
+
+        link_token = f"link_{secrets.token_hex(20)}"
+        expires_at = time.time() + 600.0
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO pending_account_links (link_token, user_id, provider, provider_user_id, email, display_name, github_username, other_provider, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (link_token, user_id, provider.strip().lower(), str(provider_user_id).strip(), email.strip().lower(), display_name, github_username, other_provider, expires_at))
+            conn.commit()
+            return link_token
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def get_pending_link(self, link_token: str) -> Optional[dict]:
+        """Retrieves an active, unexpired pending link."""
+        if not link_token:
+            return None
+        import time
+        now = time.time()
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT link_token, user_id, provider, provider_user_id, email, display_name, github_username, other_provider, expires_at
+                FROM pending_account_links
+                WHERE link_token = ? AND expires_at > ?
+            """, (link_token.strip(), now))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    "link_token": row[0],
+                    "user_id": row[1],
+                    "provider": row[2],
+                    "provider_user_id": row[3],
+                    "email": row[4],
+                    "display_name": row[5],
+                    "github_username": row[6] or "",
+                    "other_provider": row[7],
+                    "expires_at": row[8]
+                }
+            return None
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+    def confirm_account_link(self, link_token: str, action: str) -> dict:
+        """
+        Processes user's confirmation decision on an account link:
+        - action == 'link': Links identity to existing canonical user_id.
+        - action == 'separate': Creates new canonical user and links identity to new user.
+        """
+        pending = self.get_pending_link(link_token)
+        if not pending:
+            raise ValueError("Invalid, expired, or already used account linking token.")
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("DELETE FROM pending_account_links WHERE link_token = ?", (link_token,))
+            conn.commit()
+        finally:
+            if self.db_path != ":memory:":
+                conn.close()
+
+        act = action.strip().lower()
+        if act == "link":
+            self.link_identity(
+                user_id=pending["user_id"],
+                provider=pending["provider"],
+                provider_user_id=pending["provider_user_id"],
+                email=pending["email"],
+                email_verified=True,
+                github_username=pending.get("github_username", "")
+            )
+            canonical_user = self.get_canonical_user_by_id(pending["user_id"])
+            return {"status": "linked", "action": "link", "user": canonical_user}
+
+        elif act == "separate":
+            new_user = self.create_canonical_user(
+                primary_email=pending["email"],
+                display_name=pending.get("display_name", ""),
+                role="tester",
+                github_username=pending.get("github_username", "")
+            )
+            self.link_identity(
+                user_id=new_user["user_id"],
+                provider=pending["provider"],
+                provider_user_id=pending["provider_user_id"],
+                email=pending["email"],
+                email_verified=True,
+                github_username=pending.get("github_username", "")
+            )
+            return {"status": "separated", "action": "separate", "user": new_user}
+
+        else:
+            raise ValueError(f"Invalid account linking action: {action}. Must be 'link' or 'separate'.")
 
 # Backward compatibility alias
 
