@@ -33,7 +33,7 @@ if PROJECT_ROOT not in sys.path:
 
 from core.orchestrator import SupervisorHub
 from core.llm import LocalLLM
-from core.memory import MemoryCore
+from core.memory import MemoryCore, get_host_identities
 from web.server import create_app, load_web_config
 
 
@@ -522,8 +522,9 @@ class TestAccountLinkingSecurity(unittest.TestCase):
         or artificial downgrade tied to the decline action.
         A decline by what would normally be a host-eligible signup must NOT get downgraded to tester/guest.
         """
-        host_email = "REDACTED"
-        host_gh_login = "REDACTED"
+        hosts = get_host_identities()
+        host_email = hosts["emails"][0] if hosts.get("emails") else "configured_host@example.com"
+        host_gh_login = hosts["github_usernames"][0] if hosts.get("github_usernames") else "configured_host_gh"
         host_gh_uid = "gh_host_999111"
 
         # 1. Existing Google user created with host_email
