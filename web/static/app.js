@@ -7818,26 +7818,6 @@
       const tok = authModalTokenInput.value.trim();
       if (!tok) return;
 
-      // Direct GitHub Personal Access Token or GitHub Username login
-      if (tok.startsWith('ghp_') || tok.startsWith('github_pat_')) {
-        authModalTokenBtn.disabled = true;
-        authModalTokenBtn.innerHTML = '<span>Verifying GitHub Token...</span>';
-        try {
-          const form = new FormData();
-          form.append('token', tok);
-          const r = await fetch('/auth/github/pat-login', { method: 'POST', body: form });
-          if (r.ok) {
-            window.location.reload();
-            return;
-          }
-        } catch (e) {
-          console.warn('GitHub login failed:', e);
-        } finally {
-          authModalTokenBtn.disabled = false;
-          authModalTokenBtn.innerHTML = '<span>🔑</span><span>Sign in with Key</span>';
-        }
-      }
-
       authToken = tok;
       localStorage.setItem('libra_token', tok);
       document.cookie = `libra_auth=${tok}; path=/; max-age=2592000; SameSite=Lax`;
