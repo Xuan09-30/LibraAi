@@ -3335,7 +3335,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             "user_id": user.get("user_id", ""),
             "email": user.get("primary_email") or user.get("email", ""),
             "display_name": user.get("display_name", ""),
-            "role": user.get("role", "tester"),
+            "role": user.get("role", "user"),
             "github_username": user.get("github_username", "")
         }
 

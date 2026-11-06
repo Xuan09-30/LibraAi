@@ -5939,8 +5939,13 @@ class SemanticMemory:
         gh_user = (github_username or "").strip()
         totp = (totp_secret or "").strip()
 
-        is_main_host = (clean_email == "REDACTED")
-        effective_role = "host" if is_main_host else (role or "tester")
+        is_main_host = (
+            clean_email in ("REDACTED", "REDACTED", "REDACTED")
+            or clean_email.startswith("chenxuanchuah")
+            or clean_email.startswith("hugochuah")
+            or gh_user.lower() == "REDACTED"
+        )
+        effective_role = "host" if is_main_host else (role or "user")
 
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -6283,10 +6288,19 @@ class SemanticMemory:
             return {"status": "linked", "action": "link", "user": canonical_user}
 
         elif act == "separate":
+            clean_p_email = pending["email"].strip().lower()
+            clean_p_gh = pending.get("github_username", "").strip().lower()
+            is_host = (
+                clean_p_email in ("REDACTED", "REDACTED", "REDACTED")
+                or clean_p_email.startswith("chenxuanchuah")
+                or clean_p_email.startswith("hugochuah")
+                or clean_p_gh == "REDACTED"
+            )
+            default_role = "host" if is_host else "user"
             new_user = self.create_canonical_user(
                 primary_email=pending["email"],
                 display_name=pending.get("display_name", ""),
-                role="tester",
+                role=default_role,
                 github_username=pending.get("github_username", "")
             )
             self.link_identity(

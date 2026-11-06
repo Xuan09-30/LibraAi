@@ -514,5 +514,76 @@ class TestAccountLinkingSecurity(unittest.TestCase):
 
 
 
+
+    def test_07_decline_by_host_eligible_signup_does_not_downgrade_to_tester_or_guest(self):
+        """
+        Spec requirement: Declining a link must create a new account via the normal
+        signup path with the normal default role determination, with no special-casing
+        or artificial downgrade tied to the decline action.
+        A decline by what would normally be a host-eligible signup must NOT get downgraded to tester/guest.
+        """
+        host_email = "REDACTED"
+        host_gh_login = "REDACTED"
+        host_gh_uid = "gh_host_999111"
+
+        # 1. Existing Google user created with host_email
+        orig_user = self.memory.create_canonical_user(
+            primary_email=host_email,
+            display_name="Chen Xuan Host",
+            role="host"
+        )
+        self.memory.link_identity(
+            user_id=orig_user["user_id"],
+            provider="google",
+            provider_user_id=host_email,
+            email=host_email,
+            email_verified=True
+        )
+
+        # 2. Host signs in via GitHub with matching verified host_email & host GitHub username
+        mock_token_resp = MagicMock()
+        mock_token_resp.status_code = 200
+        mock_token_resp.json.return_value = {"access_token": "gho_mock_token_host"}
+
+        mock_user_resp = MagicMock()
+        mock_user_resp.status_code = 200
+        mock_user_resp.json.return_value = {
+            "login": host_gh_login,
+            "id": host_gh_uid,
+            "email": host_email,
+            "verified": True,
+            "name": "Chuah Chen Xuan"
+        }
+
+        with patch("httpx.AsyncClient.post", return_value=mock_token_resp), \
+             patch("httpx.AsyncClient.get", return_value=mock_user_resp):
+            state = "csrf_state_host_decline_test"
+            clean_client = TestClient(self.app)
+            clean_client.cookies.set("libra_gh_state", state)
+            res = clean_client.get(f"/auth/github/callback?code=code_host&state={state}")
+            self.assertEqual(res.status_code, 200)
+
+            m = re.search(r'name=["\']link_token["\']\s+value=["\']([^"\']+)["\']', res.text)
+            self.assertIsNotNone(m, "Link token must be in the confirmation screen form")
+            link_token = m.group(1)
+
+            # 3. User declines: No, Keep Separate (action='separate')
+            decline_res = clean_client.post(
+                "/api/auth/link-account",
+                data={"link_token": link_token, "action": "separate"},
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            self.assertEqual(decline_res.status_code, 200)
+            res_data = decline_res.json()
+            self.assertEqual(res_data.get("action"), "separate")
+
+            # 4. Assert role: The separated account must have role == 'host', NOT downgraded to 'tester' or 'guest'
+            new_role = res_data.get("role")
+            self.assertEqual(
+                new_role,
+                "host",
+                f"Host-eligible signup declining a link must receive role='host', but received '{new_role}'!"
+            )
+
 if __name__ == "__main__":
     unittest.main()
