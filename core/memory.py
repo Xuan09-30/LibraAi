@@ -718,6 +718,8 @@ class SemanticMemory:
 
                 totp_secret TEXT DEFAULT '',
 
+                github_username TEXT DEFAULT '',
+
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
                 last_login TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -735,6 +737,10 @@ class SemanticMemory:
             if "totp_secret" not in cols:
 
                 cursor.execute("ALTER TABLE registered_users ADD COLUMN totp_secret TEXT DEFAULT ''")
+
+            if "github_username" not in cols:
+
+                cursor.execute("ALTER TABLE registered_users ADD COLUMN github_username TEXT DEFAULT ''")
 
         except Exception:
 
@@ -4701,7 +4707,7 @@ class SemanticMemory:
 
             cursor.execute("""
 
-                SELECT email, display_name, role, unique_token, totp_secret, created_at, last_login
+                SELECT email, display_name, role, unique_token, totp_secret, created_at, last_login, github_username
 
                 FROM registered_users
 
@@ -4729,7 +4735,9 @@ class SemanticMemory:
 
                 "created_at": row[5],
 
-                "last_login": row[6]
+                "last_login": row[6],
+
+                "github_username": row[7] if len(row) > 7 and row[7] else ""
 
             }
 
@@ -5047,7 +5055,9 @@ class SemanticMemory:
 
         display_name: str = "",
 
-        totp_secret: str = ""
+        totp_secret: str = "",
+
+        github_username: str = ""
 
     ) -> dict:
 
@@ -5073,7 +5083,7 @@ class SemanticMemory:
 
             cursor.execute("""
 
-                SELECT email, display_name, role, unique_token, totp_secret, created_at, last_login
+                SELECT email, display_name, role, unique_token, totp_secret, created_at, last_login, github_username
 
                 FROM registered_users
 
@@ -5111,6 +5121,11 @@ class SemanticMemory:
 
                     cursor.execute("UPDATE registered_users SET totp_secret = ? WHERE LOWER(email) = ?", (curr_totp, clean_email))
 
+                curr_gh = row[7] if len(row) > 7 and row[7] else ""
+                if github_username and github_username != curr_gh:
+                    curr_gh = github_username
+                    cursor.execute("UPDATE registered_users SET github_username = ? WHERE LOWER(email) = ?", (curr_gh, clean_email))
+
                 cursor.execute("""
 
                     UPDATE registered_users
@@ -5135,6 +5150,8 @@ class SemanticMemory:
 
                     "totp_secret": curr_totp,
 
+                    "github_username": curr_gh,
+
                     "created_at": row[5],
 
                     "last_login": row[6],
@@ -5150,14 +5167,15 @@ class SemanticMemory:
             dname = (display_name or clean_email.split("@")[0]).strip()
 
             final_totp = totp_secret or generate_totp_secret()
+            final_gh = (github_username or "").strip()
 
             cursor.execute("""
 
-                INSERT INTO registered_users (email, display_name, role, unique_token, totp_secret, created_at, last_login)
+                INSERT INTO registered_users (email, display_name, role, unique_token, totp_secret, github_username, created_at, last_login)
 
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
 
-            """, (clean_email, dname, effective_role, unique_token, final_totp))
+            """, (clean_email, dname, effective_role, unique_token, final_totp, final_gh))
 
             conn.commit()
 
@@ -5172,6 +5190,8 @@ class SemanticMemory:
                 "unique_token": unique_token,
 
                 "totp_secret": final_totp,
+
+                "github_username": final_gh,
 
                 "is_new_user": True
 
@@ -5207,7 +5227,7 @@ class SemanticMemory:
 
             cursor.execute("""
 
-                SELECT email, display_name, role, unique_token
+                SELECT email, display_name, role, unique_token, github_username
 
                 FROM registered_users
 
@@ -5219,6 +5239,7 @@ class SemanticMemory:
 
             if row and hmac.compare_digest(str(row[3]), str(token.strip())):
 
+                gh_user = row[4] if len(row) > 4 and row[4] else ""
                 return {
 
                     "email": row[0],
@@ -5227,7 +5248,11 @@ class SemanticMemory:
 
                     "role": row[2],
 
-                    "token": row[3]
+                    "token": row[3],
+
+                    "github_username": gh_user,
+
+                    "github_login": gh_user
 
                 }
 
