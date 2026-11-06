@@ -54,9 +54,11 @@ def test_stream_token_progressive_rendering_app_js():
 
 def test_async_web_search_fanout():
     """Verify Task 4: Parallel async web search fanout across providers with fast response."""
+    import concurrent.futures
     engine = HardenedResearchEngine()
     t0 = time.perf_counter()
-    res = asyncio.run(engine.async_search_and_extract("NBA basketball news today", max_sources=2))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        res = ex.submit(lambda: asyncio.run(engine.async_search_and_extract("NBA basketball news today", max_sources=2))).result()
     dt = time.perf_counter() - t0
 
     assert isinstance(res, dict)

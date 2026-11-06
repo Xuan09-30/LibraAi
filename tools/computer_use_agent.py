@@ -502,6 +502,11 @@ class AutonomousComputerUseAgent:
 
         return {"popup_detected": False}
 
+    def is_game_mode_active(self) -> bool:
+        """Returns True if Gaming Shield / Anti-Cheat Safe Mode is currently active."""
+        gov = get_vram_governor()
+        return bool(gov and gov.is_gaming_lite_mode())
+
     def execute_task(
         self,
         prompt: str,
@@ -515,8 +520,7 @@ class AutonomousComputerUseAgent:
         - `thought_steps`: UI-compatible step cards for the Web/Mobile Thought Process box
         """
         # Anti-cheat safety guard: never send synthetic mouse/keyboard inputs while a game is running
-        gov = get_vram_governor()
-        if not dry_run and gov and gov.is_gaming_lite_mode():
+        if not dry_run and self.is_game_mode_active():
             blocked_step = {
                 "step": 1,
                 "thought": "Protected game / anti-cheat detected. Paused synthetic mouse & keyboard automation to keep Anti-Cheat Safe Mode 100% compliant.",

@@ -54,3 +54,20 @@ def test_semantic_memory_never_writes_real_db_or_vault():
         assert os.path.getmtime(real_db_path) == orig_db_mtime, "Real assets/libra_memory.db was modified during test!"
     new_vault_files = set(os.listdir(real_vault_dir))
     assert new_vault_files == orig_vault_files, f"Real assets/vault received new files: {new_vault_files - orig_vault_files}"
+
+
+def test_tracked_files_under_assets_never_modified_during_run():
+    """
+    Round 5 Item 3:
+    Fails if any tracked file under assets/ changes during the test run.
+    Uses git diff-index against HEAD for assets/.
+    """
+    import subprocess
+    proc = subprocess.run(
+        ["git", "diff-index", "--name-status", "HEAD", "--", "assets"],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True
+    )
+    modified_tracked = [line for line in proc.stdout.splitlines() if line.strip() and not line.startswith("?")]
+    assert len(modified_tracked) == 0, f"Tracked files under assets/ were modified during test run: {modified_tracked}"

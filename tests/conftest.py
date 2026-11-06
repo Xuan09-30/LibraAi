@@ -56,34 +56,59 @@ def isolate_test_environment(tmp_path_factory):
     if os.path.isfile(real_user):
         shutil.copy2(real_user, test_user)
 
+    test_lessons = str(test_sandbox / "LESSONS.md")
+    real_lessons = os.path.join(PROJECT_ROOT, "assets", "LESSONS.md")
+    if os.path.isfile(real_lessons):
+        shutil.copy2(real_lessons, test_lessons)
+
+    test_skills = str(test_sandbox / "skills")
+    real_skills = os.path.join(PROJECT_ROOT, "skills")
+    if os.path.isdir(real_skills):
+        shutil.copytree(real_skills, test_skills, dirs_exist_ok=True)
+
+    test_plots = str(test_sandbox / "plots")
+    os.makedirs(test_plots, exist_ok=True)
+
+    test_uploads = str(test_sandbox / "uploads")
+    os.makedirs(test_uploads, exist_ok=True)
+
+    test_assets = str(test_sandbox / "assets")
+    os.makedirs(test_assets, exist_ok=True)
+
     orig_vault = os.environ.get("LIBRA_VAULT_DIR")
     orig_db = os.environ.get("LIBRA_MEMORY_DB")
     orig_soul = os.environ.get("LIBRA_SOUL_PATH")
     orig_user = os.environ.get("LIBRA_USER_PATH")
+    orig_lessons = os.environ.get("LIBRA_LESSONS_PATH")
+    orig_skills = os.environ.get("LIBRA_SKILLS_DIR")
+    orig_plots = os.environ.get("LIBRA_PLOTS_DIR")
+    orig_uploads = os.environ.get("LIBRA_UPLOADS_DIR")
+    orig_assets = os.environ.get("LIBRA_ASSETS_DIR")
 
     os.environ["LIBRA_VAULT_DIR"] = str(test_vault)
     os.environ["LIBRA_MEMORY_DB"] = test_db
     os.environ["LIBRA_SOUL_PATH"] = test_soul
     os.environ["LIBRA_USER_PATH"] = test_user
+    os.environ["LIBRA_LESSONS_PATH"] = test_lessons
+    os.environ["LIBRA_SKILLS_DIR"] = test_skills
+    os.environ["LIBRA_PLOTS_DIR"] = test_plots
+    os.environ["LIBRA_UPLOADS_DIR"] = test_uploads
+    os.environ["LIBRA_ASSETS_DIR"] = test_assets
 
     yield
 
-    if orig_vault is not None:
-        os.environ["LIBRA_VAULT_DIR"] = orig_vault
-    else:
-        os.environ.pop("LIBRA_VAULT_DIR", None)
-
-    if orig_db is not None:
-        os.environ["LIBRA_MEMORY_DB"] = orig_db
-    else:
-        os.environ.pop("LIBRA_MEMORY_DB", None)
-
-    if orig_soul is not None:
-        os.environ["LIBRA_SOUL_PATH"] = orig_soul
-    else:
-        os.environ.pop("LIBRA_SOUL_PATH", None)
-
-    if orig_user is not None:
-        os.environ["LIBRA_USER_PATH"] = orig_user
-    else:
-        os.environ.pop("LIBRA_USER_PATH", None)
+    for k, v in [
+        ("LIBRA_VAULT_DIR", orig_vault),
+        ("LIBRA_MEMORY_DB", orig_db),
+        ("LIBRA_SOUL_PATH", orig_soul),
+        ("LIBRA_USER_PATH", orig_user),
+        ("LIBRA_LESSONS_PATH", orig_lessons),
+        ("LIBRA_SKILLS_DIR", orig_skills),
+        ("LIBRA_PLOTS_DIR", orig_plots),
+        ("LIBRA_UPLOADS_DIR", orig_uploads),
+        ("LIBRA_ASSETS_DIR", orig_assets),
+    ]:
+        if v is not None:
+            os.environ[k] = v
+        else:
+            os.environ.pop(k, None)

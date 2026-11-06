@@ -839,7 +839,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
     # -----------------------------------------------------------------------
 
-    upload_dir = os.path.join(PROJECT_ROOT, "assets", "uploads")
+    upload_dir = os.environ.get("LIBRA_UPLOADS_DIR") or os.path.join(PROJECT_ROOT, "assets", "uploads")
 
     os.makedirs(upload_dir, exist_ok=True)
 
@@ -4136,6 +4136,16 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         reply_text = result.get("voice_response") or "Command processed."
 
         action = result.get("action")
+
+        # Format and append source citations for non-streaming web chat if present
+        srcs = result.get("sources", [])
+        if srcs and isinstance(srcs, list) and not re.search(r"\*Sources:", reply_text, re.IGNORECASE):
+            src_links = []
+            for s in srcs:
+                if isinstance(s, dict) and s.get("url") and s.get("name"):
+                    src_links.append(f"[{s['name']}]({s['url']})")
+            if src_links:
+                reply_text += f"\n\n*Sources: {' • '.join(src_links[:3])}*" 
         if action == "show_ui":
             send_local_ipc_command("show")
         elif action == "hide_ui":
@@ -4288,6 +4298,8 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             "hud_card": result.get("hud_card"),
 
             "scratchpad": result.get("scratchpad"),
+
+            "sources": result.get("sources", []),
 
             "thought_steps": result.get("thought_steps", []),
 

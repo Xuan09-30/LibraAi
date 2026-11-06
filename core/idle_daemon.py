@@ -29,7 +29,7 @@ class IdleTaskDaemon:
         cooldown_sec: float = 3600.0,
         db_path: str = "assets/libra_memory.db",
         log_path: str = "logs/latency_metrics.jsonl",
-        plots_dir: str = "assets/plots",
+        plots_dir: Optional[str] = None,
         user_md_path: str = "assets/USER.md"
     ):
         self.memory = memory
@@ -40,7 +40,12 @@ class IdleTaskDaemon:
         self.cooldown_sec = cooldown_sec
         self.db_path = os.path.join(PROJECT_ROOT, db_path)
         self.log_path = os.path.join(PROJECT_ROOT, log_path)
-        self.plots_dir = os.path.join(PROJECT_ROOT, plots_dir)
+        if plots_dir is None:
+            self.plots_dir = os.environ.get("LIBRA_PLOTS_DIR") or os.path.join(PROJECT_ROOT, "assets", "plots")
+        elif os.path.isabs(plots_dir):
+            self.plots_dir = plots_dir
+        else:
+            self.plots_dir = os.path.join(PROJECT_ROOT, plots_dir)
         self.user_md_path = os.path.join(PROJECT_ROOT, user_md_path)
 
         self.last_activity_time: float = time.time()

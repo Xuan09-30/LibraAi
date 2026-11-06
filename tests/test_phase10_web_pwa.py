@@ -1,6 +1,19 @@
 import os
 import sys
+import time
 import unittest
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+
+class MockJWKSClient:
+    def __init__(self, public_key):
+        self.public_key = public_key
+
+    def get_signing_key_from_jwt(self, token):
+        class MockKey:
+            def __init__(self, key):
+                self.key = key
+        return MockKey(self.public_key)
 import json
 import wave
 import io
@@ -26,6 +39,19 @@ class TestPhase10WebPWA(unittest.TestCase):
         cls.token = cls.cfg.get("access_token", "libra_access_token_phase10_secure")
         cls.app = create_app(hub=cls.hub, config_path="config.json")
         cls.client = TestClient(cls.app)
+
+        # Generate RSA keypair for RS256 JWKS testing (Round 5 Item 1)
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        cls.rsa_private_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        cls.rsa_public_pem = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        cls.mock_jwks = MockJWKSClient(cls.rsa_public_pem)
 
     # -----------------------------------------------------------------------
     # 1. CLIENT SCOPE SANDBOXING TESTS
@@ -88,11 +114,18 @@ class TestPhase10WebPWA(unittest.TestCase):
         res_stranger_forged = self.client.get("/api/vitals", headers=headers_stranger_forged)
         self.assertEqual(res_stranger_forged.status_code, 401)
 
-        # Stranger email with Cloudflare Access enabled and valid JWT -> 403 Forbidden
+        # Stranger email with Cloudflare Access enabled and valid RS256 JWT -> 403 Forbidden
         import jwt
         self.app.state.cloudflare_access_enabled = True
-        self.app.state.cloudflare_access_secret = "test-secret"
-        stranger_jwt = jwt.encode({"email": "stranger@gmail.com"}, "test-secret", algorithm="HS256")
+        self.app.state.cloudflare_access_team_domain = "team"
+        self.app.state.cloudflare_access_audience = "test-aud"
+        self.app.state.cloudflare_access_jwks_client = self.mock_jwks
+        stranger_jwt = jwt.encode(
+            {"email": "stranger@gmail.com", "aud": "test-aud", "iss": "https://team.cloudflareaccess.com", "exp": time.time() + 300},
+            self.rsa_private_pem,
+            algorithm="RS256",
+            headers={"kid": "key1"}
+        )
         headers_stranger = {
             "Cf-Access-Authenticated-User-Email": "stranger@gmail.com",
             "Cf-Access-Jwt-Assertion": stranger_jwt
@@ -104,10 +137,17 @@ class TestPhase10WebPWA(unittest.TestCase):
     def test_05_auth_authorized_gmail_and_token(self):
         """Test 5: Authorized Gmail (via verified Cloudflare Access / custom header) and valid Bearer tokens are permitted."""
         import jwt
-        # Authorized Gmail via verified Cloudflare Access JWT header
+        # Authorized Gmail via verified Cloudflare Access RS256 JWT header
         self.app.state.cloudflare_access_enabled = True
-        self.app.state.cloudflare_access_secret = "test-secret"
-        cf_jwt = jwt.encode({"email": self.admin_email}, "test-secret", algorithm="HS256")
+        self.app.state.cloudflare_access_team_domain = "team"
+        self.app.state.cloudflare_access_audience = "test-aud"
+        self.app.state.cloudflare_access_jwks_client = self.mock_jwks
+        cf_jwt = jwt.encode(
+            {"email": self.admin_email, "aud": "test-aud", "iss": "https://team.cloudflareaccess.com", "exp": time.time() + 300},
+            self.rsa_private_pem,
+            algorithm="RS256",
+            headers={"kid": "key1"}
+        )
         headers_cf = {
             "Cf-Access-Authenticated-User-Email": self.admin_email,
             "Cf-Access-Jwt-Assertion": cf_jwt

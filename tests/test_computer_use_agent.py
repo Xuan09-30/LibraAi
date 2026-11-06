@@ -291,6 +291,8 @@ def test_round2_item_b_risky_action_gates():
 
     spy = SpyGUI()
     agent = AutonomousComputerUseAgent(gui_control=spy, spatial=None)
+    # Mock is_game_mode_active so test does not depend on host machine processes
+    agent.is_game_mode_active = lambda: False
 
     # 1. Direct check_action_risk unit checks on arguments for type, press, hotkey, navigate:
     # (a) Win+R or Win key launchers
