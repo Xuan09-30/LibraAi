@@ -4760,6 +4760,7 @@ class SemanticMemory:
         return self.check_user_exists(email)
 
     get_registered_user = get_registered_user_by_email
+    get_user_by_email = get_registered_user_by_email
 
     def generate_email_otp(
 

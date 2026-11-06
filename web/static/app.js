@@ -2247,15 +2247,39 @@
 
     try {
 
+      if (currentUserRole && currentUserRole !== 'host' && vitalsText) {
+
+        vitalsText.textContent = 'Project Libra Online';
+
+        return;
+
+      }
+
       const res = await fetch('/api/vitals', {
 
         headers: getAuthHeaders({ 'Content-Type': 'application/json' })
 
       });
 
-      if (res.status === 401 || res.status === 403) {
+      if (res.status === 403) {
 
-        showAuthModal();
+        if (vitalsText) {
+
+          vitalsText.textContent = 'Project Libra Online';
+
+        }
+
+        return;
+
+      }
+
+      if (res.status === 401) {
+
+        if (!authToken) {
+
+          showAuthModal();
+
+        }
 
         return;
 
@@ -7746,9 +7770,11 @@
 
   initOrb();
 
-  fetchVitals();
+  initAuthAndRole().then(() => {
 
-  initAuthAndRole();
+    fetchVitals();
+
+  });
 
   fetchSessions().then(() => {
 

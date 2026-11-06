@@ -715,8 +715,9 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                 return {"authenticated": True, "role": "host", "method": "identity_header", "email": clean_email}
             else:
                 memory = getattr(supervisor.llm, "memory", None)
-                if memory and hasattr(memory, "get_user_by_email"):
-                    u = memory.get_user_by_email(clean_email)
+                get_u_fn = getattr(memory, "get_user_by_email", None) or getattr(memory, "get_registered_user_by_email", None)
+                if get_u_fn:
+                    u = get_u_fn(clean_email)
                     if u:
                         return {"authenticated": True, "role": u.get("role", "tester"), "method": "identity_header", "email": clean_email, "label": u.get("display_name", "User")}
                 raise HTTPException(
@@ -2896,13 +2897,15 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
                 # 1. Ensure or auto-create session thread
 
+                user_email = (auth.get("email") or "").strip().lower()
+
                 sid = req.session_id
 
-                if not sid:
+                if not sid or (role != "host" and sid == "default"):
 
                     if memory and hasattr(memory, "create_session"):
 
-                        raw_sid = memory.create_session(title="New Chat", client_scope=scope)
+                        raw_sid = memory.create_session(title="New Chat", client_scope=scope, user_email=user_email)
 
                         sid = str(raw_sid) if (raw_sid and not hasattr(raw_sid, "_mock_return_value")) else "default"
 
@@ -3999,13 +4002,15 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         # 1. Ensure or auto-create session thread
 
+        user_email = (auth.get("email") or "").strip().lower()
+
         sid = req.session_id
 
-        if not sid:
+        if not sid or (role != "host" and sid == "default"):
 
             if memory and hasattr(memory, "create_session"):
 
-                sid = memory.create_session(title="New Chat", client_scope=effective_scope)
+                sid = memory.create_session(title="New Chat", client_scope=effective_scope, user_email=user_email)
 
             else:
 
@@ -4530,11 +4535,13 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
             )
         scope = "remote_host" if role_audio == "host" else "remote_web"
 
-        if not sid:
+        user_email = (auth.get("email") or "").strip().lower()
+
+        if not sid or (role_audio != "host" and sid == "default"):
 
             if memory and hasattr(memory, "create_session"):
 
-                sid = memory.create_session(title="New Chat", client_scope=scope)
+                sid = memory.create_session(title="New Chat", client_scope=scope, user_email=user_email)
 
             else:
 
