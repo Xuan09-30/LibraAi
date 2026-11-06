@@ -3127,40 +3127,56 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
     }}
     .button-stack {{
       display: flex;
-      flex-direction: column;
+      flex-direction: row;
       gap: 12px;
-    }}
-    .btn {{
       width: 100%;
-      padding: 13px 20px;
+    }}
+    @media (max-width: 480px) {{
+      .button-stack {{
+        flex-direction: column;
+      }}
+    }}
+    /* Equal weighting: both options have identical structure, elevated contrast, and zero dark patterns */
+    .btn {{
+      flex: 1;
+      padding: 13px 18px;
       border-radius: 10px;
       font-size: 14px;
       font-weight: 600;
       cursor: pointer;
-      border: none;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      background: #27272a;
+      color: #f8fafc;
       transition: all 0.15s ease;
       box-sizing: border-box;
       text-decoration: none;
-      display: inline-block;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       text-align: center;
     }}
-    .btn-confirm-link {{
-      background: var(--accent-green);
-      color: #042f2e;
-    }}
-    .btn-confirm-link:hover {{
-      background: var(--accent-green-hover);
+    .btn:hover {{
+      background: #3f3f46;
+      border-color: rgba(255, 255, 255, 0.35);
       transform: translateY(-1px);
     }}
+    .btn-confirm-link {{
+      background: #27272a;
+      color: #f8fafc;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+    }}
+    .btn-confirm-link:hover {{
+      background: #323238;
+      border-color: rgba(255, 255, 255, 0.4);
+    }}
     .btn-decline-link {{
-      background: transparent;
-      color: #cbd5e1;
-      border: 1px solid rgba(255, 255, 255, 0.15);
+      background: #27272a;
+      color: #f8fafc;
+      border: 1px solid rgba(255, 255, 255, 0.22);
     }}
     .btn-decline-link:hover {{
-      background: rgba(255, 255, 255, 0.05);
-      border-color: rgba(255, 255, 255, 0.3);
-      color: #ffffff;
+      background: #323238;
+      border-color: rgba(255, 255, 255, 0.4);
     }}
     .back-link {{
       margin-top: 24px;
@@ -3180,11 +3196,11 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
   <div class="linking-card" id="account-linking-card">
     <div class="badge-row">
       <span class="provider-pill">
-        <span>{html.escape(other_disp)}</span>
+        <span>{html.escape(other_disp)}: {html.escape(email)}</span>
       </span>
       <span class="link-icon-wrap">&harr;</span>
       <span class="provider-pill">
-        <span>{html.escape(new_disp)}</span>
+        <span>{html.escape(new_disp)}: {html.escape(('@' + new_username) if new_username else email)}</span>
       </span>
     </div>
     <h1>Link Your Accounts</h1>
@@ -3192,8 +3208,11 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
       <p class="prompt-text" id="linking-prompt-message">
         An account using <strong>{html.escape(email)}</strong> already exists, created via <strong>{html.escape(other_disp)}</strong>. Link your accounts?
       </p>
-      <p class="prompt-subtext">
-        Linking unites both logins under one profile, giving you shared conversation threads, tokens, and unified bug tracking.
+      <p class="prompt-subtext" style="margin-top: 6px; font-size: 13px; color: #cbd5e1; line-height: 1.5;">
+        Offering to link new <strong>{html.escape(new_disp)}</strong> identity <strong>{html.escape(('@' + new_username) if new_username else email)}</strong> into your existing profile.
+      </p>
+      <p class="prompt-subtext" style="margin-top: 6px;">
+        Choose whether to unite both logins under one profile with shared memory, sessions, and bug tracking, or keep them as two completely separate accounts.
       </p>
     </div>
     <form method="POST" action="/api/auth/link-account" class="button-stack" id="linking-form">
