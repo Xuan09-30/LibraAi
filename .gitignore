@@ -18,3 +18,8 @@ assets/*.db-wal
 # Logs & telemetry
 logs/
 *.log
+
+# Test artifacts
+test_grab.png
+assets/uploads/
+assets/vault/fact_*
