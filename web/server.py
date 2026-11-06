@@ -7,6 +7,8 @@ import io
 import sys
 
 import hmac
+import html
+import secrets
 import json
 
 import time
@@ -745,13 +747,16 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         if memory and hasattr(memory, "validate_user_token") and token:
             user_info = memory.validate_user_token(token)
             if user_info:
+                gh_u = user_info.get("github_username", "") or user_info.get("github_login", "")
                 return {
                     "authenticated": True,
                     "role": user_info.get("role", "guest"),
                     "method": "user_token",
                     "token": token,
                     "email": user_info.get("email", ""),
-                    "label": user_info.get("display_name", "User")
+                    "label": user_info.get("display_name", "User"),
+                    "github_username": gh_u,
+                    "github_login": gh_u
                 }
 
         # Legacy Guest Access Token fallback
@@ -1496,21 +1501,15 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         dname = auth.get("label") or auth.get("display_name") or (email.split("@")[0] if email else "User")
 
         return {
-
             "status": "authenticated",
-
             "role": role,
-
             "email": email,
-
             "label": dname,
-
             "display_name": dname,
-
+            "github_login": auth.get("github_login", ""),
+            "github_username": auth.get("github_username", ""),
             "tunnel_url": cf_url,
-
             "tunnel_status": cf_info.get("status", "offline")
-
         }
 
     @app.post("/api/auth/clear-chats")
@@ -2223,131 +2222,204 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
                     pass
         return {"client_id": cid, "client_secret": csec}
 
-    @app.get("/auth/github/login")
-    async def get_github_oauth_login(request: Request):
-        """Directs user to GitHub OAuth authorize or guided Personal Access Token login."""
+    @app.get("/auth/github/start")
+    async def get_github_oauth_start(request: Request):
+        """Initiates GitHub OAuth 2.0 authorization redirect with CSRF state protection."""
         creds = _get_github_oauth_credentials()
         client_id = creds.get("client_id")
+        if not client_id or client_id.startswith("YOUR_"):
+            return HTMLResponse(
+                "<h3>GitHub OAuth Error</h3><p>GitHub OAuth Client ID is not configured. Please check config.local.json.</p><p><a href='/'>Return to Libra</a></p>",
+                status_code=500
+            )
+
         host_header = request.headers.get("host", "localhost:8765")
         proto = "https" if (request.headers.get("x-forwarded-proto") == "https" or "trycloudflare" in host_header or "ngrok" in host_header) else "http"
         base_url = f"{proto}://{host_header}"
         redirect_uri = f"{base_url.rstrip('/')}/auth/github/callback"
 
-        if not client_id:
-            return HTMLResponse(f"""<!DOCTYPE html>
+        # Generate cryptographic random state for CSRF defense
+        state = secrets.token_urlsafe(32)
+        gh_url = (
+            f"https://github.com/login/oauth/authorize?"
+            f"client_id={urllib.parse.quote(client_id)}&"
+            f"redirect_uri={urllib.parse.quote(redirect_uri)}&"
+            f"scope=read:user&"
+            f"state={urllib.parse.quote(state)}"
+        )
+        resp = RedirectResponse(url=gh_url, status_code=307)
+        resp.set_cookie(
+            key="libra_gh_state",
+            value=state,
+            httponly=True,
+            samesite="lax",
+            secure=(proto == "https"),
+            max_age=600,
+            path="/"
+        )
+        return resp
+
+    @app.get("/auth/github/login")
+    async def get_github_oauth_login(request: Request, direct: Optional[int] = Query(None)):
+        """Renders GitHub login screen with single standard 'Continue with GitHub' button (or direct redirect)."""
+        if direct == 1:
+            return await get_github_oauth_start(request)
+
+        creds = _get_github_oauth_credentials()
+        client_id = creds.get("client_id")
+        configured = bool(client_id and not client_id.startswith("YOUR_"))
+
+        html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Sign in with GitHub - Project Libra</title>
   <style>
-    body {{ margin: 0; padding: 20px; background: #09090b; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; }}
-    .setup-card {{ background: #18181b; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 14px; max-width: 480px; width: 100%; padding: 28px; box-sizing: border-box; box-shadow: 0 24px 60px rgba(0, 0, 0, 0.85); }}
-    h1 {{ font-size: 20px; font-weight: 700; margin: 0 0 8px 0; color: #f8fafc; display: flex; align-items: center; gap: 8px; }}
-    p {{ font-size: 13px; line-height: 1.5; color: #94a3b8; margin: 0 0 16px 0; }}
-    .info-box {{ background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.2); border-radius: 8px; padding: 12px; font-size: 12px; color: #cbd5e1; line-height: 1.5; margin-bottom: 16px; }}
-    .token-box {{ display: flex; flex-direction: column; gap: 10px; }}
-    input {{ height: 44px; background: #121215; border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 8px; padding: 0 14px; color: #fff; font-size: 13.5px; outline: none; }}
-    input:focus {{ border-color: #38bdf8; }}
-    button {{ height: 44px; background: #38bdf8; color: #09090b; font-weight: 600; border: none; border-radius: 8px; cursor: pointer; font-size: 13px; }}
-    button:hover {{ filter: brightness(1.1); }}
-    a {{ color: #38bdf8; text-decoration: none; }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      background-color: #09090b;
+      color: #f8fafc;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 20px;
+    }}
+    .auth-card {{
+      background: #18181b;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      border-radius: 14px;
+      max-width: 420px;
+      width: 100%;
+      padding: 36px 32px;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.7);
+      text-align: center;
+    }}
+    .octocat-brand-icon {{
+      width: 48px;
+      height: 48px;
+      fill: #f8fafc;
+      margin-bottom: 20px;
+      display: inline-block;
+    }}
+    h1 {{
+      font-size: 22px;
+      font-weight: 700;
+      color: #f8fafc;
+      margin-bottom: 10px;
+      letter-spacing: -0.01em;
+    }}
+    p.lead-desc {{
+      font-size: 13.5px;
+      line-height: 1.55;
+      color: #94a3b8;
+      margin-bottom: 28px;
+    }}
+    .github-oauth-button {{
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      width: 100%;
+      height: 46px;
+      background: #24292f;
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      border-radius: 8px;
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.05s ease;
+      cursor: pointer;
+    }}
+    .github-oauth-button:hover {{
+      background: #2f363d;
+      border-color: rgba(255, 255, 255, 0.35);
+    }}
+    .github-oauth-button:active {{
+      transform: scale(0.99);
+    }}
+    .btn-octocat {{
+      width: 20px;
+      height: 20px;
+      fill: #ffffff;
+      flex-shrink: 0;
+    }}
+    .back-link-wrap {{
+      margin-top: 24px;
+    }}
+    .back-link-wrap a {{
+      color: #38bdf8;
+      font-size: 12.5px;
+      text-decoration: none;
+      transition: color 0.15s ease;
+    }}
+    .back-link-wrap a:hover {{
+      text-decoration: underline;
+    }}
+    .warning-box {{
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 12px;
+      color: #f87171;
+      margin-bottom: 20px;
+      line-height: 1.4;
+      text-align: left;
+    }}
   </style>
 </head>
 <body>
-  <div class="setup-card">
-    <h1><span>🐙</span> Sign in with GitHub</h1>
-    <p>Authenticate with your GitHub account so bug reports and tester feedback are attributed directly to you.</p>
-    <div class="info-box">
-      <strong>Instant Login:</strong> Enter your GitHub Personal Access Token (starts with <code>ghp_</code>) or your GitHub username below.
+  <div class="auth-card" id="github-login-card">
+    <svg class="octocat-brand-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/>
+    </svg>
+    <h1>Sign in with GitHub</h1>
+    <p class="lead-desc">Authenticate with your GitHub account to access Project Libra, link your sessions, and attribute tester bug reports.</p>
+    {'' if configured else '<div class="warning-box">GitHub OAuth credentials not yet configured in config.local.json.</div>'}
+    <a href="/auth/github/start" class="github-oauth-button" id="continue-with-github-btn">
+      <svg class="btn-octocat" viewBox="0 0 24 24" aria-hidden="true">
+        <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"/>
+      </svg>
+      <span>Continue with GitHub</span>
+    </a>
+    <div class="back-link-wrap">
+      <a href="/">&larr; Return to Libra</a>
     </div>
-    <form method="POST" action="/auth/github/pat-login" class="token-box">
-      <input type="password" name="token" placeholder="Paste GitHub Token (ghp_...) or GitHub Username" required autocomplete="off">
-      <button type="submit">Continue with GitHub</button>
-    </form>
-    <p style="margin-top: 16px; font-size: 12px; text-align: center;"><a href="/">&larr; Return to Libra</a></p>
   </div>
 </body>
-</html>""", status_code=200)
-
-        gh_url = f"https://github.com/login/oauth/authorize?client_id={client_id}&redirect_uri={urllib.parse.quote(redirect_uri)}&scope=read:user,user:email"
-        return RedirectResponse(url=gh_url)
-
-    @app.post("/auth/github/pat-login")
-    async def post_github_pat_login(request: Request, response: Response):
-        """Authenticates user with a GitHub PAT or username and creates/loads their session."""
-        form_data = await request.form()
-        raw_token = str(form_data.get("token", "")).strip()
-        if not raw_token:
-            return HTMLResponse("<h3>GitHub token or username required</h3>", status_code=400)
-
-        gh_user = None
-        gh_email = None
-        gh_name = None
-
-        if raw_token.startswith("ghp_") or raw_token.startswith("github_pat_"):
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    gh_res = await client.get(
-                        "https://api.github.com/user",
-                        headers={"Authorization": f"Bearer {raw_token}", "User-Agent": "LibraAi"}
-                    )
-                    if gh_res.status_code == 200:
-                        u_data = gh_res.json()
-                        gh_user = u_data.get("login")
-                        gh_email = u_data.get("email") or f"{gh_user}@users.noreply.github.com"
-                        gh_name = u_data.get("name") or gh_user
-            except Exception as ex:
-                logger.warning(f"Failed GitHub API token verify: {ex}")
-
-        if not gh_user:
-            clean_name = re.sub(r"[^a-zA-Z0-9_\-\.]", "", raw_token)
-            if clean_name:
-                gh_user = clean_name
-                gh_email = f"{clean_name.lower()}@github.com"
-                gh_name = clean_name
-            else:
-                return HTMLResponse("<h3>Invalid GitHub token or username</h3>", status_code=400)
-
-        memory = getattr(supervisor.llm, "memory", None)
-        if not memory:
-            raise HTTPException(status_code=500, detail="Memory subsystem offline")
-
-        is_host = (gh_email == admin_email or gh_user.lower() == "REDACTED")
-        role = "host" if is_host else "tester"
-        user = memory.get_or_create_registered_user(gh_email, default_role=role, display_name=gh_name)
-        tok = user.get("unique_token", "")
-
-        resp = HTMLResponse(f"""<!DOCTYPE html>
-<html>
-<head><title>Authenticated</title></head>
-<body style="background:#09090b; color:#ffffff; font-family:-apple-system, sans-serif; text-align:center; padding-top:60px;">
-  <h2>Authenticated with GitHub</h2>
-  <p>Logging into Project Libra as <strong>@{gh_user}</strong>...</p>
-  <script>
-    localStorage.setItem('libra_token', '{tok}');
-    document.cookie = 'libra_auth={tok}; path=/; max-age=2592000; SameSite=Lax';
-    window.location.href = '/';
-  </script>
-</body>
-</html>""")
-        resp.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax")
-        return resp
+</html>"""
+        return HTMLResponse(content=html_content, status_code=200)
 
     @app.get("/auth/github/callback")
     async def get_github_oauth_callback(
         request: Request,
-        response: Response,
         code: Optional[str] = Query(None),
+        state: Optional[str] = Query(None),
         error: Optional[str] = Query(None)
     ):
-        """Handles the redirect return from github.com."""
-        if error or not code:
-            return HTMLResponse(f"<h3>GitHub Sign In Error: {error or 'No code'}</h3><p><a href='/'>Return to Libra</a></p>", status_code=400)
+        """Handles return redirect from GitHub OAuth, validates state, exchanges code for token, and creates user session."""
+        if error:
+            return HTMLResponse(f"<h3>GitHub Sign In Error: {html.escape(error)}</h3><p><a href='/auth/github/login'>Try again</a></p>", status_code=400)
+
+        if not code or not state:
+            return HTMLResponse("<h3>GitHub OAuth Error: Missing code or state parameter.</h3><p><a href='/auth/github/login'>Try again</a></p>", status_code=400)
+
+        # Validate state parameter against secure HTTP-only cookie (CSRF protection)
+        cookie_state = request.cookies.get("libra_gh_state", "")
+        if not cookie_state or not hmac.compare_digest(state, cookie_state):
+            logger.warning("GitHub OAuth callback rejected: state mismatch or missing state cookie.")
+            return HTMLResponse("<h3>Security Error: OAuth state verification failed (CSRF protection).</h3><p><a href='/auth/github/login'>Try again</a></p>", status_code=400)
 
         creds = _get_github_oauth_credentials()
         client_id = creds.get("client_id")
         client_secret = creds.get("client_secret", "")
+        if not client_id or not client_secret:
+            return HTMLResponse("<h3>GitHub OAuth credentials not configured on server.</h3>", status_code=500)
+
         host_header = request.headers.get("host", "localhost:8765")
         proto = "https" if (request.headers.get("x-forwarded-proto") == "https" or "trycloudflare" in host_header or "ngrok" in host_header) else "http"
         base_url = f"{proto}://{host_header}"
@@ -2355,30 +2427,62 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
-                t_res = await client.post("https://github.com/login/oauth/access_token", data={
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                    "code": code,
-                    "redirect_uri": redirect_uri
-                }, headers={"Accept": "application/json"})
-                t_data = t_res.json()
-                gh_token = t_data.get("access_token")
-                if not gh_token:
-                    return HTMLResponse("<h3>GitHub token exchange failed</h3>", status_code=400)
+                token_res = await client.post(
+                    "https://github.com/login/oauth/access_token",
+                    data={
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "code": code,
+                        "redirect_uri": redirect_uri
+                    },
+                    headers={"Accept": "application/json", "User-Agent": "Project-Libra"}
+                )
+                if token_res.status_code != 200:
+                    return HTMLResponse(f"<h3>GitHub token exchange failed (HTTP {token_res.status_code})</h3><p><a href='/auth/github/login'>Try again</a></p>", status_code=400)
 
-                u_res = await client.get("https://api.github.com/user", headers={"Authorization": f"Bearer {gh_token}", "User-Agent": "LibraAi"})
-                u_data = u_res.json()
-                gh_user = u_data.get("login")
-                gh_email = u_data.get("email") or f"{gh_user}@users.noreply.github.com"
+                token_data = token_res.json()
+                access_token = token_data.get("access_token")
+                if not access_token:
+                    err_desc = token_data.get("error_description") or token_data.get("error") or "Failed to exchange authorization code for access token"
+                    return HTMLResponse(f"<h3>GitHub token exchange error: {html.escape(err_desc)}</h3><p><a href='/auth/github/login'>Try again</a></p>", status_code=400)
+
+                # Fetch user profile using access token
+                user_res = await client.get(
+                    "https://api.github.com/user",
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Accept": "application/vnd.github+json",
+                        "User-Agent": "Project-Libra"
+                    }
+                )
+                if user_res.status_code != 200:
+                    return HTMLResponse(f"<h3>Failed to fetch GitHub profile (HTTP {user_res.status_code})</h3><p><a href='/auth/github/login'>Try again</a></p>", status_code=400)
+
+                u_data = user_res.json()
+                gh_user = str(u_data.get("login") or "").strip()
+                if not gh_user:
+                    return HTMLResponse("<h3>Invalid GitHub user profile: missing login.</h3>", status_code=400)
+
+                gh_avatar = u_data.get("avatar_url") or ""
                 gh_name = u_data.get("name") or gh_user
+                gh_email = u_data.get("email") or f"{gh_user.lower()}@github.com"
+
+                # Discard access token immediately (do not store or log)
+                del access_token
+                del token_data
 
                 memory = getattr(supervisor.llm, "memory", None)
                 if not memory:
                     raise HTTPException(status_code=500, detail="Memory subsystem offline")
 
-                is_host = (gh_email == admin_email or (gh_user and gh_user.lower() == "REDACTED"))
+                is_host = (gh_email.lower() == admin_email.lower() or gh_user.lower() == "REDACTED")
                 role = "host" if is_host else "tester"
-                user = memory.get_or_create_registered_user(gh_email, default_role=role, display_name=gh_name)
+                user = memory.get_or_create_registered_user(
+                    email=gh_email,
+                    default_role=role,
+                    display_name=gh_name,
+                    github_username=gh_user
+                )
                 tok = user.get("unique_token", "")
 
                 resp = HTMLResponse(f"""<!DOCTYPE html>
@@ -2386,7 +2490,7 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
 <head><title>Authenticated</title></head>
 <body style="background:#09090b; color:#ffffff; font-family:-apple-system, sans-serif; text-align:center; padding-top:60px;">
   <h2>Authenticated with GitHub</h2>
-  <p>Logging into Project Libra as <strong>@{gh_user}</strong>...</p>
+  <p>Logging into Project Libra as <strong>@{html.escape(gh_user)}</strong>...</p>
   <script>
     localStorage.setItem('libra_token', '{tok}');
     document.cookie = 'libra_auth={tok}; path=/; max-age=2592000; SameSite=Lax';
@@ -2394,10 +2498,13 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
   </script>
 </body>
 </html>""")
-                resp.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax")
+                resp.set_cookie(key="libra_token", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
+                resp.set_cookie(key="libra_auth", value=tok, max_age=2592000, httponly=False, samesite="lax", path="/")
+                resp.delete_cookie(key="libra_gh_state", path="/")
                 return resp
         except Exception as ex:
-            return HTMLResponse(f"<h3>GitHub Authentication Error</h3><p>{ex}</p><p><a href='/'>Return to Libra</a></p>", status_code=500)
+            logger.error(f"GitHub OAuth callback unexpected error: {type(ex).__name__}")
+            return HTMLResponse(f"<h3>GitHub Authentication Error</h3><p>An unexpected error occurred during authentication.</p><p><a href='/auth/github/login'>Return to Login</a></p>", status_code=500)
 
     # -----------------------------------------------------------------------
 
@@ -5071,13 +5178,12 @@ def create_app(hub: Optional[SupervisorHub] = None, config_path: str = "config.j
         desc = str(data.get("description", "")).strip()
         if not desc:
             raise HTTPException(status_code=400, detail="Bug description is required.")
-        reporter = str(data.get("reporter_name", "")).strip() or auth.get("email", "Tester")
-        gh_user = auth.get("github_login")
+        # Attribution strictly uses authenticated GitHub username when available, ignoring free-text spoofing
+        gh_user = auth.get("github_login") or auth.get("github_username")
         if gh_user:
-            if not reporter or reporter == "Tester" or "@" not in reporter:
-                reporter = f"@{gh_user}"
-            elif f"@{gh_user}" not in reporter:
-                reporter = f"@{gh_user} ({reporter})"
+            reporter = f"@{gh_user}"
+        else:
+            reporter = auth.get("email") or auth.get("label") or "Tester"
         category = str(data.get("category", "General")).strip()
         device_info = str(data.get("device_info", "")).strip()
         session_id = str(data.get("session_id", "")).strip()
